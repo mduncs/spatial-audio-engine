@@ -1,0 +1,59 @@
+name: FightboxApp
+
+options:
+  minimumXcodeGenVersion: 2.44.1
+  deploymentTarget:
+    iOS: "15.0"
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    SDKROOT: iphoneos
+    SUPPORTED_PLATFORMS: iphoneos
+    TARGETED_DEVICE_FAMILY: "1"
+    SUPPORTS_MACCATALYST: NO
+    SWIFT_VERSION: "5.0"
+
+targets:
+  FightboxApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: ../FightboxKit/Sources/FightboxKit/CoreMotionHeadTracker.swift
+      - path: ../FightboxKit/Sources/FightboxKit/GpsLocalEnuProvider.swift
+      - path: ../FightboxKit/Sources/FightboxKit/AbxSession.swift
+      - path: Resources/chicago-block-a.fightbox
+        type: folder
+        buildPhase: resources
+      - path: Resources/chicago-block-baked
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.fightbox.spatial-audio
+        PRODUCT_NAME: Fightbox
+        INFOPLIST_FILE: Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/FightboxApp-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../../../crates/fightbox-ffi/include"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../../../target/aarch64-apple-ios/release"
+          - "$(SRCROOT)/../../../.cache/steam-audio/steamaudio-4.8.1/steamaudio/lib/ios"
+          - "$(SRCROOT)/../third-party/lib/ios"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-lfightbox_ffi"
+          - "-lphonon"
+          - "-lpffft"
+          - "-lmysofa"
+          - "-lc++"
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: YES
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - sdk: libz.tbd
+    scheme:
+      gatherCoverageData: false
