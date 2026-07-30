@@ -38,6 +38,7 @@ pub enum SignalKind {
     Sine,
     Multitone,
     PinkLike,
+    FireworkBurst,
 }
 impl SignalKind {
     #[must_use]
@@ -46,9 +47,14 @@ impl SignalKind {
             Self::Sine => "sine",
             Self::Multitone => "multitone",
             Self::PinkLike => "pink_like",
+            Self::FireworkBurst => "firework_burst",
         }
     }
 }
+
+/// Fixed seed for [`firework_burst`]. The seed is part of the evidence
+/// contract so the broadband crack and crackle train remain byte-stable.
+pub const FIREWORK_BURST_SEED: u64 = 0xF1AE_2026_0729_0048;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignalError {
@@ -226,6 +232,77 @@ pub fn pink_like(
     })
 }
 
+/// A deterministic firework-like impulse with a sharp broadband crack, a
+/// decaying low-frequency boom, and a short train of crackle transients.
+///
+/// The first sample is intentionally nonzero. Broadband components use the
+/// fixed [`FIREWORK_BURST_SEED`]; callers cannot accidentally make a
+/// non-reproducible qualification stimulus. The requested buffer should be at
+/// least 250 ms long to retain the complete crackle train.
+pub fn firework_burst(
+    spec: WavSpec,
+    frame_count: usize,
+    target_rms_dbfs: f32,
+) -> Result<GeneratedSignal, SignalError> {
+    validate_spec(spec).map_err(SignalError::BadSpec)?;
+    let sample_rate = spec.sample_rate_hz as f32;
+    let mut state = FIREWORK_BURST_SEED;
+    let crackles = [
+        (0.043_f32, 0.42_f32),
+        (0.079, 0.31),
+        (0.131, 0.24),
+        (0.207, 0.18),
+    ];
+    let mut previous_noise = 0.0_f32;
+    let mut samples = interleave_buffer(spec.channels, frame_count, |frame| {
+        let t = frame as f32 / sample_rate;
+        let noise = next_uniform(&mut state);
+        let high_pass_noise = noise - previous_noise * 0.82;
+        previous_noise = noise;
+
+        // Roughly 9 ms of fast broadband crack, with an explicit onset.
+        let crack = if t < 0.009 {
+            let onset = if frame == 0 { 1.0 } else { 0.0 };
+            onset + 0.72 * high_pass_noise * (-420.0 * t).exp()
+        } else {
+            0.0
+        };
+
+        // Delayed low boom: two slightly inharmonic components avoid a pure
+        // calibration-tone character while retaining a smooth physical decay.
+        let boom_t = t - 0.012;
+        let boom = if boom_t >= 0.0 {
+            let envelope = (-3.8 * boom_t).exp();
+            envelope
+                * (0.34 * (std::f32::consts::TAU * 52.0 * boom_t).sin()
+                    + 0.16 * (std::f32::consts::TAU * 83.0 * boom_t).sin())
+        } else {
+            0.0
+        };
+
+        let crackle = crackles
+            .iter()
+            .map(|(start_s, amplitude)| {
+                let local_t = t - start_s;
+                if (0.0..0.004).contains(&local_t) {
+                    amplitude * high_pass_noise * (-900.0 * local_t).exp()
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f32>();
+
+        crack + boom + crackle
+    });
+    let normalization = calibrate(&mut samples, target_rms_dbfs)?;
+    Ok(GeneratedSignal {
+        kind: SignalKind::FireworkBurst,
+        spec,
+        samples,
+        normalization,
+    })
+}
+
 /// Measure a flat RMS over the interleaved buffer (RMS is channel-agnostic).
 fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -368,6 +445,32 @@ mod tests {
         // Stereo duplicates mono content, so the side channel is silent.
         let metrics = channel_metrics(spec, &a.samples).unwrap();
         assert!(metrics.stereo_difference_rms.unwrap_or(1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn firework_burst_is_deterministic_impulsive_and_finite() {
+        let spec = spec(1);
+        let a = firework_burst(spec, 48_000 * 2, -30.0).unwrap();
+        let b = firework_burst(spec, 48_000 * 2, -30.0).unwrap();
+        assert_eq!(a.samples, b.samples);
+        assert_eq!(a.kind, SignalKind::FireworkBurst);
+        assert!(a.samples.iter().all(|sample| sample.is_finite()));
+
+        let peak = a.samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        let rms = rms(&a.samples);
+        let crest_factor = peak / rms;
+        assert!(crest_factor > 8.0, "crest factor={crest_factor:.3}");
+        let onset_peak = a.samples[..480]
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0, f32::max);
+        let later_peak = a.samples[24_000..]
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0, f32::max);
+        assert!(onset_peak > later_peak * 4.0);
     }
 
     #[test]

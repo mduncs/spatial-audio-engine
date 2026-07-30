@@ -28,7 +28,8 @@ pub use analysis::{
 pub use hash::{sha256, sha256_hex};
 pub use listening::{
     EquipmentRecord, HrtfRecord, LISTENING_REQUIRES_HUMAN, LISTENING_SCHEMA_VERSION,
-    ListenerIdentity, ListeningObservation, ListeningRecord, ListeningResult, SignOff,
+    ListenerIdentity, ListeningObservation, ListeningPromptSet, ListeningRecord, ListeningResult,
+    PerceptPrompt, SignOff, blank_qualification_records, qualification_prompt_sets,
 };
 pub use manifest::{
     AssetAnalysisRecord, CadenceStatus, CallbackStatus, CallbackTiming, CaptureConfig,
@@ -48,7 +49,8 @@ pub use metrics::{
     time_varying_spectral_notches,
 };
 pub use signal::{
-    GeneratedSignal, GeneratorNormalization, SignalError, SignalKind, multitone, pink_like, sine,
+    FIREWORK_BURST_SEED, GeneratedSignal, GeneratorNormalization, SignalError, SignalKind,
+    firework_burst, multitone, pink_like, sine,
 };
 pub use wav::{
     WAVE_FORMAT_IEEE_FLOAT, WavError, WavSpec, read_wav, stem_hash, validate_spec, write_wav,

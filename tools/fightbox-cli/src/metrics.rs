@@ -32,9 +32,7 @@ pub(crate) fn stereo_channel_metric(
             "metric requires stereo input".to_string()
         }
         fightbox_evidence::MetricError::InvalidWindow => "invalid analysis window".to_string(),
-        fightbox_evidence::MetricError::InvalidThreshold => {
-            "invalid metric threshold".to_string()
-        }
+        fightbox_evidence::MetricError::InvalidThreshold => "invalid metric threshold".to_string(),
     })?;
     Ok(from_channel_metrics(&metrics))
 }

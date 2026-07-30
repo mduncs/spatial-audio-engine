@@ -26,6 +26,7 @@ mod calibrate;
 mod city;
 mod error;
 mod fixture;
+mod listening;
 mod metrics;
 mod phase_b;
 mod provenance;
@@ -59,6 +60,10 @@ phase-b soak     Run the four-source offline or feature-gated live soak\n    \
                   [--reflection-effect <parametric|convolution>] (default: convolution)\n\n\
 phase-b s6b-soak Run the eight-source offline or feature-gated live soak\n    \
                   [--reflection-effect <parametric|convolution>] (default: convolution)\n\n\
+listening init --output <directory>\n    \
+                  Write blank JSON and Markdown qualification forms\n    \
+listening validate <directory>\n    \
+                  Validate completed observations and listener sign-off\n\n\
 city compile     Compile GeoJSON into a deterministic .fightbox package\n    \
 city synth       Generate a deterministic Manhattan-style GeoJSON city\n    \
 city inspect     Print a package manifest summary and assumptions\n    \
@@ -89,6 +94,7 @@ fn dispatch(args: &[String]) -> error::Result<()> {
         }
         Some("phase-a") => dispatch_phase_a(&args[1..]),
         Some("phase-b") => dispatch_phase_b(&args[1..]),
+        Some("listening") => listening::run(&args[1..]),
         Some("city") => dispatch_city(&args[1..]),
         Some(command) => Err(error::CliError::new(format!(
             "unknown command: {command}\n\n{HELP}"
@@ -536,6 +542,8 @@ mod tests {
         assert!(HELP.contains("city synth"));
         assert!(HELP.contains("phase-b s6b"));
         assert!(HELP.contains("phase-b s6b-soak"));
+        assert!(HELP.contains("listening init --output"));
+        assert!(HELP.contains("listening validate <directory>"));
     }
 
     #[test]
