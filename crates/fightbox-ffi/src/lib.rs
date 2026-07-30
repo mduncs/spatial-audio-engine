@@ -25,11 +25,11 @@ use fightbox_runtime::backend::{
 };
 use fightbox_runtime::{SnapshotPublication, SnapshotReader, SnapshotWriter};
 use fightbox_steam_audio::{
-    AcousticMaterial, AudioConfig, BakedProbeBatch, GovernorTransitionReason,
+    AcousticMaterial, AudioConfig, BakedProbeBatch, GovernorTransitionReason, MemoryTrackingStatus,
     MultiSourceDescriptor, PROBE_BATCH_METADATA_SCHEMA, PathQualityLevel, ProbeBatchMetadata,
-    QualityGovernorTelemetry, ReflectionQualityLevel, ReverbStrategy, S3SimulationConfig,
+    QualityGovernorTelemetry, QualityTier, ReflectionQualityLevel, ReverbStrategy,
     STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION, SourceQualityLevel, SteamAudioRenderGraph,
-    SteamAudioSimulationRunner, build_multi_source_session,
+    SteamAudioSimulationRunner, build_multi_source_session_for_tier,
 };
 use serde::Deserialize;
 
@@ -47,6 +47,14 @@ pub enum FbResult {
     FbBackendError = 7,
     FbBufferTooSmall = 8,
     FbPanic = 9,
+}
+
+/// Named construction-time quality tier.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FbQualityTier {
+    FbQualityDesktop = 0,
+    FbQualityMobile = 1,
 }
 
 /// Three-component vector in right-handed local ENU coordinates.
@@ -76,6 +84,21 @@ pub struct FbSessionConfig {
     pub source_count: u32,
     /// Relative source level used by the quality governor.
     pub default_source_level_db: f32,
+    /// One of `FbQualityTier`. Zero selects Desktop, preserving legacy
+    /// zero-initialized caller behavior. Unknown values are rejected.
+    pub quality_tier: u32,
+}
+
+impl Default for FbSessionConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate_hz: 48_000,
+            block_size_frames: 512,
+            source_count: 1,
+            default_source_level_db: 0.0,
+            quality_tier: FbQualityTier::FbQualityDesktop as u32,
+        }
+    }
 }
 
 /// Complete control-thread update for one stable source index.
@@ -115,6 +138,7 @@ struct SessionInner {
     source_count: usize,
     block_size: usize,
     last_render_ns: AtomicU64,
+    ffi_render_buffers_bytes: u64,
 }
 
 // Safety: the public contract assigns `control` and `render` to distinct,
@@ -403,7 +427,10 @@ pub unsafe extern "C" fn fb_session_telemetry_json(
             return FbResult::FbInvalidState;
         };
         observe_latest_render_timing(session, control);
-        let json = telemetry_json(control.runner.quality_governor_telemetry());
+        let json = telemetry_json(
+            control.runner.quality_governor_telemetry(),
+            session.ffi_render_buffers_bytes,
+        );
         let required = match json.len().checked_add(1) {
             Some(value) => value,
             None => return FbResult::FbInvalidState,
@@ -448,10 +475,12 @@ impl SessionInner {
             usize::try_from(config.source_count).map_err(|_| FbResult::FbInvalidArgument)?;
         let block_size =
             usize::try_from(config.block_size_frames).map_err(|_| FbResult::FbInvalidArgument)?;
+        let quality_tier =
+            quality_tier_from_ffi(config.quality_tier).ok_or(FbResult::FbInvalidArgument)?;
         if config.sample_rate_hz == 0
             || block_size == 0
             || source_count == 0
-            || source_count > MAX_ACTIVE_SOURCES
+            || source_count > quality_tier.active_source_cap()
             || !config.default_source_level_db.is_finite()
             || i32::try_from(config.sample_rate_hz).is_err()
             || i32::try_from(config.block_size_frames).is_err()
@@ -476,12 +505,14 @@ impl SessionInner {
             sample_rate_hz: config.sample_rate_hz as i32,
             frame_size: config.block_size_frames as i32,
         };
-        let (mut runner, graph) = build_multi_source_session(
+        let simulation = quality_tier.simulation_defaults();
+        let (mut runner, graph) = build_multi_source_session_for_tier(
             &mesh,
             &baked,
             audio,
-            S3SimulationConfig::default(),
+            simulation,
             &descriptors,
+            quality_tier,
         )
         .map_err(|error| {
             if matches!(error, fightbox_steam_audio::BackendError::SdkUnavailable(_)) {
@@ -523,6 +554,9 @@ impl SessionInner {
             source_count,
             block_size,
             last_render_ns: AtomicU64::new(0),
+            ffi_render_buffers_bytes: (block_size as u64)
+                .saturating_mul(2)
+                .saturating_mul(size_of::<f32>() as u64),
         })
     }
 }
@@ -672,7 +706,10 @@ fn verify_bake_identity(
     Ok(())
 }
 
-fn telemetry_json(telemetry: Option<QualityGovernorTelemetry>) -> String {
+fn telemetry_json(
+    telemetry: Option<QualityGovernorTelemetry>,
+    ffi_render_buffers_bytes: u64,
+) -> String {
     let Some(value) = telemetry else {
         return String::from(r#"{"available":false}"#);
     };
@@ -698,15 +735,36 @@ fn telemetry_json(telemetry: Option<QualityGovernorTelemetry>) -> String {
             source.transport_advances,
         ));
     }
+    let tracked_at_create_bytes = value
+        .memory
+        .tracked_at_create_bytes
+        .saturating_add(ffi_render_buffers_bytes);
+    let tracked_current_bytes = value
+        .memory
+        .tracked_current_bytes
+        .saturating_add(ffi_render_buffers_bytes);
+    let tracked_peak_bytes = value
+        .memory
+        .tracked_peak_bytes
+        .saturating_add(ffi_render_buffers_bytes);
     format!(
         concat!(
-            r#"{{"available":true,"sequence":{},"ladder_position":{},"reason":"{}","#,
+            r#"{{"available":true,"quality_tier":"{}","tier_source_cap":{},"sequence":{},"ladder_position":{},"reason":"{}","#,
             r#""timing_ns":{{"p50":{},"p95":{},"p99":{},"p99_9":{},"deadline_misses":{}}},"#,
             r#""simulation_lateness_ns":[{},{},{}],"delivered_quality":{{"#,
             r#""reflections":{{"level":"{}","rays":{},"diffuse_samples":{},"bounces":{},"#,
             r#""ir_duration_s":{},"cadence_divisor":{}}},"pathing":"{}","#,
-            r#""ambisonic_order":{},"reverb":"{}","reflection_output_gain":{},"sources":[{}]}}}}"#
+            r#""ambisonic_order":{},"reverb":"{}","reflection_output_gain":{},"sources":[{}]}},"#,
+            r#""memory":{{"scope":"configuration_known_payloads_and_capacities_not_process_total","#,
+            r#""tracked_at_create_bytes":{},"tracked_current_bytes":{},"tracked_peak_bytes":{},"categories":{{"#,
+            r#""snapshot_ring_payload_bytes":{},"reflection_ir_payload_capacity_bytes":{},"#,
+            r#""audio_buffer_payload_bytes":{},"engine_render_scratch_bytes":{},"#,
+            r#""ffi_render_buffers_bytes":{},"propagation_delay_line_bytes":{},"retained_bake_bytes":{}}},"#,
+            r#""untracked":[{{"category":"steam_audio_sdk_internal","status":"{}","#,
+            r#""includes":"allocator_overhead,effect_workspaces,hrtf,scene,probe_and_simulator_storage"}}]}}}}"#
         ),
+        quality_tier_name(value.quality_tier),
+        value.tier_source_cap,
         value.sequence,
         value.ladder_position,
         transition_reason_name(value.reason),
@@ -729,7 +787,40 @@ fn telemetry_json(telemetry: Option<QualityGovernorTelemetry>) -> String {
         reverb_name(value.reverb),
         value.reflection_output_gain,
         sources,
+        tracked_at_create_bytes,
+        tracked_current_bytes,
+        tracked_peak_bytes,
+        value.memory.snapshot_ring_payload_bytes,
+        value.memory.reflection_ir_payload_capacity_bytes,
+        value.memory.audio_buffer_payload_bytes,
+        value.memory.render_scratch_bytes,
+        ffi_render_buffers_bytes,
+        value.memory.propagation_delay_line_bytes,
+        value.memory.retained_bake_bytes,
+        memory_tracking_status_name(value.memory.steam_audio_sdk_internal),
     )
+}
+
+fn quality_tier_from_ffi(value: u32) -> Option<QualityTier> {
+    match value {
+        value if value == FbQualityTier::FbQualityDesktop as u32 => Some(QualityTier::Desktop),
+        value if value == FbQualityTier::FbQualityMobile as u32 => Some(QualityTier::Mobile),
+        _ => None,
+    }
+}
+
+fn quality_tier_name(value: QualityTier) -> &'static str {
+    match value {
+        QualityTier::Desktop => "desktop",
+        QualityTier::Mobile => "mobile",
+    }
+}
+
+fn memory_tracking_status_name(value: MemoryTrackingStatus) -> &'static str {
+    match value {
+        MemoryTrackingStatus::Tracked => "tracked",
+        MemoryTrackingStatus::Untracked => "untracked",
+    }
 }
 
 fn transition_reason_name(value: GovernorTransitionReason) -> &'static str {
@@ -873,6 +964,7 @@ mod tests {
             source_count: 1,
             block_size: 4,
             last_render_ns: AtomicU64::new(0),
+            ffi_render_buffers_bytes: 2 * 4 * size_of::<f32>() as u64,
         };
         Box::into_raw(Box::new(session)).cast()
     }
@@ -927,5 +1019,106 @@ mod tests {
         assert_eq!(required, 0);
         // Safety: this is a unique live allocation and is destroyed once.
         assert_eq!(unsafe { fb_session_destroy(session) }, FbResult::FbOk);
+    }
+
+    #[test]
+    fn ffi_quality_tier_values_round_trip_and_unknown_values_are_rejected() {
+        for (wire, expected) in [
+            (FbQualityTier::FbQualityDesktop as u32, QualityTier::Desktop),
+            (FbQualityTier::FbQualityMobile as u32, QualityTier::Mobile),
+        ] {
+            assert_eq!(quality_tier_from_ffi(wire), Some(expected));
+        }
+        assert_eq!(quality_tier_from_ffi(2), None);
+        assert_eq!(
+            FbSessionConfig::default().quality_tier,
+            FbQualityTier::FbQualityDesktop as u32
+        );
+        let mobile_defaults = quality_tier_from_ffi(FbQualityTier::FbQualityMobile as u32)
+            .unwrap()
+            .simulation_defaults();
+        assert_eq!(mobile_defaults.reflection_rays, 512);
+        assert_eq!(mobile_defaults.reflection_duration_s, 0.5);
+        assert_eq!(mobile_defaults.reflection_order, 0);
+        assert_eq!(mobile_defaults.pathing_order, 1);
+    }
+
+    #[test]
+    fn create_rejects_an_invalid_tier_before_reading_package_paths() {
+        let config = FbSessionConfig {
+            quality_tier: u32::MAX,
+            ..FbSessionConfig::default()
+        };
+        let path = std::ffi::CString::new("/definitely/not/a/fightbox/path").unwrap();
+        let mut session: *mut FbSession = ptr::null_mut();
+        // Safety: all pointers are valid for the duration of the call.
+        let result = unsafe {
+            fb_session_create(
+                &config,
+                path.as_ptr(),
+                path.as_ptr(),
+                &mut session as *mut *mut FbSession,
+            )
+        };
+        assert_eq!(result, FbResult::FbInvalidArgument);
+        assert!(session.is_null());
+    }
+
+    #[test]
+    fn telemetry_json_reports_tracked_memory_without_claiming_sdk_internal_total() {
+        let telemetry = QualityGovernorTelemetry {
+            quality_tier: QualityTier::Mobile,
+            tier_source_cap: 4,
+            sequence: 1,
+            ladder_position: 3,
+            reason: GovernorTransitionReason::Initial,
+            p50_ns: 10,
+            p95_ns: 20,
+            p99_ns: 30,
+            p99_9_ns: 40,
+            callback_deadline_misses: 0,
+            simulation_lateness_ns: [0; 3],
+            reflections: fightbox_steam_audio::DeliveredReflectionQuality {
+                level: ReflectionQualityLevel::Reduced,
+                rays: 512,
+                diffuse_samples: 16,
+                diffuse_samples_target: 16,
+                diffuse_samples_availability:
+                    fightbox_steam_audio::ReflectionSettingAvailability::Implemented,
+                bounces: 1,
+                ir_duration_s: 0.5,
+                cadence_divisor: 2,
+            },
+            pathing: PathQualityLevel::NoValidation,
+            ambisonic_order: 0,
+            reverb: ReverbStrategy::ShortIrLowerOrder,
+            reflection_output_gain: 1.0,
+            sources: [fightbox_steam_audio::SourceQualityTelemetry::default(); MAX_ACTIVE_SOURCES],
+            source_count: 1,
+            memory: fightbox_steam_audio::SessionMemoryTelemetry {
+                tracked_at_create_bytes: 100,
+                tracked_current_bytes: 90,
+                tracked_peak_bytes: 110,
+                snapshot_ring_payload_bytes: 10,
+                reflection_ir_payload_capacity_bytes: 20,
+                audio_buffer_payload_bytes: 15,
+                render_scratch_bytes: 5,
+                propagation_delay_line_bytes: 30,
+                retained_bake_bytes: 10,
+                steam_audio_sdk_internal: MemoryTrackingStatus::Untracked,
+            },
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&telemetry_json(Some(telemetry), 8)).unwrap();
+
+        assert_eq!(value["quality_tier"], "mobile");
+        assert_eq!(value["memory"]["tracked_at_create_bytes"], 108);
+        assert_eq!(value["memory"]["tracked_current_bytes"], 98);
+        assert_eq!(value["memory"]["tracked_peak_bytes"], 118);
+        assert_eq!(
+            value["memory"]["untracked"][0]["category"],
+            "steam_audio_sdk_internal"
+        );
+        assert_eq!(value["memory"]["untracked"][0]["status"], "untracked");
     }
 }

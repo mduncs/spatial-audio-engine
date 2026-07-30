@@ -661,6 +661,86 @@ impl Default for DirectOcclusionMode {
     }
 }
 
+/// Named construction-time quality and resource policy.
+///
+/// A tier is immutable for the life of a retained session. `Desktop` preserves
+/// the pre-Phase-E defaults. `Mobile` spends less worker time and retained
+/// memory on the reflection-heavy stages identified by the recorded Phase B
+/// measurements, and caps a session at four active sources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QualityTier {
+    #[default]
+    Desktop,
+    Mobile,
+}
+
+impl QualityTier {
+    /// Maximum number of source descriptors accepted by this tier.
+    #[must_use]
+    pub const fn active_source_cap(self) -> usize {
+        match self {
+            Self::Desktop => fightbox_runtime::backend::MAX_ACTIVE_SOURCES,
+            Self::Mobile => 4,
+        }
+    }
+
+    /// Tier-specific simulation defaults applied at session construction.
+    ///
+    /// Mobile halves the reflection rays and IR duration, uses one bounce,
+    /// lowers reflection and path Ambisonic ceilings, and disables the more
+    /// expensive path-validation pass. Its governor additionally prevents
+    /// recovery above reduced reflections, no-validation pathing, order zero,
+    /// and short-IR reverb.
+    #[must_use]
+    pub fn simulation_defaults(self) -> S3SimulationConfig {
+        let mut defaults = S3SimulationConfig::default();
+        if self == Self::Mobile {
+            defaults.reflection_rays = 512;
+            defaults.diffuse_samples = 16;
+            defaults.reflection_bounces = 1;
+            defaults.reflection_duration_s = 0.5;
+            defaults.reflection_order = 0;
+            defaults.pathing_order = 1;
+            defaults.validate_paths = false;
+        }
+        defaults
+    }
+}
+
+/// Whether a memory category is measurable at this ownership boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryTrackingStatus {
+    Tracked,
+    Untracked,
+}
+
+/// Configuration-known session memory payloads and capacities.
+///
+/// These values account Rust-owned buffers plus the exact PCM/IR payload
+/// dimensions requested from Steam Audio. They deliberately do not claim
+/// allocator overhead, effect-kernel workspaces, HRTF storage, scene/probe
+/// structures, or any other SDK-internal allocation as part of a process
+/// total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionMemoryTelemetry {
+    pub tracked_at_create_bytes: u64,
+    pub tracked_current_bytes: u64,
+    pub tracked_peak_bytes: u64,
+    pub snapshot_ring_payload_bytes: u64,
+    pub reflection_ir_payload_capacity_bytes: u64,
+    pub audio_buffer_payload_bytes: u64,
+    pub render_scratch_bytes: u64,
+    pub propagation_delay_line_bytes: u64,
+    pub retained_bake_bytes: u64,
+    pub steam_audio_sdk_internal: MemoryTrackingStatus,
+}
+
+impl Default for MemoryTrackingStatus {
+    fn default() -> Self {
+        Self::Untracked
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct S3SimulationConfig {
     /// Capacity reserved by `IPLSimulationSettings::maxNumOcclusionSamples`.
@@ -1717,10 +1797,40 @@ pub fn build_multi_source_session(
     simulation: S3SimulationConfig,
     sources: &[MultiSourceDescriptor],
 ) -> Result<(SteamAudioSimulationRunner, SteamAudioRenderGraph), BackendError> {
+    build_multi_source_session_for_tier(
+        mesh,
+        baked,
+        audio,
+        simulation,
+        sources,
+        QualityTier::Desktop,
+    )
+}
+
+/// Builds a retained session under an immutable named quality tier.
+///
+/// Callers wanting the tier defaults should pass
+/// [`QualityTier::simulation_defaults`]. Supplying a custom simulation config
+/// is supported, but the governor and active-source ceiling remain bound to
+/// `quality_tier`.
+pub fn build_multi_source_session_for_tier(
+    mesh: &SceneMesh,
+    baked: &BakedProbeBatch,
+    audio: AudioConfig,
+    simulation: S3SimulationConfig,
+    sources: &[MultiSourceDescriptor],
+    quality_tier: QualityTier,
+) -> Result<(SteamAudioSimulationRunner, SteamAudioRenderGraph), BackendError> {
     #[cfg(feature = "linked-sdk")]
     {
-        let (simulation, mut render) =
-            linked::build_multi_source_session(mesh, baked, audio, simulation, sources)?;
+        let (simulation, mut render) = linked::build_multi_source_session(
+            mesh,
+            baked,
+            audio,
+            simulation,
+            sources,
+            quality_tier,
+        )?;
         let stage_output_gain_writer = render
             .take_stage_output_gain_writer()
             .expect("new render graph owns its stage-gain producer");
@@ -1736,7 +1846,7 @@ pub fn build_multi_source_session(
     }
     #[cfg(not(feature = "linked-sdk"))]
     {
-        let _ = (mesh, baked, audio, simulation, sources);
+        let _ = (mesh, baked, audio, simulation, sources, quality_tier);
         Err(BackendError::SdkUnavailable(unavailable_metadata()))
     }
 }
@@ -3366,5 +3476,24 @@ mod tests {
             left.z * right.x - left.x * right.z,
             left.x * right.y - left.y * right.x,
         )
+    }
+
+    #[test]
+    fn mobile_tier_construction_defaults_are_reduced_and_bounded() {
+        let desktop = QualityTier::Desktop.simulation_defaults();
+        let mobile = QualityTier::Mobile.simulation_defaults();
+
+        assert_eq!(QualityTier::Desktop.active_source_cap(), 8);
+        assert_eq!(QualityTier::Mobile.active_source_cap(), 4);
+        assert!(mobile.reflection_rays < desktop.reflection_rays);
+        assert!(mobile.reflection_duration_s < desktop.reflection_duration_s);
+        assert!(mobile.reflection_order < desktop.reflection_order);
+        assert!(mobile.pathing_order < desktop.pathing_order);
+        assert!(mobile.reflection_bounces < desktop.reflection_bounces);
+        assert!(!mobile.validate_paths);
+        assert_eq!(mobile.reflection_rays, 512);
+        assert_eq!(mobile.reflection_duration_s, 0.5);
+        assert_eq!(mobile.reflection_order, 0);
+        assert_eq!(mobile.pathing_order, 1);
     }
 }

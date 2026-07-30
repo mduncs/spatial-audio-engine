@@ -13,6 +13,7 @@ parse_deps = false
 [export]
 include = [
     "FbResult",
+    "FbQualityTier",
     "FbVec3",
     "FbPose",
     "FbSessionConfig",

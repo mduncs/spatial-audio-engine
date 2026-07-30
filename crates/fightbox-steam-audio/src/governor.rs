@@ -5,7 +5,9 @@
 //! bounded SPSC channel used by the propagation and stage-gain paths.
 
 #[cfg(any(feature = "linked-sdk", test))]
-use crate::{AudioConfig, MultiSourceDescriptor, S3SimulationConfig};
+use crate::{
+    AudioConfig, MultiSourceDescriptor, QualityTier, S3SimulationConfig, SessionMemoryTelemetry,
+};
 #[cfg(any(feature = "linked-sdk", test))]
 use fightbox_runtime::SnapshotPublication;
 use fightbox_runtime::backend::MAX_ACTIVE_SOURCES;
@@ -210,6 +212,8 @@ impl Default for SourceQualityTelemetry {
 /// Copyable delivered-quality and timing surface suitable for later CLI serialization.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QualityGovernorTelemetry {
+    pub quality_tier: QualityTier,
+    pub tier_source_cap: u8,
     pub sequence: u64,
     pub ladder_position: u16,
     pub reason: GovernorTransitionReason,
@@ -226,6 +230,7 @@ pub struct QualityGovernorTelemetry {
     pub reflection_output_gain: f32,
     pub sources: [SourceQualityTelemetry; MAX_ACTIVE_SOURCES],
     pub source_count: u8,
+    pub memory: SessionMemoryTelemetry,
 }
 
 #[cfg(any(feature = "linked-sdk", test))]
@@ -349,6 +354,7 @@ impl Default for SourceAudibility {
 
 #[cfg(any(feature = "linked-sdk", test))]
 pub(crate) struct QualityGovernor {
+    quality_tier: QualityTier,
     requested: S3SimulationConfig,
     source_count: usize,
     p99_budget_ns: u64,
@@ -372,6 +378,7 @@ pub(crate) struct QualityGovernor {
     recovery_cost_history: [RecoveryCostHistory; RECOVERY_RUNG_COUNT],
     recovery_probation: Option<RecoveryProbation>,
     global_recovery_lockout: GlobalRecoveryLockout,
+    memory: SessionMemoryTelemetry,
 }
 
 #[cfg(any(feature = "linked-sdk", test))]
@@ -380,6 +387,8 @@ impl QualityGovernor {
         audio: AudioConfig,
         requested: S3SimulationConfig,
         descriptors: &[MultiSourceDescriptor],
+        quality_tier: QualityTier,
+        memory: SessionMemoryTelemetry,
     ) -> (
         Self,
         fightbox_runtime::SnapshotReader<GovernorRenderSnapshot>,
@@ -396,7 +405,12 @@ impl QualityGovernor {
                 predicted_db: descriptor.declared_level_db(),
             };
         }
-        let reflections = delivered_reflections(requested, ReflectionQualityLevel::Minimum, true);
+        let reflections = delivered_reflections(
+            requested,
+            quality_tier,
+            ReflectionQualityLevel::Minimum,
+            true,
+        );
         let mut sources = [SourceQualityLevel::Full; MAX_ACTIVE_SOURCES];
         for index in 0..descriptors.len() {
             sources[index] = degraded_source_quality(audibility[index]);
@@ -415,6 +429,7 @@ impl QualityGovernor {
         let (writer, reader) = SnapshotPublication::new(initial);
         (
             Self {
+                quality_tier,
                 requested,
                 source_count: descriptors.len(),
                 p99_budget_ns: block_period_ns / 2,
@@ -438,6 +453,7 @@ impl QualityGovernor {
                 recovery_cost_history: [RecoveryCostHistory::default(); RECOVERY_RUNG_COUNT],
                 recovery_probation: None,
                 global_recovery_lockout: GlobalRecoveryLockout::default(),
+                memory,
             },
             reader,
         )
@@ -525,6 +541,8 @@ impl QualityGovernor {
             };
         }
         QualityGovernorTelemetry {
+            quality_tier: self.quality_tier,
+            tier_source_cap: self.quality_tier.active_source_cap() as u8,
             sequence: self.render.sequence,
             ladder_position: self.ladder_position(),
             reason: self.reason,
@@ -547,6 +565,7 @@ impl QualityGovernor {
             reflection_output_gain: self.render.reflection_output_gain,
             sources,
             source_count: self.source_count as u8,
+            memory: self.memory,
         }
     }
 
@@ -803,13 +822,21 @@ impl QualityGovernor {
     fn degrade_one(&mut self) -> bool {
         match self.render.reflections.level {
             ReflectionQualityLevel::Full => {
-                self.render.reflections =
-                    delivered_reflections(self.requested, ReflectionQualityLevel::Reduced, false);
+                self.render.reflections = delivered_reflections(
+                    self.requested,
+                    self.quality_tier,
+                    ReflectionQualityLevel::Reduced,
+                    false,
+                );
                 return true;
             }
             ReflectionQualityLevel::Reduced => {
-                self.render.reflections =
-                    delivered_reflections(self.requested, ReflectionQualityLevel::Minimum, false);
+                self.render.reflections = delivered_reflections(
+                    self.requested,
+                    self.quality_tier,
+                    ReflectionQualityLevel::Minimum,
+                    false,
+                );
                 return true;
             }
             ReflectionQualityLevel::Minimum => {}
@@ -856,14 +883,20 @@ impl QualityGovernor {
     fn recovery_candidate(&self) -> Option<RecoveryRung> {
         match self.render.reverb {
             ReverbStrategy::ShortIrLowerOrder => {
-                return Some(RecoveryRung::FullLengthReverb);
+                if self.quality_tier == QualityTier::Desktop {
+                    return Some(RecoveryRung::FullLengthReverb);
+                }
             }
             ReverbStrategy::SdkMixerConvolution
             | ReverbStrategy::Hybrid
             | ReverbStrategy::Baked
             | ReverbStrategy::ListenerCentric => {}
         }
-        if self.render.ambisonic_order < self.requested.reflection_order {
+        let ambisonic_ceiling = match self.quality_tier {
+            QualityTier::Desktop => self.requested.reflection_order,
+            QualityTier::Mobile => 0,
+        };
+        if self.render.ambisonic_order < ambisonic_ceiling {
             return Some(RecoveryRung::AmbisonicOrder(
                 self.render.ambisonic_order + 1,
             ));
@@ -874,12 +907,18 @@ impl QualityGovernor {
         if !self.render.find_alternate_paths && self.requested.find_alternate_paths {
             return Some(RecoveryRung::AlternatePaths);
         }
-        if !self.render.validate_paths && self.requested.validate_paths {
+        if self.quality_tier == QualityTier::Desktop
+            && !self.render.validate_paths
+            && self.requested.validate_paths
+        {
             return Some(RecoveryRung::PathValidation);
         }
         match self.render.reflections.level {
             ReflectionQualityLevel::Minimum => Some(RecoveryRung::ReflectionReduced),
-            ReflectionQualityLevel::Reduced => Some(RecoveryRung::ReflectionFull),
+            ReflectionQualityLevel::Reduced if self.quality_tier == QualityTier::Desktop => {
+                Some(RecoveryRung::ReflectionFull)
+            }
+            ReflectionQualityLevel::Reduced => None,
             ReflectionQualityLevel::Full => None,
         }
     }
@@ -887,12 +926,20 @@ impl QualityGovernor {
     fn apply_recovery(&mut self, rung: RecoveryRung) {
         match rung {
             RecoveryRung::ReflectionFull => {
-                self.render.reflections =
-                    delivered_reflections(self.requested, ReflectionQualityLevel::Full, false);
+                self.render.reflections = delivered_reflections(
+                    self.requested,
+                    self.quality_tier,
+                    ReflectionQualityLevel::Full,
+                    false,
+                );
             }
             RecoveryRung::ReflectionReduced => {
-                self.render.reflections =
-                    delivered_reflections(self.requested, ReflectionQualityLevel::Reduced, false);
+                self.render.reflections = delivered_reflections(
+                    self.requested,
+                    self.quality_tier,
+                    ReflectionQualityLevel::Reduced,
+                    false,
+                );
             }
             RecoveryRung::PathValidation => self.render.validate_paths = true,
             RecoveryRung::AlternatePaths => self.render.find_alternate_paths = true,
@@ -917,12 +964,20 @@ impl QualityGovernor {
     fn degrade_recovered_rung(&mut self, rung: RecoveryRung) -> bool {
         match rung {
             RecoveryRung::ReflectionFull => {
-                self.render.reflections =
-                    delivered_reflections(self.requested, ReflectionQualityLevel::Reduced, false);
+                self.render.reflections = delivered_reflections(
+                    self.requested,
+                    self.quality_tier,
+                    ReflectionQualityLevel::Reduced,
+                    false,
+                );
             }
             RecoveryRung::ReflectionReduced => {
-                self.render.reflections =
-                    delivered_reflections(self.requested, ReflectionQualityLevel::Minimum, false);
+                self.render.reflections = delivered_reflections(
+                    self.requested,
+                    self.quality_tier,
+                    ReflectionQualityLevel::Minimum,
+                    false,
+                );
             }
             RecoveryRung::PathValidation => self.render.validate_paths = false,
             RecoveryRung::AlternatePaths => self.render.find_alternate_paths = false,
@@ -1011,6 +1066,7 @@ impl QualityGovernor {
                     self.render.reverb = strategy;
                     self.render.reflections = delivered_reflections(
                         self.requested,
+                        self.quality_tier,
                         ReflectionQualityLevel::Minimum,
                         final_short_ir,
                     );
@@ -1100,14 +1156,27 @@ fn degraded_source_quality(audibility: SourceAudibility) -> SourceQualityLevel {
 #[cfg(any(feature = "linked-sdk", test))]
 fn delivered_reflections(
     requested: S3SimulationConfig,
+    quality_tier: QualityTier,
     level: ReflectionQualityLevel,
     final_short_ir: bool,
 ) -> DeliveredReflectionQuality {
     let (ray_divisor, diffuse_divisor, bounce_reduction, duration_divisor, cadence_divisor) =
-        match level {
-            ReflectionQualityLevel::Full => (1, 1, 0, 1.0, 1),
-            ReflectionQualityLevel::Reduced => (2, 2, 1, 2.0, 2),
-            ReflectionQualityLevel::Minimum => (4, 4, i32::MAX, 4.0, 4),
+        match (quality_tier, level) {
+            (QualityTier::Desktop, ReflectionQualityLevel::Full) => (1, 1, 0, 1.0, 1),
+            (QualityTier::Desktop, ReflectionQualityLevel::Reduced) => (2, 2, 1, 2.0, 2),
+            (QualityTier::Desktop, ReflectionQualityLevel::Minimum) => (4, 4, i32::MAX, 4.0, 4),
+            // The Mobile construction defaults are already its maximum
+            // resource envelope. "Reduced" names its tier ceiling and
+            // therefore delivers those defaults without dividing them again.
+            (QualityTier::Mobile, ReflectionQualityLevel::Reduced) => (1, 1, 0, 1.0, 2),
+            (QualityTier::Mobile, ReflectionQualityLevel::Minimum) => (2, 2, i32::MAX, 2.0, 4),
+            (QualityTier::Mobile, ReflectionQualityLevel::Full) => {
+                debug_assert!(
+                    false,
+                    "mobile governor cannot reach desktop full reflections"
+                );
+                (1, 1, 0, 1.0, 2)
+            }
         };
     let duration_divisor = if final_short_ir {
         duration_divisor * 2.0
@@ -1158,6 +1227,8 @@ mod tests {
                 ..S3SimulationConfig::default()
             },
             &descriptors,
+            QualityTier::Desktop,
+            SessionMemoryTelemetry::default(),
         )
         .0
     }
@@ -1385,6 +1456,8 @@ mod tests {
             },
             S3SimulationConfig::default(),
             &descriptors,
+            QualityTier::Desktop,
+            SessionMemoryTelemetry::default(),
         )
         .0;
         assert_eq!(
@@ -1418,5 +1491,53 @@ mod tests {
             governor.telemetry().simulation_lateness_ns[2],
             SIMULATION_LATENESS_TRIGGER_NS
         );
+    }
+
+    #[test]
+    fn sustained_headroom_cannot_recover_above_mobile_tier_ceiling() {
+        let descriptors = (0..QualityTier::Mobile.active_source_cap())
+            .map(|index| {
+                MultiSourceDescriptor::at(EnuVector3::new(index as f32, 0.0, 0.0))
+                    .with_reference_level(ReferenceLevel::CreativeDb { db: index as f32 })
+            })
+            .collect::<Vec<_>>();
+        let mut governor = QualityGovernor::new(
+            AudioConfig {
+                sample_rate_hz: 48_000,
+                frame_size: 128,
+            },
+            QualityTier::Mobile.simulation_defaults(),
+            &descriptors,
+            QualityTier::Mobile,
+            SessionMemoryTelemetry::default(),
+        )
+        .0;
+
+        for _ in 0..20_000 {
+            governor.observe_block_timing(100_000);
+            if governor.recovery_candidate().is_none()
+                && governor.recovery_probation.is_none()
+                && governor.pending_render_change.is_none()
+            {
+                break;
+            }
+        }
+
+        let telemetry = governor.telemetry();
+        assert_eq!(telemetry.quality_tier, QualityTier::Mobile);
+        assert_eq!(telemetry.tier_source_cap, 4);
+        assert_eq!(telemetry.reflections.level, ReflectionQualityLevel::Reduced);
+        assert_eq!(telemetry.reflections.rays, 512);
+        assert_eq!(telemetry.reflections.ir_duration_s, 0.5);
+        assert_eq!(telemetry.reflections.cadence_divisor, 2);
+        assert_eq!(telemetry.pathing, PathQualityLevel::NoValidation);
+        assert_eq!(telemetry.ambisonic_order, 0);
+        assert_eq!(telemetry.reverb, ReverbStrategy::ShortIrLowerOrder);
+        assert!(
+            telemetry.sources[..descriptors.len()]
+                .iter()
+                .all(|source| source.quality == SourceQualityLevel::Full)
+        );
+        assert_eq!(governor.recovery_candidate(), None);
     }
 }

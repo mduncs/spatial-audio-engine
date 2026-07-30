@@ -20,12 +20,14 @@ use crate::motion_smoothing::{
     PROPAGATION_SLEW_TIME_SECONDS, SourcePropagationSmoother, maximum_propagation_delay_samples,
     propagation_delay_samples,
 };
+use crate::{MemoryTrackingStatus, QualityTier, SessionMemoryTelemetry};
 use fightbox_api::{EnuVector3 as ApiEnuVector3, Pose};
 use fightbox_runtime::backend::{
     BackendRenderError, BackendSourceBlock, ListenerOrientation, MAX_ACTIVE_SOURCES,
     PropagationRenderBlock, SimulationError, SimulationUpdate,
 };
 use fightbox_runtime::{FractionalDelayLine, SnapshotPublication};
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1134,7 +1136,15 @@ pub(crate) fn build_multi_source_session(
     config: S3SimulationConfig,
     descriptors: &[crate::MultiSourceDescriptor],
 ) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
-    build_multi_source_generation(mesh, Some(baked), audio, config, descriptors, 1)
+    build_multi_source_generation(
+        mesh,
+        Some(baked),
+        audio,
+        config,
+        descriptors,
+        1,
+        QualityTier::Desktop,
+    )
 }
 
 pub(crate) fn build_multi_source_generation(
@@ -1144,8 +1154,10 @@ pub(crate) fn build_multi_source_generation(
     config: S3SimulationConfig,
     descriptors: &[crate::MultiSourceDescriptor],
     generation: u64,
+    quality_tier: QualityTier,
 ) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
-    validate_multi_source_config(mesh, baked, audio, config, descriptors)?;
+    validate_multi_source_config(mesh, baked, audio, config, descriptors, quality_tier)?;
+    let memory = session_memory_telemetry(audio, config, descriptors.len(), baked)?;
     let world = Arc::new(create_world(
         mesh,
         baked,
@@ -1153,6 +1165,7 @@ pub(crate) fn build_multi_source_generation(
         config,
         descriptors.len(),
         generation,
+        quality_tier,
     )?);
     let mut initial = SteamPropagationSnapshot::default();
     initial.world_generation = generation;
@@ -1177,7 +1190,8 @@ pub(crate) fn build_multi_source_generation(
     let (writer, reader) = SnapshotPublication::new(initial);
     let (stage_output_gain_writer, stage_output_gains) =
         SnapshotPublication::new(StageOutputGains::UNITY);
-    let (governor, governor_quality) = QualityGovernor::new(audio, config, descriptors);
+    let (governor, governor_quality) =
+        QualityGovernor::new(audio, config, descriptors, quality_tier, memory);
     let render = create_render_graph(
         Arc::clone(&world),
         audio,
@@ -1213,15 +1227,16 @@ fn validate_multi_source_config(
     audio: AudioConfig,
     config: S3SimulationConfig,
     descriptors: &[crate::MultiSourceDescriptor],
+    quality_tier: QualityTier,
 ) -> Result<(), BackendError> {
     validate_audio(audio)?;
     validate_mesh(mesh)?;
     if let Some(baked) = baked {
         baked.validate()?;
     }
-    if descriptors.is_empty() || descriptors.len() > MAX_ACTIVE_SOURCES {
+    if descriptors.is_empty() || descriptors.len() > quality_tier.active_source_cap() {
         return Err(BackendError::InvalidInput(
-            "multi-source session requires between one and MAX_ACTIVE_SOURCES descriptors",
+            "multi-source session source count exceeds the selected quality tier cap",
         ));
     }
     if descriptors.iter().any(|descriptor| {
@@ -1267,6 +1282,77 @@ fn validate_multi_source_config(
     Ok(())
 }
 
+fn session_memory_telemetry(
+    audio: AudioConfig,
+    config: S3SimulationConfig,
+    source_count: usize,
+    baked: Option<&BakedProbeBatch>,
+) -> Result<SessionMemoryTelemetry, BackendError> {
+    let frames = u64::try_from(audio.frame_size)
+        .map_err(|_| BackendError::InvalidInput("audio frame size must be positive"))?;
+    let sources = source_count as u64;
+    let channels = u64::try_from(ambisonics_channel_count(config.reflection_order)?)
+        .map_err(|_| BackendError::InvalidInput("Ambisonic channel count must be positive"))?;
+    let ir_samples = u64::try_from(reflection_ir_size(
+        config.reflection_duration_s,
+        audio.sample_rate_hz,
+    )?)
+    .map_err(|_| BackendError::InvalidInput("reflection IR size must be positive"))?;
+    let float_bytes = size_of::<f32>() as u64;
+
+    // SnapshotPublication owns three shared payload slots; each reader retains
+    // one last-complete payload. This reports payload bytes, not Arc/allocator
+    // bookkeeping.
+    let snapshot_ring_payload_bytes = 4_u64.saturating_mul(
+        size_of::<SteamPropagationSnapshot>()
+            .saturating_add(size_of::<GovernorRenderSnapshot>())
+            .saturating_add(size_of::<StageOutputGains>()) as u64,
+    );
+    let reflection_ir_payload_capacity_bytes =
+        if reflection_effect_uses_ir(config.reflection_effect.effect_type) {
+            sources
+                .saturating_mul(channels)
+                .saturating_mul(ir_samples)
+                .saturating_mul(float_bytes)
+        } else {
+            0
+        };
+    // Per source: mono input + mono direct + stereo direct + stereo path +
+    // Ambisonic reflection scratch. Shared: Ambisonic reflection mix + stereo
+    // decode target.
+    let audio_buffer_payload_bytes = sources
+        .saturating_mul(6_u64.saturating_add(channels))
+        .saturating_add(channels.saturating_add(2))
+        .saturating_mul(frames)
+        .saturating_mul(float_bytes);
+    let render_scratch_bytes = 3_u64.saturating_mul(frames).saturating_mul(float_bytes);
+    let propagation_delay_line_bytes = sources
+        .saturating_mul(
+            maximum_propagation_delay_samples(audio.sample_rate_hz).saturating_add(4) as u64,
+        )
+        .saturating_mul(float_bytes);
+    let retained_bake_bytes = baked.map_or(0, |value| value.bytes.len() as u64);
+    let tracked = snapshot_ring_payload_bytes
+        .saturating_add(reflection_ir_payload_capacity_bytes)
+        .saturating_add(audio_buffer_payload_bytes)
+        .saturating_add(render_scratch_bytes)
+        .saturating_add(propagation_delay_line_bytes)
+        .saturating_add(retained_bake_bytes);
+
+    Ok(SessionMemoryTelemetry {
+        tracked_at_create_bytes: tracked,
+        tracked_current_bytes: tracked,
+        tracked_peak_bytes: tracked,
+        snapshot_ring_payload_bytes,
+        reflection_ir_payload_capacity_bytes,
+        audio_buffer_payload_bytes,
+        render_scratch_bytes,
+        propagation_delay_line_bytes,
+        retained_bake_bytes,
+        steam_audio_sdk_internal: MemoryTrackingStatus::Untracked,
+    })
+}
+
 fn create_world(
     mesh: &SceneMesh,
     baked: Option<&BakedProbeBatch>,
@@ -1274,6 +1360,7 @@ fn create_world(
     config: S3SimulationConfig,
     source_count: usize,
     generation: u64,
+    quality_tier: QualityTier,
 ) -> Result<WorldGeneration, BackendError> {
     let mut context = core::ptr::null_mut();
     let mut context_settings = ffi::IPLContextSettings::pinned_defaults();
@@ -1389,7 +1476,7 @@ fn create_world(
             numDiffuseSamples: config.diffuse_samples,
             maxDuration: config.reflection_duration_s,
             maxOrder: config.reflection_order.max(config.pathing_order),
-            maxNumSources: MAX_ACTIVE_SOURCES as i32,
+            maxNumSources: quality_tier.active_source_cap() as i32,
             numThreads: config.simulation_threads,
             rayBatchSize: config.ray_batch_size,
             numVisSamples: config.pathing_visibility_samples,
@@ -2340,6 +2427,7 @@ mod tests {
             test_config(),
             &descriptors,
             41,
+            QualityTier::Desktop,
         )
         .unwrap();
         let mut wrong_generation = simulation.snapshot;

@@ -30,6 +30,11 @@ typedef enum FbResult {
   FbPanic = 9,
 } FbResult;
 
+typedef enum FbQualityTier {
+  FbQualityDesktop = 0,
+  FbQualityMobile = 1,
+} FbQualityTier;
+
 typedef struct FbSession FbSession;
 
 typedef struct FbVec3 {
@@ -49,6 +54,11 @@ typedef struct FbSessionConfig {
   uint32_t block_size_frames;
   uint32_t source_count;
   float default_source_level_db;
+  /**
+   * One of `FbQualityTier`. Zero selects Desktop, preserving legacy
+   * zero-initialized caller behavior. Unknown values are rejected.
+   */
+  uint32_t quality_tier;
 } FbSessionConfig;
 
 typedef struct FbSourceUpdate {

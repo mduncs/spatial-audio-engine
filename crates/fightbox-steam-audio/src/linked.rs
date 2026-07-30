@@ -1,6 +1,6 @@
 //! Safe RAII and owned Phase A operations over the private 4.8.1 FFI module.
 
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{marker::PhantomData, mem::size_of, ptr::NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -33,7 +33,7 @@ use multi_source::{
 use crate::world_swap;
 use crate::{
     DeliveredWorldState, MultiSourceDescriptor, PreparedWorldCapabilities, PreparedWorldSwapError,
-    StageOutputGains, WorldReflectionState,
+    QualityTier, StageOutputGains, WorldReflectionState,
 };
 use fightbox_runtime::backend::{
     BackendRenderError, PropagationRenderBlock, SimulationError, SimulationUpdate,
@@ -140,6 +140,9 @@ pub(crate) struct MultiSourceSimulation {
     prepared: world_swap::Producer<GenerationRenderGraph>,
     retired: world_swap::Consumer<GenerationRenderGraph>,
     delivered: Arc<AtomicU64>,
+    session_fixed_memory_bytes: u64,
+    tracked_memory_at_create_bytes: u64,
+    tracked_memory_peak_bytes: u64,
 }
 
 impl MultiSourceSimulation {
@@ -162,10 +165,22 @@ impl MultiSourceSimulation {
     }
 
     pub(crate) fn quality_governor_telemetry(&self) -> Option<crate::QualityGovernorTelemetry> {
-        self.active
-            .capabilities()
-            .baked_pathing
-            .then(|| self.active.quality_governor_telemetry())
+        self.active.capabilities().baked_pathing.then(|| {
+            let mut telemetry = self.active.quality_governor_telemetry();
+            telemetry.memory.render_scratch_bytes = telemetry
+                .memory
+                .render_scratch_bytes
+                .saturating_add(self.session_fixed_memory_bytes);
+            telemetry.memory.tracked_at_create_bytes = self.tracked_memory_at_create_bytes;
+            telemetry.memory.tracked_current_bytes = telemetry
+                .memory
+                .tracked_current_bytes
+                .saturating_add(self.session_fixed_memory_bytes);
+            telemetry.memory.tracked_peak_bytes = self
+                .tracked_memory_peak_bytes
+                .max(telemetry.memory.tracked_current_bytes);
+            telemetry
+        })
     }
 
     pub(crate) fn update_inputs(&mut self, update: &SimulationUpdate) {
@@ -209,7 +224,22 @@ impl MultiSourceSimulation {
             config,
             descriptors,
             generation,
+            self.active.quality_governor_telemetry().quality_tier,
         )?;
+        let active_bytes = self
+            .active
+            .quality_governor_telemetry()
+            .memory
+            .tracked_current_bytes;
+        let prepared_bytes = simulation
+            .quality_governor_telemetry()
+            .memory
+            .tracked_current_bytes;
+        self.tracked_memory_peak_bytes = self.tracked_memory_peak_bytes.max(
+            active_bytes
+                .saturating_add(prepared_bytes)
+                .saturating_add(self.session_fixed_memory_bytes),
+        );
         Ok(PreparedMultiSourceWorld { simulation, render })
     }
 
@@ -349,21 +379,43 @@ pub(crate) fn build_multi_source_session(
     audio: AudioConfig,
     config: S3SimulationConfig,
     descriptors: &[MultiSourceDescriptor],
+    quality_tier: QualityTier,
 ) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
     let generation = next_world_generation();
-    let (simulation, render) =
-        build_multi_source_generation(mesh, Some(baked), audio, config, descriptors, generation)?;
+    let (simulation, render) = build_multi_source_generation(
+        mesh,
+        Some(baked),
+        audio,
+        config,
+        descriptors,
+        generation,
+        quality_tier,
+    )?;
     let capabilities = simulation.capabilities();
+    let generation_memory_bytes = simulation
+        .quality_governor_telemetry()
+        .memory
+        .tracked_current_bytes;
     let delivered = Arc::new(AtomicU64::new(encode_delivery(capabilities, 0)));
     let (prepared_tx, prepared_rx) = world_swap::channel();
     let (retired_tx, retired_rx) = world_swap::channel();
     let frames = audio.frame_size as usize;
+    // The swap wrapper retains old/new stereo render targets so adopting a
+    // prepared generation never allocates on the callback.
+    let session_fixed_memory_bytes = (frames as u64)
+        .saturating_mul(4)
+        .saturating_mul(size_of::<f32>() as u64);
+    let tracked_memory_at_create_bytes =
+        generation_memory_bytes.saturating_add(session_fixed_memory_bytes);
     Ok((
         MultiSourceSimulation {
             active: simulation,
             prepared: prepared_tx,
             retired: retired_rx,
             delivered: Arc::clone(&delivered),
+            session_fixed_memory_bytes,
+            tracked_memory_at_create_bytes,
+            tracked_memory_peak_bytes: tracked_memory_at_create_bytes,
         },
         MultiSourceRenderGraph {
             active: render,
