@@ -714,19 +714,7 @@ impl MultiSourceRenderGraph {
         let listener_centric_reflection = governor_quality.reverb
             != ReverbStrategy::ListenerCentric
             || usize::from(governor_quality.listener_centric_source) == source_block.source_index;
-        let targets = match source_quality {
-            SourceQualityLevel::Full => [
-                1.0,
-                1.0,
-                if listener_centric_reflection {
-                    1.0
-                } else {
-                    0.0
-                },
-            ],
-            SourceQualityLevel::DirectOnly => [1.0, 0.0, 0.0],
-            SourceQualityLevel::Virtualized => [0.0, 0.0, 0.0],
-        };
+        let targets = source_quality_targets(source_quality, listener_centric_reflection);
         let quality_ramps: [GainRamp; 3] = std::array::from_fn(|index| {
             GainRamp::new(
                 state.quality_gains[index],
@@ -1432,6 +1420,15 @@ fn create_render_graph(
         )?);
     }
     let applied_governor_quality = governor_quality.read();
+    for (index, state) in source_states.iter_mut().enumerate() {
+        let listener_centric_reflection = applied_governor_quality.reverb
+            != ReverbStrategy::ListenerCentric
+            || usize::from(applied_governor_quality.listener_centric_source) == index;
+        state.quality_gains = source_quality_targets(
+            applied_governor_quality.sources[index],
+            listener_centric_reflection,
+        );
+    }
     Ok(MultiSourceRenderGraph {
         world,
         config,
@@ -1456,6 +1453,25 @@ fn create_render_graph(
         #[cfg(test)]
         governor_snapshot_reads: 0,
     })
+}
+
+fn source_quality_targets(
+    quality: SourceQualityLevel,
+    listener_centric_reflection: bool,
+) -> [f32; 3] {
+    match quality {
+        SourceQualityLevel::Full => [
+            1.0,
+            1.0,
+            if listener_centric_reflection {
+                1.0
+            } else {
+                0.0
+            },
+        ],
+        SourceQualityLevel::DirectOnly => [1.0, 0.0, 0.0],
+        SourceQualityLevel::Virtualized => [0.0, 0.0, 0.0],
+    }
 }
 
 fn create_source_render_state(
@@ -1831,13 +1847,13 @@ mod tests {
         let (mut simulation, mut render) =
             build_multi_source_session(&mesh, &baked, audio, test_config(), &descriptor).unwrap();
 
-        // Reflection levels, validation, alternates, then the source rung.
-        for _ in 0..(5 * 16) {
-            simulation.observe_render_timing(3_000_000);
-        }
         let zeros = vec![0.0; audio.frame_size as usize];
         let ones = vec![1.0; audio.frame_size as usize];
         let reads_before = render.governor_snapshot_reads;
+        assert_eq!(
+            render.sources[0].quality_gains, [0.0; 3],
+            "the first render block must inherit the conservative snapshot"
+        );
         render_one_source_block(&mut render, &zeros);
         simulation.observe_render_timing(100_000);
         render_one_source_block(&mut render, &ones);
@@ -1855,20 +1871,26 @@ mod tests {
             "the delay/transport path stopped while backend DSP was virtualized"
         );
 
-        // Sustained headroom restores this first source rung. The next block
-        // ramps from silence to full quality without rewinding transport.
-        for _ in 0..(8 * 16) {
+        // Sustained headroom earns the preceding reverb and order rungs, then
+        // restores this source. The next block ramps from silence to full
+        // quality without rewinding transport.
+        for _ in 0..5_000 {
             simulation.observe_render_timing(100_000);
+            if simulation.quality_governor_telemetry().sources[0].quality
+                == SourceQualityLevel::Full
+            {
+                break;
+            }
         }
-        render_one_source_block(&mut render, &ones);
-        simulation.observe_render_timing(100_000);
-        render_one_source_block(&mut render, &ones);
-        simulation.observe_render_timing(100_000);
-        render_one_source_block(&mut render, &ones);
         assert_eq!(
             simulation.quality_governor_telemetry().sources[0].quality,
             SourceQualityLevel::Full
         );
+        render_one_source_block(&mut render, &ones);
+        simulation.observe_render_timing(100_000);
+        render_one_source_block(&mut render, &ones);
+        simulation.observe_render_timing(100_000);
+        render_one_source_block(&mut render, &ones);
         assert_eq!(render.governor_snapshot_reads - reads_before, 6);
         assert_eq!(render.sources[0].quality_gains, [1.0; 3]);
     }
