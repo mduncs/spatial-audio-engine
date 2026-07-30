@@ -10,6 +10,8 @@ use fightbox_api::{
 };
 use fightbox_evidence::sha256_hex;
 use fightbox_runtime::backend::{SimulationRunner, SimulationUpdate, SourceMotion};
+#[cfg(feature = "live-output")]
+use fightbox_runtime::{BlockProcessor, RenderError, SnapshotReader};
 use fightbox_runtime::{
     FaultCounters, MAX_ACTIVE_SOURCES, OfflineDriver, ProcessBlock, PropagationSnapshot,
     RuntimeGraph, SnapshotPublication, SourceBlock, SourcePropagation, TimingHistory,
@@ -862,7 +864,11 @@ pub fn run_soak(
     live: bool,
     reflection_effect: ReflectionEffectConfig,
 ) -> Result<()> {
-    let fixture_path = repo_root().join("fixtures/s6a-four-sources/fixture.json");
+    let fixture_path = if live {
+        repo_root().join("fixtures/s6a-four-sources-moving-listener/fixture.json")
+    } else {
+        repo_root().join("fixtures/s6a-four-sources/fixture.json")
+    };
     run_fixture_soak(
         minutes,
         output,
@@ -1207,12 +1213,57 @@ fn offline_soak(
 }
 
 #[cfg(feature = "live-output")]
+trait ListenerStateSink {
+    fn set_listener_state(&mut self, listener: ListenerState);
+}
+
+#[cfg(feature = "live-output")]
+impl ListenerStateSink for RuntimeGraph {
+    fn set_listener_state(&mut self, listener: ListenerState) {
+        RuntimeGraph::set_listener_state(self, listener);
+    }
+}
+
+#[cfg(feature = "live-output")]
+struct PoseDrivenProcessor<P> {
+    processor: P,
+    pose_reader: SnapshotReader<ListenerState>,
+}
+
+#[cfg(feature = "live-output")]
+impl<P> PoseDrivenProcessor<P> {
+    fn new(processor: P, pose_reader: SnapshotReader<ListenerState>) -> Self {
+        Self {
+            processor,
+            pose_reader,
+        }
+    }
+}
+
+#[cfg(feature = "live-output")]
+impl<P: BlockProcessor + ListenerStateSink> BlockProcessor for PoseDrivenProcessor<P> {
+    fn block_size_frames(&self) -> usize {
+        self.processor.block_size_frames()
+    }
+
+    fn process_block(&mut self, block: ProcessBlock<'_>) -> std::result::Result<(), RenderError> {
+        self.processor.set_listener_state(self.pose_reader.read());
+        self.processor.process_block(block)
+    }
+
+    fn fault_counters(&self) -> FaultCounters {
+        self.processor.fault_counters()
+    }
+}
+
+#[cfg(feature = "live-output")]
 fn live_soak(
     prepared: &PreparedFixture,
     baked: &BakedProbeBatch,
     seconds: u64,
 ) -> Result<MeasuredSoakReport> {
     use fightbox_runtime::live::{LiveInputProvider, LiveSourceBuffer};
+    use std::ops::ControlFlow;
 
     struct LoopingInput {
         signals: Vec<Vec<f32>>,
@@ -1236,6 +1287,9 @@ fn live_soak(
     let (mut runner, graph) = build_graph(prepared, baked)?;
     runner.update_inputs(&simulation_update(prepared, 0));
     initial_simulation(&mut runner)?;
+    let initial_listener = listener_state_at(&prepared.fixture, 0);
+    let (mut pose_writer, pose_reader) = SnapshotPublication::new(initial_listener);
+    let processor = PoseDrivenProcessor::new(graph, pose_reader);
     let input = LoopingInput {
         signals: prepared
             .sources
@@ -1244,13 +1298,36 @@ fn live_soak(
             .collect(),
         offsets: vec![0; prepared.sources.len()],
     };
-    let report = fightbox_runtime::live::run_live_soak_with_input(
-        graph,
+    let mut next_ticks = [1_u64; 3];
+    let mut simulation = SimulationTelemetry::default();
+    let mut control_error = None;
+    let live_result = fightbox_runtime::live::run_live_soak_with_input_and_control(
+        processor,
         engine_config(prepared.sources.len()),
         Box::new(input),
         seconds,
-    )
-    .map_err(|error| CliError::new(format!("live soak failed: {error:?}")))?;
+        |elapsed| {
+            let rendered_frames = elapsed_audio_frames(elapsed);
+            pose_writer.publish(listener_state_at(&prepared.fixture, rendered_frames));
+            if let Err(error) = step_simulation(
+                &mut runner,
+                prepared,
+                rendered_frames,
+                &mut next_ticks,
+                &mut simulation,
+            ) {
+                control_error = Some(error);
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
+    if let Some(error) = control_error {
+        return Err(error);
+    }
+    let report =
+        live_result.map_err(|error| CliError::new(format!("live soak failed: {error:?}")))?;
     Ok(MeasuredSoakReport {
         report,
         governor: runner.quality_governor_telemetry(),
@@ -1267,6 +1344,16 @@ fn live_soak(
     Err(CliError::new(
         "--live requires rebuilding with --features live-output,linked-sdk",
     ))
+}
+
+#[cfg(feature = "live-output")]
+fn elapsed_audio_frames(elapsed: std::time::Duration) -> u64 {
+    elapsed
+        .as_nanos()
+        .saturating_mul(u128::from(SAMPLE_RATE))
+        .checked_div(1_000_000_000)
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn render(
@@ -1487,6 +1574,14 @@ fn motion_at(source: &FixtureSource, rendered_frames: u64) -> (EnuVector3, EnuVe
 
 fn trajectory_motion_at(trajectory: &Trajectory, rendered_frames: u64) -> (EnuVector3, EnuVector3) {
     let mut remaining = rendered_frames as f64 / f64::from(SAMPLE_RATE) * trajectory.speed_mps;
+    if trajectory.waypoints_m.first() == trajectory.waypoints_m.last() {
+        let cycle_distance = trajectory
+            .waypoints_m
+            .windows(2)
+            .map(|segment| length(sub(segment[1], segment[0])))
+            .sum::<f64>();
+        remaining %= cycle_distance;
+    }
     for segment in trajectory.waypoints_m.windows(2) {
         let delta = sub(segment[1], segment[0]);
         let distance = length(delta);
@@ -1605,11 +1700,16 @@ fn validate_fixture(fixture: &Fixture, fixture_use: FixtureUse) -> Result<()> {
                 || fixture.gate != "S6A"
                 || fixture.sources.len() != 4
                 || moving_sources != 1
-                || fixture.listener.trajectory.is_some()
-                || fixture.listener.position_m.is_none() =>
+                || fixture
+                    .listener
+                    .trajectory
+                    .as_ref()
+                    .is_some_and(|trajectory| {
+                        trajectory.waypoints_m.first() != trajectory.waypoints_m.last()
+                    }) =>
         {
             return Err(CliError::new(
-                "phase-b S6a requires four sources, exactly one moving source, and a static listener",
+                "phase-b S6a requires four sources, exactly one moving source, and a static or closed-cycle moving listener",
             ));
         }
         FixtureUse::PhaseBS6b
@@ -1948,6 +2048,7 @@ fn length(value: [f64; 3]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fightbox_steam_audio::{QualityTier, SessionMemoryTelemetry};
 
     fn fixture() -> Fixture {
         serde_json::from_str(include_str!(
@@ -1959,6 +2060,155 @@ mod tests {
     #[test]
     fn repository_fixture_is_valid() {
         validate_fixture(&fixture(), FixtureUse::PhaseBS6a).unwrap();
+    }
+
+    fn moving_listener_fixture() -> Fixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/s6a-four-sources-moving-listener/fixture.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn moving_listener_fixture_preserves_sources_and_has_a_closed_walk_cycle() {
+        let baseline = fixture();
+        let fixture = moving_listener_fixture();
+        for (actual, expected) in fixture.sources.iter().zip(&baseline.sources) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.asset_id, expected.asset_id);
+            assert_eq!(actual.reference_level.mode, expected.reference_level.mode);
+            assert_eq!(
+                actual.reference_level.db_spl,
+                expected.reference_level.db_spl
+            );
+            assert_eq!(actual.position_m, expected.position_m);
+            match (&actual.trajectory, &expected.trajectory) {
+                (Some(actual), Some(expected)) => {
+                    assert_eq!(actual.waypoints_m, expected.waypoints_m);
+                    assert_eq!(actual.speed_mps, expected.speed_mps);
+                    assert_eq!(actual.max_speed_mps, expected.max_speed_mps);
+                }
+                (None, None) => {}
+                _ => panic!("source motion kind changed"),
+            }
+        }
+        validate_fixture(&fixture, FixtureUse::PhaseBS6a).unwrap();
+        assert_eq!(fixture.fixture_id, "s6a-four-sources-moving-listener");
+        let trajectory = fixture.listener.trajectory.as_ref().unwrap();
+        assert_eq!(
+            trajectory.waypoints_m.first(),
+            trajectory.waypoints_m.last()
+        );
+        assert!((1.5..=3.0).contains(&trajectory.speed_mps));
+        assert!(
+            trajectory
+                .waypoints_m
+                .iter()
+                .all(|waypoint| waypoint[2] == 1.5)
+        );
+    }
+
+    #[test]
+    fn closed_listener_trajectory_repeats_after_each_cycle() {
+        let fixture = moving_listener_fixture();
+        let trajectory = fixture.listener.trajectory.as_ref().unwrap();
+        let cycle_frames =
+            (trajectory_duration(trajectory) * f64::from(SAMPLE_RATE)).round() as u64;
+        assert_eq!(
+            listener_state_at(&fixture, 0),
+            listener_state_at(&fixture, cycle_frames)
+        );
+    }
+
+    #[cfg(feature = "live-output")]
+    #[test]
+    fn pose_driven_processor_applies_the_latest_listener_for_each_block() {
+        struct RecordingProcessor {
+            listener: ListenerState,
+            observed: [ListenerState; 2],
+            observed_len: usize,
+        }
+
+        impl ListenerStateSink for RecordingProcessor {
+            fn set_listener_state(&mut self, listener: ListenerState) {
+                self.listener = listener;
+            }
+        }
+
+        impl BlockProcessor for RecordingProcessor {
+            fn block_size_frames(&self) -> usize {
+                1
+            }
+
+            fn process_block(
+                &mut self,
+                block: ProcessBlock<'_>,
+            ) -> std::result::Result<(), RenderError> {
+                self.observed[self.observed_len] = self.listener;
+                self.observed_len += 1;
+                block.output_left[0] = 0.0;
+                block.output_right[0] = 0.0;
+                Ok(())
+            }
+        }
+
+        let north = ListenerState {
+            pose: Pose {
+                position: EnuVector3::new(0.0, 0.0, 1.5),
+                forward: EnuVector3::new(0.0, 1.0, 0.0),
+                up: EnuVector3::new(0.0, 0.0, 1.0),
+            },
+            linear_velocity_mps: EnuVector3::default(),
+        };
+        let east = ListenerState {
+            pose: Pose {
+                position: EnuVector3::new(1.0, 0.0, 1.5),
+                forward: EnuVector3::new(0.0, 1.0, 0.0),
+                up: EnuVector3::new(0.0, 0.0, 1.0),
+            },
+            linear_velocity_mps: EnuVector3::new(2.0, 0.0, 0.0),
+        };
+        let (mut writer, reader) = SnapshotPublication::new(north);
+        let recording = RecordingProcessor {
+            listener: north,
+            observed: [north; 2],
+            observed_len: 0,
+        };
+        let mut processor = PoseDrivenProcessor::new(recording, reader);
+        let mut left = [0.0];
+        let mut right = [0.0];
+        processor
+            .process_block(ProcessBlock {
+                now_ns: 0,
+                sources: &[],
+                output_left: &mut left,
+                output_right: &mut right,
+            })
+            .unwrap();
+        writer.publish(east);
+        processor
+            .process_block(ProcessBlock {
+                now_ns: 1,
+                sources: &[],
+                output_left: &mut left,
+                output_right: &mut right,
+            })
+            .unwrap();
+
+        assert_eq!(processor.processor.observed, [north, east]);
+    }
+
+    #[cfg(feature = "live-output")]
+    #[test]
+    fn live_control_wall_time_maps_to_48khz_audio_frames() {
+        assert_eq!(
+            elapsed_audio_frames(std::time::Duration::from_millis(10)),
+            480
+        );
+        assert_eq!(
+            elapsed_audio_frames(std::time::Duration::from_secs(1)),
+            48_000
+        );
     }
 
     fn s6b_fixture() -> Fixture {
@@ -2011,6 +2261,8 @@ mod tests {
             transport_advances: true,
         };
         let telemetry = QualityGovernorTelemetry {
+            quality_tier: QualityTier::Desktop,
+            tier_source_cap: MAX_ACTIVE_SOURCES as u8,
             sequence: 7,
             ladder_position: 9,
             reason: GovernorTransitionReason::RenderP999OverCeiling,
@@ -2037,6 +2289,7 @@ mod tests {
             reflection_output_gain: 1.0,
             sources,
             source_count: 3,
+            memory: SessionMemoryTelemetry::default(),
         };
         let source_ids = vec!["lead".into(), "bed".into(), "distant".into()];
         let value = serde_json::to_value(delivered_quality_from_telemetry(

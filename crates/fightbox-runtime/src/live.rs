@@ -473,6 +473,48 @@ pub fn run_live_soak_with_input<P: BlockProcessor + Send + 'static>(
     })
 }
 
+/// Runs a real device soak while giving the caller a 10 ms control-side tick.
+///
+/// The control closure runs on the caller's thread, never in the device
+/// callback. Returning `Break` stops playback early so the caller can surface a
+/// control-side failure after this function has paused the stream.
+pub fn run_live_soak_with_input_and_control<P, C>(
+    processor: P,
+    engine_config: EngineConfig,
+    input: Box<dyn LiveInputProvider>,
+    seconds: u64,
+    mut control: C,
+) -> Result<SoakReport, LiveOutputError>
+where
+    P: BlockProcessor + Send + 'static,
+    C: FnMut(Duration) -> std::ops::ControlFlow<()>,
+{
+    let output = LiveOutput::new_default_with_input(processor, engine_config, input)?;
+    output.start()?;
+    let started = Instant::now();
+    let requested = Duration::from_secs(seconds);
+    let control_interval = Duration::from_millis(10);
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= requested {
+            break;
+        }
+        if control(elapsed).is_break() {
+            break;
+        }
+        std::thread::sleep(control_interval.min(requested.saturating_sub(elapsed)));
+    }
+    output.stop()?;
+    let telemetry = output.telemetry();
+    Ok(SoakReport {
+        rendered_blocks: telemetry.callback_count,
+        window_callback_timings: telemetry.callback_timings,
+        run_callback_timings: telemetry.run_callback_timings,
+        deadline_misses: telemetry.deadline_misses,
+        faults: telemetry.faults,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
