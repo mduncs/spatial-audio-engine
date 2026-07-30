@@ -1,0 +1,8 @@
+/target/
+/.cache/
+fixtures/assets/music/*.wav
+__pycache__/
+*.py[cod]
+.DS_Store
+/EXECUTION.md
+/runs/

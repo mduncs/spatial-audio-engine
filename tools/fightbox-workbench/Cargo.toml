@@ -1,0 +1,29 @@
+[package]
+name = "fightbox-workbench"
+version = "0.1.0"
+description = "Interactive Fightbox spatial-audio diagnostic workbench"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+linked-sdk = ["fightbox-steam-audio/linked-sdk"]
+live-output = ["fightbox-runtime/live-output"]
+
+[dependencies]
+eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "wgpu"] }
+# eframe with default-features=false leaves wgpu backend-less; enable Metal + WGSL explicitly.
+wgpu = { version = "27", default-features = false, features = ["metal", "wgsl"] }
+fightbox-api = { path = "../../crates/fightbox-api" }
+fightbox-evidence = { path = "../../crates/fightbox-evidence" }
+fightbox-runtime = { path = "../../crates/fightbox-runtime" }
+fightbox-steam-audio = { path = "../../crates/fightbox-steam-audio" }
+fightbox-world = { path = "../../crates/fightbox-world" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "fightbox-workbench"
+path = "src/main.rs"

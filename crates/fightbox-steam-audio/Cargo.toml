@@ -1,0 +1,23 @@
+[package]
+name = "fightbox-steam-audio"
+version = "0.1.0"
+description = "Audited Steam Audio 4.8.1 boundary for Fightbox"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+links = "fightbox_steam_audio"
+
+[features]
+default = []
+# Links the locally verified official Steam Audio SDK. Set STEAM_AUDIO_SDK_DIR
+# to the extracted SDK root, normally the value printed by the acquisition script.
+linked-sdk = []
+
+[dependencies]
+fightbox-api = { path = "../fightbox-api" }
+fightbox-runtime = { path = "../fightbox-runtime" }
+
+[lib]
+path = "src/lib.rs"

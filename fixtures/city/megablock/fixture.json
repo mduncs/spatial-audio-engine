@@ -1,0 +1,180 @@
+{
+  "schema_version": "fightbox.fixture.s6a.v1",
+  "fixture_id": "megablock-walk",
+  "gate": "S5",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {
+    "name": "Steam Audio",
+    "version": "4.8.1"
+  },
+  "sources": [
+    {
+      "id": "toms-diner-mid-grid",
+      "asset_id": "toms-diner",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 85
+      },
+      "position_m": [
+        292.5,
+        292.5,
+        1.5
+      ]
+    }
+  ],
+  "listener": {
+    "trajectory": {
+      "waypoints_m": [
+        [
+          197.5,
+          292.5,
+          1.5
+        ],
+        [
+          292.5,
+          292.5,
+          1.5
+        ],
+        [
+          292.5,
+          387.5,
+          1.5
+        ]
+      ],
+      "speed_mps": 6.0,
+      "max_speed_mps": 6.0
+    },
+    "forward_enu": [
+      1,
+      0,
+      0
+    ],
+    "up_enu": [
+      0,
+      0,
+      1
+    ]
+  },
+  "geometry": {
+    "vertices_m": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        585,
+        0,
+        0
+      ],
+      [
+        585,
+        585,
+        0
+      ],
+      [
+        0,
+        585,
+        0
+      ]
+    ],
+    "triangles": [
+      {
+        "indices": [
+          0,
+          1,
+          2
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          2,
+          3
+        ],
+        "material": "masonry"
+      }
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [
+          0.03,
+          0.05,
+          0.07
+        ],
+        "scattering": 0.1,
+        "transmission": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {
+      "distance_attenuation": true,
+      "occlusion": true,
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "enabled": true,
+      "rays": 4096,
+      "bounces": 3,
+      "duration_s": 1.5
+    },
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": [
+        "direct",
+        "path",
+        "reflections"
+      ]
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [
+        0,
+        0,
+        0.5
+      ],
+      "max_m": [
+        585,
+        585,
+        2.5
+      ],
+      "spacing_m": 4.0
+    },
+    "probe_generation": {
+      "type": "uniform_floor",
+      "height_m": 1.5
+    },
+    "path_bake": {
+      "identifier": "megablock-city-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 2
+    }
+  },
+  "expected": {
+    "properties": [
+      "For city synth --seed 1 --blocks 6x6, the source is at the central east/north street intersection [292.5, 292.5, 1.5] and the listener begins one 95 m block pitch west at the same 1.5 m height.",
+      "The source uses asset_id toms-diner, whose exact WAV reference is fixtures/assets/music/toms-diner-48k-mono.wav with sha256 4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843.",
+      "The local metre coordinate frame is shared byte-for-byte in meaning by city synth, city compile, city render, and the workbench."
+    ],
+    "non_claims": [
+      "The synthetic grid is an acoustic stress fixture, not surveyed geography.",
+      "This fixture makes no delivered-ear-SPL claim without output calibration."
+    ]
+  }
+}

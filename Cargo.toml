@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/fightbox-api",
+    "crates/fightbox-evidence",
+    "crates/fightbox-runtime",
+    "crates/fightbox-steam-audio",
+    "crates/fightbox-world",
+    "tools/fightbox-cli",
+    "tools/fightbox-workbench",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/mduncs/spatial-audio-engine"

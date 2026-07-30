@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fightbox.dev/schema/asset-descriptor-1.json",
+  "title": "Fightbox deterministic asset descriptor",
+  "description": "Descriptor for a generated or file-backed finite, calibrated signal. WAV assets normalize their selected PCM to target_rms_dbfs using the same reference as generated assets: a full-scale-peak sine is approximately -3.0103 dBFS RMS. The selected kind must carry its matching generator block; cross-field rules are also enforced by the validators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "asset_id",
+    "kind",
+    "generator",
+    "channels",
+    "sample_rate_hz",
+    "duration_s",
+    "target_rms_dbfs",
+    "expected_reference_rms_dbfs",
+    "calibration",
+    "non_claims"
+  ],
+  "properties": {
+    "schema_version": {"const": "fightbox.asset-descriptor.v1"},
+    "asset_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "kind": {"enum": ["sine", "multitone", "pink_like", "wav"]},
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "module": {"const": "fightbox_evidence::signal"},
+        "sine": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frequency_hz"],
+          "properties": {"frequency_hz": {"type": "number", "exclusiveMinimum": 0}}
+        },
+        "multitone": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frequencies_hz"],
+          "properties": {
+            "frequencies_hz": {
+              "type": "array",
+              "items": {"type": "number", "exclusiveMinimum": 0},
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          }
+        },
+        "pink_like": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["seed"],
+          "properties": {"seed": {"type": "integer", "minimum": 0}}
+        },
+        "wav": {
+          "description": "File-backed program audio. Relative paths are resolved from the repository root; absolute paths support intentionally uncommitted recordings. sha256 is mandatory provenance and is verified before decoding.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256", "start_frame", "loop"],
+          "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "start_frame": {"type": "integer", "minimum": 0},
+            "loop": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "channels": {"enum": [1, 2]},
+    "sample_rate_hz": {"type": "integer", "minimum": 1},
+    "duration_s": {"type": "number", "exclusiveMinimum": 0},
+    "target_rms_dbfs": {
+      "description": "Requested delivered RMS in dBFS. Must be a finite JSON number strictly below 0 dBFS.",
+      "type": "number",
+      "exclusiveMaximum": 0
+    },
+    "expected_reference_rms_dbfs": {
+      "description": "The generator's raw pre-gain RMS in dBFS. A descriptor with a known analytical value (sine ~ -3.01) pins it; pink_like leaves null and lets the engine record it. This is distinct from target_rms_dbfs, which is the calibrated level the delivered asset measures.",
+      "type": ["number", "null"]
+    },
+    "calibration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applied_gain_db"],
+      "properties": {"applied_gain_db": {"type": ["number", "null"]}}
+    },
+    "non_claims": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "contains": {"const": "This descriptor makes no delivered-ear-SPL claim without output calibration."}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "sine"}}, "required": ["kind"]},
+      "then": {"properties": {"generator": {"required": ["module", "sine"]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "multitone"}}, "required": ["kind"]},
+      "then": {"properties": {"generator": {"required": ["module", "multitone"]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "pink_like"}}, "required": ["kind"]},
+      "then": {"properties": {"generator": {"required": ["module", "pink_like"]}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "wav"}}, "required": ["kind"]},
+      "then": {
+        "properties": {
+          "channels": {"const": 1},
+          "sample_rate_hz": {"const": 48000},
+          "generator": {
+            "required": ["wav"],
+            "not": {"required": ["module"]}
+          }
+        }
+      }
+    }
+  ]
+}
