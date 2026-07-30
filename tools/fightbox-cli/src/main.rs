@@ -53,7 +53,11 @@ phase-a sweep --verify <report-directory>\n\
                   Verify a self-contained sweep report without SDK work\n    \
 phase-b s6a      Render the deterministic four-source S6a fixture\n    \
                   [--reflection-effect <parametric|convolution>] (default: parametric)\n    \
+phase-b s6b      Render the deterministic eight-source S6b fixture\n    \
+                  [--reflection-effect <parametric|convolution>] (default: parametric)\n    \
 phase-b soak     Run the four-source offline or feature-gated live soak\n    \
+                  [--reflection-effect <parametric|convolution>] (default: convolution)\n\n\
+phase-b s6b-soak Run the eight-source offline or feature-gated live soak\n    \
                   [--reflection-effect <parametric|convolution>] (default: convolution)\n\n\
 city compile     Compile GeoJSON into a deterministic .fightbox package\n    \
 city synth       Generate a deterministic Manhattan-style GeoJSON city\n    \
@@ -223,9 +227,18 @@ fn dispatch_phase_b(args: &[String]) -> error::Result<()> {
                 parse_phase_b_s6a_args(&args[1..])?;
             phase_b::run_s6a(&fixture, &output, isolation_check, reflection_effect)
         }
+        Some("s6b") => {
+            let (fixture, output, isolation_check, reflection_effect) =
+                parse_phase_b_s6a_args(&args[1..])?;
+            phase_b::run_s6b(&fixture, &output, isolation_check, reflection_effect)
+        }
         Some("soak") => {
             let (minutes, output, live, reflection_effect) = parse_phase_b_soak_args(&args[1..])?;
             phase_b::run_soak(minutes, &output, live, reflection_effect)
+        }
+        Some("s6b-soak") => {
+            let (minutes, output, live, reflection_effect) = parse_phase_b_soak_args(&args[1..])?;
+            phase_b::run_s6b_soak(minutes, &output, live, reflection_effect)
         }
         Some(sub) => Err(error::CliError::new(format!(
             "unknown phase-b subcommand: {sub}\n\n{HELP}"
@@ -521,6 +534,8 @@ mod tests {
         assert!(HELP.contains("phase-a sweep --verify <report-directory>"));
         assert!(HELP.contains("<report-directory>/report.json"));
         assert!(HELP.contains("city synth"));
+        assert!(HELP.contains("phase-b s6b"));
+        assert!(HELP.contains("phase-b s6b-soak"));
     }
 
     #[test]

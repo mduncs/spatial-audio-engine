@@ -28,6 +28,13 @@ pub(crate) fn stereo_channel_metric(
             "stereo sample count is not a whole number of frames".to_string()
         }
         fightbox_evidence::MetricError::EmptyBins => "empty comparison bins".to_string(),
+        fightbox_evidence::MetricError::StereoRequired => {
+            "metric requires stereo input".to_string()
+        }
+        fightbox_evidence::MetricError::InvalidWindow => "invalid analysis window".to_string(),
+        fightbox_evidence::MetricError::InvalidThreshold => {
+            "invalid metric threshold".to_string()
+        }
     })?;
     Ok(from_channel_metrics(&metrics))
 }

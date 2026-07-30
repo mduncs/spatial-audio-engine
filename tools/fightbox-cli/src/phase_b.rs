@@ -199,6 +199,7 @@ struct PreparedFixture {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FixtureUse {
     PhaseBS6a,
+    PhaseBS6b,
     City,
 }
 
@@ -391,6 +392,8 @@ struct SoakGates {
 struct SoakReport {
     schema_version: &'static str,
     mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_profile: Option<&'static str>,
     reflection_effect: &'static str,
     requested_minutes: u64,
     rendered_blocks: u64,
@@ -399,7 +402,35 @@ struct SoakReport {
     deadline_misses: u64,
     faults: FaultReport,
     gates: SoakGates,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered_quality: Option<DeliveredQuality>,
     identity: IdentityReport,
+}
+
+#[derive(Serialize)]
+struct DeliveredQuality {
+    source_count: usize,
+    sample_rate_hz: u32,
+    block_size_frames: usize,
+    direct_occlusion: &'static str,
+    max_occlusion_samples: i32,
+    reflection_effect: &'static str,
+    reflection_rays: i32,
+    diffuse_samples: i32,
+    reflection_bounces: i32,
+    reflection_duration_s: f32,
+    reflection_order: i32,
+    simulation_threads: i32,
+    ray_batch_size: i32,
+    pathing_order: i32,
+    pathing_visibility_samples: i32,
+    pathing_visibility_radius_m: f32,
+    pathing_visibility_threshold: f32,
+    pathing_visibility_range_m: f32,
+    validate_paths: bool,
+    find_alternate_paths: bool,
+    quality_governor_enabled: bool,
+    degradation_events: u64,
 }
 
 pub fn run_s6a(
@@ -411,6 +442,26 @@ pub fn run_s6a(
     require_linked("phase-b s6a")?;
     let output = validate_output_path(output)?;
     let prepared = prepare_fixture(fixture_path, reflection_effect, FixtureUse::PhaseBS6a)?;
+    let baked = bake_fixture(&prepared)?;
+    write_s6a_render(
+        &prepared,
+        &baked,
+        &output,
+        isolation_check,
+        reflection_effect,
+        None,
+    )
+}
+
+pub fn run_s6b(
+    fixture_path: &Path,
+    output: &Path,
+    isolation_check: bool,
+    reflection_effect: ReflectionEffectConfig,
+) -> Result<()> {
+    require_linked("phase-b s6b")?;
+    let output = validate_output_path(output)?;
+    let prepared = prepare_fixture(fixture_path, reflection_effect, FixtureUse::PhaseBS6b)?;
     let baked = bake_fixture(&prepared)?;
     write_s6a_render(
         &prepared,
@@ -604,7 +655,11 @@ fn write_s6a_render(
         ));
     }
     let report = S6aReport {
-        schema_version: "fightbox.phase-b.s6a-report.v1",
+        schema_version: if prepared.fixture.gate == "S6B" {
+            "fightbox.phase-b.s6b-report.v1"
+        } else {
+            "fightbox.phase-b.s6a-report.v1"
+        },
         reflection_effect: reflection_effect_name(reflection_effect),
         sample_rate_hz: SAMPLE_RATE,
         block_size_frames: BLOCK_SIZE,
@@ -634,7 +689,8 @@ fn write_s6a_render(
     }
     dir.commit()?;
     eprintln!(
-        "fightbox: S6a render written to {} ({} frames, isolation {})",
+        "fightbox: {} render written to {} ({} frames, isolation {})",
+        prepared.fixture.gate,
         output.display(),
         prepared.timeline_frames,
         if isolation_check {
@@ -729,13 +785,51 @@ pub fn run_soak(
     live: bool,
     reflection_effect: ReflectionEffectConfig,
 ) -> Result<()> {
+    let fixture_path = repo_root().join("fixtures/s6a-four-sources/fixture.json");
+    run_fixture_soak(
+        minutes,
+        output,
+        live,
+        reflection_effect,
+        &fixture_path,
+        FixtureUse::PhaseBS6a,
+        "phase-b soak",
+    )
+}
+
+pub fn run_s6b_soak(
+    minutes: u64,
+    output: &Path,
+    live: bool,
+    reflection_effect: ReflectionEffectConfig,
+) -> Result<()> {
+    let fixture_path = repo_root().join("fixtures/s6b-eight-sources/fixture.json");
+    run_fixture_soak(
+        minutes,
+        output,
+        live,
+        reflection_effect,
+        &fixture_path,
+        FixtureUse::PhaseBS6b,
+        "phase-b s6b-soak",
+    )
+}
+
+fn run_fixture_soak(
+    minutes: u64,
+    output: &Path,
+    live: bool,
+    reflection_effect: ReflectionEffectConfig,
+    fixture_path: &Path,
+    fixture_use: FixtureUse,
+    command: &str,
+) -> Result<()> {
     if minutes == 0 {
         return Err(CliError::new("--minutes must be greater than zero"));
     }
-    require_linked("phase-b soak")?;
+    require_linked(command)?;
     let output = validate_output_path(output)?;
-    let fixture_path = repo_root().join("fixtures/s6a-four-sources/fixture.json");
-    let prepared = prepare_fixture(&fixture_path, reflection_effect, FixtureUse::PhaseBS6a)?;
+    let prepared = prepare_fixture(fixture_path, reflection_effect, fixture_use)?;
     let baked = bake_fixture(&prepared)?;
     let seconds = minutes
         .checked_mul(60)
@@ -749,9 +843,19 @@ pub fn run_soak(
     let run_timings: Percentiles = report.run_callback_timings.into();
     let run_p99_passed = run_timings.p99_ms <= P99_GATE_MS;
     let run_p99_9_passed = run_timings.p99_9_ms <= P99_9_GATE_MS;
+    let is_s6b = fixture_use == FixtureUse::PhaseBS6b;
     let wire = SoakReport {
-        schema_version: "fightbox.phase-b.soak-report.v2",
+        schema_version: if is_s6b {
+            "fightbox.phase-b.s6b-soak-report.v1"
+        } else {
+            "fightbox.phase-b.soak-report.v2"
+        },
         mode: if live { "live" } else { "offline" },
+        build_profile: is_s6b.then_some(if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }),
         reflection_effect: reflection_effect_name(reflection_effect),
         requested_minutes: minutes,
         rendered_blocks: report.rendered_blocks,
@@ -768,6 +872,7 @@ pub fn run_soak(
             run_p99_9_passed,
             passed: run_p99_passed && run_p99_9_passed,
         },
+        delivered_quality: is_s6b.then(|| delivered_quality(&prepared)),
         identity: identity(&prepared, &baked),
     };
     let dir = AtomicDir::create(output.clone())?;
@@ -775,6 +880,37 @@ pub fn run_soak(
     dir.commit()?;
     eprintln!("fightbox: soak report written to {}", output.display());
     Ok(())
+}
+
+fn delivered_quality(prepared: &PreparedFixture) -> DeliveredQuality {
+    let simulation = prepared.simulation;
+    DeliveredQuality {
+        source_count: prepared.sources.len(),
+        sample_rate_hz: SAMPLE_RATE,
+        block_size_frames: BLOCK_SIZE,
+        direct_occlusion: match simulation.direct_occlusion {
+            DirectOcclusionMode::Raycast => "raycast",
+            DirectOcclusionMode::Volumetric { .. } => "volumetric",
+        },
+        max_occlusion_samples: simulation.max_occlusion_samples,
+        reflection_effect: reflection_effect_name(simulation.reflection_effect),
+        reflection_rays: simulation.reflection_rays,
+        diffuse_samples: simulation.diffuse_samples,
+        reflection_bounces: simulation.reflection_bounces,
+        reflection_duration_s: simulation.reflection_duration_s,
+        reflection_order: simulation.reflection_order,
+        simulation_threads: simulation.simulation_threads,
+        ray_batch_size: simulation.ray_batch_size,
+        pathing_order: simulation.pathing_order,
+        pathing_visibility_samples: simulation.pathing_visibility_samples,
+        pathing_visibility_radius_m: simulation.pathing_visibility_radius_m,
+        pathing_visibility_threshold: simulation.pathing_visibility_threshold,
+        pathing_visibility_range_m: simulation.pathing_visibility_range_m,
+        validate_paths: simulation.validate_paths,
+        find_alternate_paths: simulation.find_alternate_paths,
+        quality_governor_enabled: false,
+        degradation_events: 0,
+    }
 }
 
 fn offline_soak(
@@ -1100,7 +1236,7 @@ fn prepare_fixture(
     let bytes = std::fs::read(path)
         .map_err(|error| CliError::new(format!("cannot read {}: {error}", path.display())))?;
     let fixture: Fixture = serde_json::from_slice(&bytes)
-        .map_err(|error| CliError::new(format!("invalid S6a fixture: {error}")))?;
+        .map_err(|error| CliError::new(format!("invalid multi-source fixture: {error}")))?;
     validate_fixture(&fixture, fixture_use)?;
     let mut sources = Vec::new();
     for source in &fixture.sources {
@@ -1181,11 +1317,6 @@ fn prepare_fixture(
 }
 
 fn validate_fixture(fixture: &Fixture, fixture_use: FixtureUse) -> Result<()> {
-    if fixture.schema_version != "fightbox.fixture.s6a.v1"
-        || !matches!(fixture.gate.as_str(), "S5" | "S6A")
-    {
-        return Err(CliError::new("expected a fightbox.fixture.s6a.v1 fixture"));
-    }
     let moving_sources = fixture
         .sources
         .iter()
@@ -1193,7 +1324,8 @@ fn validate_fixture(fixture: &Fixture, fixture_use: FixtureUse) -> Result<()> {
         .count();
     match fixture_use {
         FixtureUse::PhaseBS6a
-            if fixture.gate != "S6A"
+            if fixture.schema_version != "fightbox.fixture.s6a.v1"
+                || fixture.gate != "S6A"
                 || fixture.sources.len() != 4
                 || moving_sources != 1
                 || fixture.listener.trajectory.is_some()
@@ -1203,8 +1335,29 @@ fn validate_fixture(fixture: &Fixture, fixture_use: FixtureUse) -> Result<()> {
                 "phase-b S6a requires four sources, exactly one moving source, and a static listener",
             ));
         }
+        FixtureUse::PhaseBS6b
+            if fixture.schema_version != "fightbox.fixture.s6b.v1"
+                || fixture.gate != "S6B"
+                || fixture.sources.len() != 8
+                || moving_sources != 1
+                || fixture.listener.trajectory.is_some()
+                || fixture.listener.position_m.is_none()
+                || fixture
+                    .sources
+                    .iter()
+                    .find_map(|source| source.trajectory.as_ref())
+                    .is_none_or(|trajectory| {
+                        trajectory.waypoints_m.first() != trajectory.waypoints_m.last()
+                    }) =>
+        {
+            return Err(CliError::new(
+                "phase-b S6b requires eight sources, exactly one closed-cycle moving source, and a static listener",
+            ));
+        }
         FixtureUse::City
-            if fixture.sources.is_empty()
+            if fixture.schema_version != "fightbox.fixture.s6a.v1"
+                || !matches!(fixture.gate.as_str(), "S5" | "S6A")
+                || fixture.sources.is_empty()
                 || fixture.sources.len() > MAX_ACTIVE_SOURCES
                 || moving_sources > 1 =>
         {
@@ -1529,6 +1682,27 @@ mod tests {
     #[test]
     fn repository_fixture_is_valid() {
         validate_fixture(&fixture(), FixtureUse::PhaseBS6a).unwrap();
+    }
+
+    fn s6b_fixture() -> Fixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/s6b-eight-sources/fixture.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn repository_s6b_fixture_is_eight_sources_with_a_speed_capped_closed_cycle() {
+        let fixture = s6b_fixture();
+        validate_fixture(&fixture, FixtureUse::PhaseBS6b).unwrap();
+        assert_eq!(fixture.sources.len(), 8);
+        let moving = fixture
+            .sources
+            .iter()
+            .find_map(|source| source.trajectory.as_ref())
+            .unwrap();
+        assert_eq!(moving.waypoints_m.first(), moving.waypoints_m.last());
+        assert!(moving.speed_mps <= moving.max_speed_mps);
     }
 
     fn walk_fixture() -> Fixture {

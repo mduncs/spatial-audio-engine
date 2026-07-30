@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fightbox.dev/schema/fixture-s6b-1.json",
+  "title": "Fightbox S6b eight-source measurement fixture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fixture_id",
+    "gate",
+    "coordinate_frame",
+    "kernel",
+    "sources",
+    "listener",
+    "geometry",
+    "simulation",
+    "expected"
+  ],
+  "properties": {
+    "schema_version": {"const": "fightbox.fixture.s6b.v1"},
+    "fixture_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "gate": {"const": "S6B"},
+    "coordinate_frame": {"$ref": "#/$defs/coordinate_frame"},
+    "kernel": {"$ref": "#/$defs/kernel"},
+    "sources": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/source"},
+      "minItems": 8,
+      "maxItems": 8
+    },
+    "listener": {"$ref": "#/$defs/listener"},
+    "geometry": {"$ref": "#/$defs/geometry"},
+    "simulation": {"$ref": "#/$defs/simulation"},
+    "expected": {"$ref": "#/$defs/expected"}
+  },
+  "$defs": {
+    "vec3": {
+      "type": "array",
+      "items": {"type": "number"},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "coordinate_frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "units", "axes", "steam_audio_mapping"],
+      "properties": {
+        "name": {"const": "local_enu"},
+        "units": {"const": "meters_seconds"},
+        "axes": {"const": "x_east_y_north_z_up"},
+        "steam_audio_mapping": {
+          "const": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+        }
+      }
+    },
+    "kernel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "Steam Audio"},
+        "version": {"const": "4.8.1"}
+      }
+    },
+    "reference_level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "db_spl"],
+      "properties": {
+        "mode": {"const": "SplAtOneMeter"},
+        "db_spl": {"type": "number"}
+      }
+    },
+    "trajectory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["waypoints_m", "speed_mps", "max_speed_mps"],
+      "properties": {
+        "waypoints_m": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/vec3"},
+          "minItems": 3
+        },
+        "speed_mps": {"type": "number", "exclusiveMinimum": 0},
+        "max_speed_mps": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "asset_id", "reference_level"],
+      "properties": {
+        "id": {"type": "string"},
+        "asset_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "reference_level": {"$ref": "#/$defs/reference_level"},
+        "position_m": {"$ref": "#/$defs/vec3"},
+        "trajectory": {"$ref": "#/$defs/trajectory"}
+      },
+      "oneOf": [
+        {"required": ["position_m"]},
+        {"required": ["trajectory"]}
+      ]
+    },
+    "listener": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position_m", "forward_enu", "up_enu"],
+      "properties": {
+        "position_m": {"$ref": "#/$defs/vec3"},
+        "forward_enu": {"$ref": "#/$defs/vec3"},
+        "up_enu": {"$ref": "#/$defs/vec3"}
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["absorption", "scattering", "transmission"],
+      "properties": {
+        "absorption": {
+          "type": "array",
+          "items": {"type": "number", "minimum": 0, "maximum": 1},
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "scattering": {"type": "number", "minimum": 0, "maximum": 1},
+        "transmission": {
+          "type": "array",
+          "items": {"type": "number", "minimum": 0, "maximum": 1},
+          "minItems": 3,
+          "maxItems": 3
+        }
+      }
+    },
+    "geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vertices_m", "triangles", "materials"],
+      "properties": {
+        "vertices_m": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/vec3"}
+        },
+        "triangles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["indices", "material"],
+            "properties": {
+              "indices": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0},
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "material": {"type": "string"}
+            }
+          }
+        },
+        "materials": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/material"}
+        }
+      }
+    },
+    "simulation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direct",
+        "reflections",
+        "pathing",
+        "probe_volume",
+        "probe_generation",
+        "path_bake"
+      ],
+      "properties": {
+        "direct": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["distance_attenuation", "occlusion"],
+          "properties": {
+            "distance_attenuation": {"const": true},
+            "occlusion": {"const": true},
+            "occlusion_samples": {"type": "integer", "minimum": 1}
+          }
+        },
+        "reflections": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {"const": true},
+            "rays": {"type": "integer", "minimum": 1},
+            "bounces": {"type": "integer", "minimum": 0},
+            "duration_s": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+        "pathing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {"const": true},
+            "order": {"type": "integer", "minimum": 0},
+            "validation": {"type": "boolean"},
+            "alternate_paths": {"type": "boolean"},
+            "runtime_order": {
+              "type": "array",
+              "items": {"enum": ["direct", "path", "reflections"]},
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          }
+        },
+        "probe_volume": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "min_m", "max_m", "spacing_m"],
+          "properties": {
+            "type": {"const": "box"},
+            "min_m": {"$ref": "#/$defs/vec3"},
+            "max_m": {"$ref": "#/$defs/vec3"},
+            "spacing_m": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+        "probe_generation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "height_m"],
+          "properties": {
+            "type": {"const": "uniform_floor"},
+            "height_m": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+        "path_bake": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "identifier",
+            "required_call",
+            "probe_batch_serialization",
+            "fresh_process_reload",
+            "bake_order"
+          ],
+          "properties": {
+            "identifier": {"type": "string"},
+            "required_call": {"const": "iplPathBakerBake"},
+            "probe_batch_serialization": {"const": "required"},
+            "fresh_process_reload": {"const": true},
+            "bake_order": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["properties", "non_claims"],
+      "properties": {
+        "properties": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1
+        },
+        "non_claims": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1
+        }
+      }
+    }
+  },
+  "notes": "Runtime validation adds constraints JSON Schema cannot express: exactly one source has a trajectory; its first and last waypoints are identical; speed_mps <= max_speed_mps; all coordinates are finite and inside the probe volume; all asset_id values resolve to deterministic mono generated-signal descriptors."
+}
