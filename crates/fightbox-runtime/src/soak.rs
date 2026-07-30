@@ -56,6 +56,25 @@ pub fn run_offline_soak<P: BlockProcessor>(
     seconds: u64,
     sources: &[SourceBlock<'_>],
 ) -> Result<SoakReport, crate::RenderError> {
+    run_offline_soak_with_timing_observer(processor, sample_rate_hz, seconds, sources, |_| {})
+}
+
+/// Runs an offline soak and reports each measured block duration to a
+/// control-side observer after the timing histograms have recorded it.
+///
+/// The observer is not part of the render callback and may perform control
+/// work such as updating a quality governor.
+pub fn run_offline_soak_with_timing_observer<P, F>(
+    processor: &mut P,
+    sample_rate_hz: u32,
+    seconds: u64,
+    sources: &[SourceBlock<'_>],
+    mut observe_timing: F,
+) -> Result<SoakReport, crate::RenderError>
+where
+    P: BlockProcessor,
+    F: FnMut(u64),
+{
     let block_size = processor.block_size_frames();
     let total_frames = seconds.saturating_mul(u64::from(sample_rate_hz));
     let blocks = total_frames.div_ceil(block_size as u64);
@@ -80,6 +99,7 @@ pub fn run_offline_soak<P: BlockProcessor>(
         let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         timings.record(elapsed);
         run_timings.record(elapsed);
+        observe_timing(elapsed);
         if elapsed > block_ns.saturating_mul(8) / 10 {
             callback_deadline_misses = callback_deadline_misses.saturating_add(1);
         }
@@ -125,6 +145,20 @@ mod tests {
         assert_eq!(processor.blocks, 8);
         assert!(report.window_callback_timings.p99_9_ms >= 0.0);
         assert!(report.run_callback_timings.p99_9_ms >= 0.0);
+    }
+
+    #[test]
+    fn offline_soak_observer_receives_every_recorded_block() {
+        let mut processor = SilentProcessor { blocks: 0 };
+        let mut observations = Vec::new();
+        let report =
+            run_offline_soak_with_timing_observer(&mut processor, 64, 2, &[], |elapsed_ns| {
+                observations.push(elapsed_ns)
+            })
+            .unwrap();
+
+        assert_eq!(observations.len() as u64, report.rendered_blocks);
+        assert!(observations.iter().all(|elapsed_ns| *elapsed_ns > 0));
     }
 
     #[test]

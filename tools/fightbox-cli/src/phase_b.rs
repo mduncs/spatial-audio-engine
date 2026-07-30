@@ -17,9 +17,11 @@ use fightbox_runtime::{
 };
 use fightbox_steam_audio::{
     AcousticMaterial, AudioConfig, BakedProbeBatch, DirectOcclusionMode,
-    EnuVector3 as SteamEnuVector3, MultiSourceDescriptor, PathBakeConfig, ProbeVolume,
-    ReflectionEffectConfig, S3BakeRequest, S3SimulationConfig, SceneMesh, bake_s3,
-    build_multi_source_session,
+    EnuVector3 as SteamEnuVector3, GovernorTransitionReason, MultiSourceDescriptor, PathBakeConfig,
+    PathQualityLevel, ProbeVolume, QualityGovernorTelemetry, REVERB_RUNG_CAPABILITIES,
+    ReflectionEffectConfig, ReflectionQualityLevel, ReflectionSettingAvailability,
+    ReverbRungAvailability, ReverbStrategy, S3BakeRequest, S3SimulationConfig, SceneMesh,
+    SourceQualityLevel, bake_s3, build_multi_source_session,
 };
 use serde::{Deserialize, Serialize};
 
@@ -302,6 +304,7 @@ struct Rendered {
     timings: TimingHistory,
     faults: FaultCounters,
     simulation: SimulationTelemetry,
+    governor: Option<QualityGovernorTelemetry>,
 }
 
 #[derive(Serialize)]
@@ -372,6 +375,8 @@ struct S6aReport {
     block_timings: Percentiles,
     faults: FaultReport,
     simulation: SimulationReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered_quality: Option<DeliveredQuality>,
     isolation_check_requested: bool,
     isolation_passed: Option<bool>,
     isolation_pairs: Vec<IsolationPair>,
@@ -407,30 +412,96 @@ struct SoakReport {
     identity: IdentityReport,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct DeliveredQuality {
     source_count: usize,
     sample_rate_hz: u32,
     block_size_frames: usize,
-    direct_occlusion: &'static str,
+    timing_observation: &'static str,
+    direct: DeliveredDirectQuality,
+    reflections: DeliveredReflectionQualityReport,
+    pathing: DeliveredPathQualityReport,
+    ambisonic_order: i32,
+    reverb: DeliveredReverbQualityReport,
+    sources: Vec<DeliveredSourceQualityReport>,
+    transition_count: u64,
+    transition_count_basis: &'static str,
+    last_transition_reason: &'static str,
+    end_of_run_timings: GovernorTimingReport,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveredDirectQuality {
+    occlusion: &'static str,
     max_occlusion_samples: i32,
-    reflection_effect: &'static str,
-    reflection_rays: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveredReflectionQualityReport {
+    level: &'static str,
+    rays: i32,
     diffuse_samples: i32,
-    reflection_bounces: i32,
-    reflection_duration_s: f32,
-    reflection_order: i32,
-    simulation_threads: i32,
-    ray_batch_size: i32,
-    pathing_order: i32,
-    pathing_visibility_samples: i32,
-    pathing_visibility_radius_m: f32,
-    pathing_visibility_threshold: f32,
-    pathing_visibility_range_m: f32,
-    validate_paths: bool,
-    find_alternate_paths: bool,
-    quality_governor_enabled: bool,
-    degradation_events: u64,
+    diffuse_samples_availability: &'static str,
+    bounces: i32,
+    ir_duration_s: f32,
+    cadence_divisor: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveredPathQualityReport {
+    level: &'static str,
+    validation_enabled: bool,
+    alternate_paths_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveredReverbQualityReport {
+    strategy: &'static str,
+    reflection_output_gain: f32,
+    capabilities: Vec<ReverbCapabilityReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReverbCapabilityReport {
+    strategy: &'static str,
+    availability: &'static str,
+    delivered: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveredSourceQualityReport {
+    source_index: u8,
+    source_id: String,
+    state: &'static str,
+    reason: &'static str,
+    predicted_audibility_db: f32,
+    physically_calibrated: bool,
+    below_hearing_threshold: bool,
+    transport_advances: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct GovernorTimingReport {
+    basis: &'static str,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    p99_9_ms: f64,
+    callback_deadline_misses: u64,
+    simulation_lateness_ms: SimulationLatenessReport,
+}
+
+#[derive(Debug, Serialize)]
+struct SimulationLatenessReport {
+    direct: f64,
+    pathing: f64,
+    reflections: f64,
+}
+
+struct MeasuredSoakReport {
+    report: fightbox_runtime::SoakReport,
+    governor: Option<QualityGovernorTelemetry>,
+    timing_observation: &'static str,
 }
 
 pub fn run_s6a(
@@ -671,6 +742,12 @@ fn write_s6a_render(
         block_timings: TimingPercentiles::from_history(&mix.timings).into(),
         faults: mix.faults.into(),
         simulation: mix.simulation.report(),
+        delivered_quality: (prepared.fixture.gate == "S6B")
+            .then(|| {
+                mix.governor
+                    .map(|telemetry| delivered_quality(prepared, telemetry, "per_block_render"))
+            })
+            .flatten(),
         isolation_check_requested: isolation_check,
         isolation_passed,
         isolation_pairs: pairs,
@@ -834,11 +911,17 @@ fn run_fixture_soak(
     let seconds = minutes
         .checked_mul(60)
         .ok_or_else(|| CliError::new("--minutes is too large"))?;
-    let report = if live {
+    let measured = if live {
         live_soak(&prepared, &baked, seconds)?
     } else {
-        offline_soak(&prepared, &baked, seconds)?
+        offline_soak(
+            &prepared,
+            &baked,
+            seconds,
+            fixture_use == FixtureUse::PhaseBS6b,
+        )?
     };
+    let report = measured.report;
     let window_timings: Percentiles = report.window_callback_timings.into();
     let run_timings: Percentiles = report.run_callback_timings.into();
     let run_p99_passed = run_timings.p99_ms <= P99_GATE_MS;
@@ -846,7 +929,7 @@ fn run_fixture_soak(
     let is_s6b = fixture_use == FixtureUse::PhaseBS6b;
     let wire = SoakReport {
         schema_version: if is_s6b {
-            "fightbox.phase-b.s6b-soak-report.v1"
+            "fightbox.phase-b.s6b-soak-report.v2"
         } else {
             "fightbox.phase-b.soak-report.v2"
         },
@@ -872,7 +955,13 @@ fn run_fixture_soak(
             run_p99_9_passed,
             passed: run_p99_passed && run_p99_9_passed,
         },
-        delivered_quality: is_s6b.then(|| delivered_quality(&prepared)),
+        delivered_quality: is_s6b
+            .then(|| {
+                measured.governor.map(|telemetry| {
+                    delivered_quality(&prepared, telemetry, measured.timing_observation)
+                })
+            })
+            .flatten(),
         identity: identity(&prepared, &baked),
     };
     let dir = AtomicDir::create(output.clone())?;
@@ -882,34 +971,190 @@ fn run_fixture_soak(
     Ok(())
 }
 
-fn delivered_quality(prepared: &PreparedFixture) -> DeliveredQuality {
+fn delivered_quality(
+    prepared: &PreparedFixture,
+    telemetry: QualityGovernorTelemetry,
+    timing_observation: &'static str,
+) -> DeliveredQuality {
     let simulation = prepared.simulation;
+    let source_ids: Vec<_> = prepared
+        .sources
+        .iter()
+        .map(|source| source.id.clone())
+        .collect();
+    delivered_quality_from_telemetry(
+        &source_ids,
+        simulation.direct_occlusion,
+        simulation.max_occlusion_samples,
+        telemetry,
+        timing_observation,
+    )
+}
+
+fn delivered_quality_from_telemetry(
+    source_ids: &[String],
+    direct_occlusion: DirectOcclusionMode,
+    max_occlusion_samples: i32,
+    telemetry: QualityGovernorTelemetry,
+    timing_observation: &'static str,
+) -> DeliveredQuality {
+    let (validation_enabled, alternate_paths_enabled) = match telemetry.pathing {
+        PathQualityLevel::Full => (true, true),
+        PathQualityLevel::NoValidation => (false, true),
+        PathQualityLevel::PrimaryOnly => (false, false),
+    };
+    let milliseconds = |nanoseconds: u64| nanoseconds as f64 / 1_000_000.0;
+    let reflection_level = match telemetry.reflections.level {
+        ReflectionQualityLevel::Full => "full",
+        ReflectionQualityLevel::Reduced => "reduced",
+        ReflectionQualityLevel::Minimum => "minimum",
+    };
     DeliveredQuality {
-        source_count: prepared.sources.len(),
+        source_count: usize::from(telemetry.source_count),
         sample_rate_hz: SAMPLE_RATE,
         block_size_frames: BLOCK_SIZE,
-        direct_occlusion: match simulation.direct_occlusion {
-            DirectOcclusionMode::Raycast => "raycast",
-            DirectOcclusionMode::Volumetric { .. } => "volumetric",
+        timing_observation,
+        direct: DeliveredDirectQuality {
+            occlusion: match direct_occlusion {
+                DirectOcclusionMode::Raycast => "raycast",
+                DirectOcclusionMode::Volumetric { .. } => "volumetric",
+            },
+            max_occlusion_samples,
         },
-        max_occlusion_samples: simulation.max_occlusion_samples,
-        reflection_effect: reflection_effect_name(simulation.reflection_effect),
-        reflection_rays: simulation.reflection_rays,
-        diffuse_samples: simulation.diffuse_samples,
-        reflection_bounces: simulation.reflection_bounces,
-        reflection_duration_s: simulation.reflection_duration_s,
-        reflection_order: simulation.reflection_order,
-        simulation_threads: simulation.simulation_threads,
-        ray_batch_size: simulation.ray_batch_size,
-        pathing_order: simulation.pathing_order,
-        pathing_visibility_samples: simulation.pathing_visibility_samples,
-        pathing_visibility_radius_m: simulation.pathing_visibility_radius_m,
-        pathing_visibility_threshold: simulation.pathing_visibility_threshold,
-        pathing_visibility_range_m: simulation.pathing_visibility_range_m,
-        validate_paths: simulation.validate_paths,
-        find_alternate_paths: simulation.find_alternate_paths,
-        quality_governor_enabled: false,
-        degradation_events: 0,
+        reflections: DeliveredReflectionQualityReport {
+            level: reflection_level,
+            rays: telemetry.reflections.rays,
+            diffuse_samples: telemetry.reflections.diffuse_samples,
+            diffuse_samples_availability: reflection_setting_availability_name(
+                telemetry.reflections.diffuse_samples_availability,
+            ),
+            bounces: telemetry.reflections.bounces,
+            ir_duration_s: telemetry.reflections.ir_duration_s,
+            cadence_divisor: telemetry.reflections.cadence_divisor,
+        },
+        pathing: DeliveredPathQualityReport {
+            level: path_quality_name(telemetry.pathing),
+            validation_enabled,
+            alternate_paths_enabled,
+        },
+        ambisonic_order: telemetry.ambisonic_order,
+        reverb: DeliveredReverbQualityReport {
+            strategy: reverb_strategy_name(telemetry.reverb),
+            reflection_output_gain: telemetry.reflection_output_gain,
+            capabilities: REVERB_RUNG_CAPABILITIES
+                .iter()
+                .map(|capability| ReverbCapabilityReport {
+                    strategy: reverb_strategy_name(capability.strategy),
+                    availability: reverb_availability_name(capability.availability),
+                    delivered: capability.strategy == telemetry.reverb,
+                })
+                .collect(),
+        },
+        sources: telemetry.sources[..usize::from(telemetry.source_count)]
+            .iter()
+            .map(|source| DeliveredSourceQualityReport {
+                source_index: source.source_index,
+                source_id: source_ids
+                    .get(usize::from(source.source_index))
+                    .cloned()
+                    .unwrap_or_else(|| format!("source-{}", source.source_index)),
+                state: source_quality_name(source.quality),
+                reason: source_quality_reason(source.quality, source.below_hearing_threshold),
+                predicted_audibility_db: source.predicted_audibility_db,
+                physically_calibrated: source.physically_calibrated,
+                below_hearing_threshold: source.below_hearing_threshold,
+                transport_advances: source.transport_advances,
+            })
+            .collect(),
+        transition_count: telemetry.sequence.saturating_sub(1),
+        transition_count_basis: "delivered_snapshot_publications_since_initial",
+        last_transition_reason: transition_reason_name(telemetry.reason),
+        end_of_run_timings: GovernorTimingReport {
+            basis: "governor_final_window",
+            p50_ms: milliseconds(telemetry.p50_ns),
+            p95_ms: milliseconds(telemetry.p95_ns),
+            p99_ms: milliseconds(telemetry.p99_ns),
+            p99_9_ms: milliseconds(telemetry.p99_9_ns),
+            callback_deadline_misses: telemetry.callback_deadline_misses,
+            simulation_lateness_ms: SimulationLatenessReport {
+                direct: milliseconds(telemetry.simulation_lateness_ns[0]),
+                pathing: milliseconds(telemetry.simulation_lateness_ns[1]),
+                reflections: milliseconds(telemetry.simulation_lateness_ns[2]),
+            },
+        },
+    }
+}
+
+fn path_quality_name(value: PathQualityLevel) -> &'static str {
+    match value {
+        PathQualityLevel::Full => "full",
+        PathQualityLevel::NoValidation => "no_validation",
+        PathQualityLevel::PrimaryOnly => "primary_only",
+    }
+}
+
+fn source_quality_name(value: SourceQualityLevel) -> &'static str {
+    match value {
+        SourceQualityLevel::Full => "full",
+        SourceQualityLevel::DirectOnly => "direct_only",
+        SourceQualityLevel::Virtualized => "virtualized",
+    }
+}
+
+fn source_quality_reason(
+    quality: SourceQualityLevel,
+    below_hearing_threshold: bool,
+) -> &'static str {
+    match quality {
+        SourceQualityLevel::Full => "retained_full_quality",
+        SourceQualityLevel::DirectOnly => "audibility_ranked_degradation",
+        SourceQualityLevel::Virtualized if below_hearing_threshold => "below_hearing_threshold",
+        SourceQualityLevel::Virtualized => "governor_virtualization",
+    }
+}
+
+fn reverb_strategy_name(value: ReverbStrategy) -> &'static str {
+    match value {
+        ReverbStrategy::SdkMixerConvolution => "sdk_mixer_convolution",
+        ReverbStrategy::Hybrid => "hybrid",
+        ReverbStrategy::Baked => "baked",
+        ReverbStrategy::ListenerCentric => "listener_centric",
+        ReverbStrategy::ShortIrLowerOrder => "short_ir_lower_order",
+    }
+}
+
+fn reverb_availability_name(value: ReverbRungAvailability) -> &'static str {
+    match value {
+        ReverbRungAvailability::Implemented => "implemented",
+        ReverbRungAvailability::StubRequiresGraphRebuild => "stub_requires_graph_rebuild",
+        ReverbRungAvailability::StubRequiresBakedReflectionData => {
+            "stub_requires_baked_reflection_data"
+        }
+        ReverbRungAvailability::StubRequiresListenerReverbGraph => {
+            "stub_requires_listener_reverb_graph"
+        }
+    }
+}
+
+fn reflection_setting_availability_name(value: ReflectionSettingAvailability) -> &'static str {
+    match value {
+        ReflectionSettingAvailability::Implemented => "implemented",
+        ReflectionSettingAvailability::StubRequiresSimulatorRebuild => {
+            "stub_requires_simulator_rebuild"
+        }
+    }
+}
+
+fn transition_reason_name(value: GovernorTransitionReason) -> &'static str {
+    match value {
+        GovernorTransitionReason::Initial => "initial",
+        GovernorTransitionReason::RenderP99OverBudget => "render_p99_over_budget",
+        GovernorTransitionReason::RenderP999OverCeiling => "render_p99_9_over_ceiling",
+        GovernorTransitionReason::RenderDeadlineMiss => "render_deadline_miss",
+        GovernorTransitionReason::SimulationLate => "simulation_late",
+        GovernorTransitionReason::SustainedHeadroom => "sustained_headroom",
+        GovernorTransitionReason::AtMinimumQuality => "at_minimum_quality",
+        GovernorTransitionReason::AtFullQuality => "at_full_quality",
     }
 }
 
@@ -917,7 +1162,8 @@ fn offline_soak(
     prepared: &PreparedFixture,
     baked: &BakedProbeBatch,
     seconds: u64,
-) -> Result<fightbox_runtime::SoakReport> {
+    observe_governor: bool,
+) -> Result<MeasuredSoakReport> {
     let (mut runner, graph) = build_graph(prepared, baked)?;
     runner.update_inputs(&simulation_update(prepared, 0));
     initial_simulation(&mut runner)?;
@@ -939,8 +1185,25 @@ fn offline_soak(
         })
         .collect();
     let mut graph = graph;
-    fightbox_runtime::run_offline_soak(&mut graph, SAMPLE_RATE, seconds, &sources)
-        .map_err(|error| CliError::new(format!("offline soak failed: {error:?}")))
+    let report = fightbox_runtime::run_offline_soak_with_timing_observer(
+        &mut graph,
+        SAMPLE_RATE,
+        seconds,
+        &sources,
+        |elapsed_ns| {
+            if observe_governor {
+                runner.observe_render_timing(elapsed_ns);
+            }
+        },
+    )
+    .map_err(|error| CliError::new(format!("offline soak failed: {error:?}")))?;
+    Ok(MeasuredSoakReport {
+        report,
+        governor: observe_governor
+            .then(|| runner.quality_governor_telemetry())
+            .flatten(),
+        timing_observation: "per_block_offline",
+    })
 }
 
 #[cfg(feature = "live-output")]
@@ -948,7 +1211,7 @@ fn live_soak(
     prepared: &PreparedFixture,
     baked: &BakedProbeBatch,
     seconds: u64,
-) -> Result<fightbox_runtime::SoakReport> {
+) -> Result<MeasuredSoakReport> {
     use fightbox_runtime::live::{LiveInputProvider, LiveSourceBuffer};
 
     struct LoopingInput {
@@ -981,13 +1244,18 @@ fn live_soak(
             .collect(),
         offsets: vec![0; prepared.sources.len()],
     };
-    fightbox_runtime::live::run_live_soak_with_input(
+    let report = fightbox_runtime::live::run_live_soak_with_input(
         graph,
         engine_config(prepared.sources.len()),
         Box::new(input),
         seconds,
     )
-    .map_err(|error| CliError::new(format!("live soak failed: {error:?}")))
+    .map_err(|error| CliError::new(format!("live soak failed: {error:?}")))?;
+    Ok(MeasuredSoakReport {
+        report,
+        governor: runner.quality_governor_telemetry(),
+        timing_observation: "unavailable_live_output",
+    })
 }
 
 #[cfg(not(feature = "live-output"))]
@@ -995,7 +1263,7 @@ fn live_soak(
     _prepared: &PreparedFixture,
     _baked: &BakedProbeBatch,
     _seconds: u64,
-) -> Result<fightbox_runtime::SoakReport> {
+) -> Result<MeasuredSoakReport> {
     Err(CliError::new(
         "--live requires rebuilding with --features live-output,linked-sdk",
     ))
@@ -1057,7 +1325,9 @@ fn render(
                 output_right: &mut right,
             })
             .map_err(|error| CliError::new(format!("S6a render failed: {error:?}")))?;
-        timings.record(elapsed_ns(started));
+        let elapsed = elapsed_ns(started);
+        timings.record(elapsed);
+        runner.observe_render_timing(elapsed);
         let valid = (prepared.timeline_frames - rendered_frames).min(BLOCK_SIZE);
         for frame in 0..valid {
             pcm.extend_from_slice(&[left[frame], right[frame]]);
@@ -1071,6 +1341,7 @@ fn render(
         timings,
         faults: driver.processor().fault_counters(),
         simulation,
+        governor: runner.quality_governor_telemetry(),
     })
 }
 
@@ -1132,7 +1403,13 @@ fn build_graph(
         .fixture
         .sources
         .iter()
-        .map(|source| MultiSourceDescriptor::at(initial_position(source)))
+        .map(|source| {
+            MultiSourceDescriptor::at(initial_position(source)).with_reference_level(
+                ReferenceLevel::SplAtOneMeter {
+                    db_spl: source.reference_level.db_spl as f32,
+                },
+            )
+        })
         .collect();
     let (runner, backend) = build_multi_source_session(
         &prepared.mesh,
@@ -1703,6 +1980,109 @@ mod tests {
             .unwrap();
         assert_eq!(moving.waypoints_m.first(), moving.waypoints_m.last());
         assert!(moving.speed_mps <= moving.max_speed_mps);
+    }
+
+    #[test]
+    fn s6b_delivered_quality_serializes_governor_snapshot_without_target_claims() {
+        let mut sources =
+            [fightbox_steam_audio::SourceQualityTelemetry::default(); MAX_ACTIVE_SOURCES];
+        sources[0] = fightbox_steam_audio::SourceQualityTelemetry {
+            source_index: 0,
+            quality: SourceQualityLevel::Full,
+            predicted_audibility_db: 72.0,
+            physically_calibrated: true,
+            below_hearing_threshold: false,
+            transport_advances: true,
+        };
+        sources[1] = fightbox_steam_audio::SourceQualityTelemetry {
+            source_index: 1,
+            quality: SourceQualityLevel::DirectOnly,
+            predicted_audibility_db: 18.0,
+            physically_calibrated: true,
+            below_hearing_threshold: false,
+            transport_advances: true,
+        };
+        sources[2] = fightbox_steam_audio::SourceQualityTelemetry {
+            source_index: 2,
+            quality: SourceQualityLevel::Virtualized,
+            predicted_audibility_db: -6.0,
+            physically_calibrated: true,
+            below_hearing_threshold: true,
+            transport_advances: true,
+        };
+        let telemetry = QualityGovernorTelemetry {
+            sequence: 7,
+            ladder_position: 9,
+            reason: GovernorTransitionReason::RenderP999OverCeiling,
+            p50_ns: 500_000,
+            p95_ns: 900_000,
+            p99_ns: 1_200_000,
+            p99_9_ns: 1_800_000,
+            callback_deadline_misses: 2,
+            simulation_lateness_ns: [1_000_000, 2_000_000, 3_000_000],
+            reflections: fightbox_steam_audio::DeliveredReflectionQuality {
+                level: ReflectionQualityLevel::Minimum,
+                rays: 256,
+                diffuse_samples: 32,
+                diffuse_samples_target: 8,
+                diffuse_samples_availability:
+                    ReflectionSettingAvailability::StubRequiresSimulatorRebuild,
+                bounces: 1,
+                ir_duration_s: 0.25,
+                cadence_divisor: 4,
+            },
+            pathing: PathQualityLevel::NoValidation,
+            ambisonic_order: 1,
+            reverb: ReverbStrategy::ShortIrLowerOrder,
+            reflection_output_gain: 1.0,
+            sources,
+            source_count: 3,
+        };
+        let source_ids = vec!["lead".into(), "bed".into(), "distant".into()];
+        let value = serde_json::to_value(delivered_quality_from_telemetry(
+            &source_ids,
+            DirectOcclusionMode::Raycast,
+            1,
+            telemetry,
+            "per_block_offline",
+        ))
+        .unwrap();
+
+        assert_eq!(value["reflections"]["level"], "minimum");
+        assert_eq!(value["reflections"]["rays"], 256);
+        assert_eq!(value["reflections"]["bounces"], 1);
+        assert_eq!(value["reflections"]["ir_duration_s"], 0.25);
+        assert_eq!(value["reflections"]["cadence_divisor"], 4);
+        assert_eq!(value["pathing"]["level"], "no_validation");
+        assert_eq!(value["pathing"]["validation_enabled"], false);
+        assert_eq!(value["pathing"]["alternate_paths_enabled"], true);
+        assert_eq!(value["ambisonic_order"], 1);
+        assert_eq!(value["reverb"]["strategy"], "short_ir_lower_order");
+        assert_eq!(value["reverb"]["capabilities"].as_array().unwrap().len(), 5);
+        assert_eq!(value["sources"][0]["state"], "full");
+        assert_eq!(value["sources"][1]["state"], "direct_only");
+        assert_eq!(
+            value["sources"][1]["reason"],
+            "audibility_ranked_degradation"
+        );
+        assert_eq!(value["sources"][2]["state"], "virtualized");
+        assert_eq!(value["sources"][2]["reason"], "below_hearing_threshold");
+        assert_eq!(value["transition_count"], 6);
+        assert_eq!(
+            value["transition_count_basis"],
+            "delivered_snapshot_publications_since_initial"
+        );
+        assert_eq!(
+            value["end_of_run_timings"]["basis"],
+            "governor_final_window"
+        );
+        assert_eq!(value["end_of_run_timings"]["p99_ms"], 1.2);
+        assert_eq!(
+            value["end_of_run_timings"]["simulation_lateness_ms"]["reflections"],
+            3.0
+        );
+        assert!(value.get("reflection_rays").is_none());
+        assert!(value["reflections"].get("diffuse_samples_target").is_none());
     }
 
     fn walk_fixture() -> Fixture {

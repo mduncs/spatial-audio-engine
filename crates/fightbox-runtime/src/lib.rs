@@ -25,7 +25,9 @@ pub use render::{
     run_timing_bucket_upper_bound_ns,
 };
 pub use snapshot::{SnapshotPublication, SnapshotReader, SnapshotWriter};
-pub use soak::{SoakReport, TimingPercentiles, run_offline_soak};
+pub use soak::{
+    SoakReport, TimingPercentiles, run_offline_soak, run_offline_soak_with_timing_observer,
+};
 pub use workers::{
     SimulationCadences, SimulationPassTelemetry, SimulationWorker, SimulationWorkerError,
     SimulationWorkerTelemetry,
