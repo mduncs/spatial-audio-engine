@@ -13,9 +13,16 @@
 
 #[cfg(any(feature = "linked-sdk", test))]
 mod backend_snapshot;
+mod governor;
 #[cfg(any(feature = "linked-sdk", test))]
 mod motion_smoothing;
 mod status;
+pub use governor::{
+    DeliveredReflectionQuality, GovernorSimulationPass, GovernorTransitionReason, PathQualityLevel,
+    QualityGovernorTelemetry, REVERB_RUNG_CAPABILITIES, ReflectionQualityLevel,
+    ReflectionSettingAvailability, ReverbRungAvailability, ReverbRungCapability, ReverbStrategy,
+    SourceQualityLevel, SourceQualityTelemetry,
+};
 pub use status::{
     CapabilityStatus, GateStatus, RuntimeStatus, runtime_status, steam_audio_provenance,
 };
@@ -697,6 +704,7 @@ pub struct S3SimulationConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MultiSourceDescriptor {
     pub initial_position_enu: fightbox_api::EnuVector3,
+    reference_level: fightbox_api::ReferenceLevel,
 }
 
 impl MultiSourceDescriptor {
@@ -704,7 +712,38 @@ impl MultiSourceDescriptor {
     pub const fn at(initial_position_enu: fightbox_api::EnuVector3) -> Self {
         Self {
             initial_position_enu,
+            reference_level: fightbox_api::ReferenceLevel::CreativeDb { db: 0.0 },
         }
+    }
+
+    /// Attaches the declared source level used for audibility ranking.
+    ///
+    /// Only `SplAtOneMeter` permits the governor to compare the prediction
+    /// with the hearing threshold and virtualize a source. `CreativeDb`
+    /// remains useful for relative ranking but can only select direct-only LOD.
+    #[must_use]
+    pub const fn with_reference_level(
+        mut self,
+        reference_level: fightbox_api::ReferenceLevel,
+    ) -> Self {
+        self.reference_level = reference_level;
+        self
+    }
+
+    #[cfg(any(feature = "linked-sdk", test))]
+    pub(crate) const fn declared_level_db(self) -> f32 {
+        match self.reference_level {
+            fightbox_api::ReferenceLevel::CreativeDb { db } => db,
+            fightbox_api::ReferenceLevel::SplAtOneMeter { db_spl } => db_spl,
+        }
+    }
+
+    #[cfg(any(feature = "linked-sdk", test))]
+    pub(crate) const fn is_physically_calibrated(self) -> bool {
+        matches!(
+            self.reference_level,
+            fightbox_api::ReferenceLevel::SplAtOneMeter { .. }
+        )
     }
 }
 
@@ -762,6 +801,36 @@ pub struct SteamAudioSimulationRunner {
     inner: linked::MultiSourceSimulation,
     #[cfg(not(feature = "linked-sdk"))]
     _private: (),
+}
+
+impl SteamAudioSimulationRunner {
+    /// Feeds one already-measured callback/block duration to the control-side governor.
+    ///
+    /// Call this outside the audio callback. A quality change, when needed, is
+    /// published as one immutable snapshot for adoption at a later block boundary.
+    pub fn observe_render_timing(&mut self, elapsed_ns: u64) {
+        #[cfg(feature = "linked-sdk")]
+        self.inner.observe_render_timing(elapsed_ns);
+        #[cfg(not(feature = "linked-sdk"))]
+        let _ = elapsed_ns;
+    }
+
+    /// Records scheduling lateness observed by an external simulation worker.
+    pub fn observe_simulation_lateness(&mut self, pass: GovernorSimulationPass, lateness_ns: u64) {
+        #[cfg(feature = "linked-sdk")]
+        self.inner.observe_simulation_lateness(pass, lateness_ns);
+        #[cfg(not(feature = "linked-sdk"))]
+        let _ = (pass, lateness_ns);
+    }
+
+    /// Returns the latest delivered-quality and governor timing telemetry.
+    #[must_use]
+    pub fn quality_governor_telemetry(&self) -> Option<QualityGovernorTelemetry> {
+        #[cfg(feature = "linked-sdk")]
+        return Some(self.inner.quality_governor_telemetry());
+        #[cfg(not(feature = "linked-sdk"))]
+        None
+    }
 }
 
 /// Audio-thread half of a retained multi-source Steam Audio session.

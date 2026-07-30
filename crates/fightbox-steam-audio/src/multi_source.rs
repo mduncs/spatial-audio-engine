@@ -12,6 +12,10 @@ use crate::backend_snapshot::{
     SteamDirectParams, SteamPropagationSnapshot, SteamReflectionParams, SteamSourcePropagation,
     WORLD_GENERATION, api_enu_to_steam, fixed_path_sh, path_coefficient_count,
 };
+use crate::governor::{
+    GovernorRenderSnapshot, GovernorSimulationPass, QualityGovernor, QualityGovernorTelemetry,
+    ReverbStrategy, SourceQualityLevel,
+};
 use crate::motion_smoothing::{
     PROPAGATION_SLEW_TIME_SECONDS, SourcePropagationSmoother, maximum_propagation_delay_samples,
     propagation_delay_samples,
@@ -173,10 +177,29 @@ pub(crate) struct MultiSourceSimulation {
     valid_update: bool,
     snapshot: SteamPropagationSnapshot,
     publication: fightbox_runtime::SnapshotWriter<SteamPropagationSnapshot>,
+    governor: QualityGovernor,
+    reflection_cadence_tick: u64,
+    last_pass_started_ns: [Option<u64>; 3],
     started: Instant,
 }
 
 impl MultiSourceSimulation {
+    pub(crate) fn observe_render_timing(&mut self, elapsed_ns: u64) {
+        self.governor.observe_block_timing(elapsed_ns);
+    }
+
+    pub(crate) fn observe_simulation_lateness(
+        &mut self,
+        pass: GovernorSimulationPass,
+        lateness_ns: u64,
+    ) {
+        self.governor.observe_simulation_lateness(pass, lateness_ns);
+    }
+
+    pub(crate) fn quality_governor_telemetry(&self) -> QualityGovernorTelemetry {
+        self.governor.telemetry()
+    }
+
     pub(crate) fn update_inputs(&mut self, update: &SimulationUpdate) {
         let Some(listener) = SteamPose::from_api(update.listener.pose) else {
             self.valid_update = false;
@@ -210,21 +233,54 @@ impl MultiSourceSimulation {
     }
 
     pub(crate) fn run_direct(&mut self) -> Result<(), SimulationError> {
-        self.run_pass(ffi::IPL_SIMULATIONFLAGS_DIRECT)
+        self.run_pass(
+            ffi::IPL_SIMULATIONFLAGS_DIRECT,
+            GovernorSimulationPass::Direct,
+        )
     }
 
     pub(crate) fn run_pathing(&mut self) -> Result<(), SimulationError> {
-        self.run_pass(ffi::IPL_SIMULATIONFLAGS_PATHING)
+        self.run_pass(
+            ffi::IPL_SIMULATIONFLAGS_PATHING,
+            GovernorSimulationPass::Pathing,
+        )
     }
 
     pub(crate) fn run_reflections(&mut self) -> Result<(), SimulationError> {
-        self.run_pass(ffi::IPL_SIMULATIONFLAGS_REFLECTIONS)
+        let cadence_divisor = u64::from(self.governor.render_quality().reflections.cadence_divisor);
+        let tick = self.reflection_cadence_tick;
+        self.reflection_cadence_tick = self.reflection_cadence_tick.wrapping_add(1);
+        if !tick.is_multiple_of(cadence_divisor) {
+            return Ok(());
+        }
+        self.run_pass(
+            ffi::IPL_SIMULATIONFLAGS_REFLECTIONS,
+            GovernorSimulationPass::Reflections,
+        )
     }
 
-    fn run_pass(&mut self, flag: i32) -> Result<(), SimulationError> {
+    fn run_pass(&mut self, flag: i32, pass: GovernorSimulationPass) -> Result<(), SimulationError> {
         if !self.valid_update {
             return Err(SimulationError::InvalidUpdate);
         }
+        let pass_started = Instant::now();
+        let pass_started_ns = self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let quality = self.governor.render_quality();
+        let target_interval_ns = match pass {
+            GovernorSimulationPass::Direct => 1_000_000_000 / 60,
+            GovernorSimulationPass::Pathing => 1_000_000_000 / 15,
+            GovernorSimulationPass::Reflections => {
+                (1_000_000_000 / 5) * u64::from(quality.reflections.cadence_divisor)
+            }
+        };
+        let pass_index = pass.index();
+        let previous_started_ns = self.last_pass_started_ns[pass_index].replace(pass_started_ns);
+        let lateness_ns = previous_started_ns.map_or(0, |previous| {
+            pass_started_ns
+                .saturating_sub(previous)
+                .saturating_sub(target_interval_ns)
+        });
+        self.governor.observe_simulation_lateness(pass, lateness_ns);
         // Steam Audio documents direct inputs as independently writable from
         // the indirect worker. Pathing and reflections share that indirect
         // input lane, even though their blocking run calls remain separate.
@@ -233,14 +289,15 @@ impl MultiSourceSimulation {
         } else {
             ffi::IPL_SIMULATIONFLAGS_REFLECTIONS | ffi::IPL_SIMULATIONFLAGS_PATHING
         };
-        let mut shared = shared_inputs(self.frame.listener, self.config)
-            .ok_or(SimulationError::InvalidUpdate)?;
+        let mut shared =
+            shared_inputs(self.frame.listener, quality).ok_or(SimulationError::InvalidUpdate)?;
         ffi::simulator_set_shared_inputs(self.world.simulator(), input_flags, &mut shared);
         for index in 0..self.world.source_count {
             let mut inputs = source_inputs(
                 self.frame.sources[index],
                 self.world.probe_batch(),
                 self.config,
+                quality,
                 input_flags,
             )
             .ok_or(SimulationError::InvalidUpdate)?;
@@ -259,10 +316,18 @@ impl MultiSourceSimulation {
             }
             _ => return Err(SimulationError::KernelFailure),
         }
-        self.copy_and_publish(flag)
+        let result = self.copy_and_publish(flag, quality);
+        let elapsed_ns = pass_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.governor
+            .observe_simulation_lateness(pass, elapsed_ns.saturating_sub(target_interval_ns));
+        result
     }
 
-    fn copy_and_publish(&mut self, flag: i32) -> Result<(), SimulationError> {
+    fn copy_and_publish(
+        &mut self,
+        flag: i32,
+        quality: GovernorRenderSnapshot,
+    ) -> Result<(), SimulationError> {
         self.snapshot.sequence = self.snapshot.sequence.wrapping_add(1);
         self.snapshot.simulated_at_ns =
             self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -287,6 +352,8 @@ impl MultiSourceSimulation {
                         return Err(SimulationError::KernelFailure);
                     }
                     source_snapshot.direct = direct;
+                    self.governor
+                        .observe_source_gain(index, predicted_direct_gain(direct));
                 }
                 ffi::IPL_SIMULATIONFLAGS_PATHING => {
                     let coefficient_count = path_coefficient_count(self.config.pathing_order)
@@ -307,10 +374,10 @@ impl MultiSourceSimulation {
                 ffi::IPL_SIMULATIONFLAGS_REFLECTIONS => {
                     let uses_ir =
                         reflection_effect_uses_ir(self.config.reflection_effect.effect_type);
-                    let expected_channels = ambisonics_channel_count(self.config.reflection_order)
+                    let expected_channels = ambisonics_channel_count(quality.ambisonic_order)
                         .map_err(|_| SimulationError::KernelFailure)?;
                     let maximum_ir_size = reflection_ir_size(
-                        self.config.reflection_duration_s,
+                        quality.reflections.ir_duration_s,
                         self.audio.sample_rate_hz,
                     )
                     .map_err(|_| SimulationError::KernelFailure)?;
@@ -357,6 +424,15 @@ fn direct_is_finite(direct: SteamDirectParams) -> bool {
         && direct.transmission.into_iter().all(f32::is_finite)
 }
 
+fn predicted_direct_gain(direct: SteamDirectParams) -> f32 {
+    let air = direct.air_absorption.into_iter().sum::<f32>() / 3.0;
+    let transmission = direct.transmission.into_iter().sum::<f32>() / 3.0;
+    let visibility = direct.occlusion.max(transmission);
+    (direct.distance_attenuation * air * direct.directivity * visibility)
+        .abs()
+        .max(0.0)
+}
+
 fn coordinate_space(pose: SteamPose) -> Option<ffi::IPLCoordinateSpace3> {
     let forward = steam_vector_to_api(pose.forward);
     let up = steam_vector_to_api(pose.up);
@@ -376,14 +452,14 @@ fn steam_vector_to_api(vector: SteamVector3) -> ApiEnuVector3 {
 
 fn shared_inputs(
     listener: SteamPose,
-    config: S3SimulationConfig,
+    quality: GovernorRenderSnapshot,
 ) -> Option<ffi::IPLSimulationSharedInputs> {
     Some(ffi::IPLSimulationSharedInputs {
         listener: coordinate_space(listener)?,
-        numRays: config.reflection_rays,
-        numBounces: config.reflection_bounces,
-        duration: config.reflection_duration_s,
-        order: config.reflection_order,
+        numRays: quality.reflections.rays,
+        numBounces: quality.reflections.bounces,
+        duration: quality.reflections.ir_duration_s,
+        order: quality.ambisonic_order,
         irradianceMinDistance: 1.0,
         pathingVisCallback: None,
         pathingUserData: core::ptr::null_mut(),
@@ -394,6 +470,7 @@ fn source_inputs(
     source: SteamPose,
     probe_batch: ffi::IPLProbeBatch,
     config: S3SimulationConfig,
+    quality: GovernorRenderSnapshot,
     flag: i32,
 ) -> Option<ffi::IPLSimulationInputs> {
     Some(ffi::IPLSimulationInputs {
@@ -437,8 +514,8 @@ fn source_inputs(
         visThreshold: config.pathing_visibility_threshold,
         visRange: config.pathing_visibility_range_m,
         pathingOrder: config.pathing_order,
-        enableValidation: bool_to_ipl(config.validate_paths),
-        findAlternatePaths: bool_to_ipl(config.find_alternate_paths),
+        enableValidation: bool_to_ipl(quality.validate_paths),
+        findAlternatePaths: bool_to_ipl(quality.find_alternate_paths),
         numTransmissionRays: 1,
         deviationModel: core::ptr::null_mut(),
     })
@@ -517,6 +594,7 @@ struct SourceRenderState {
     rendered_since_reset: bool,
     guard_reactivation_history: bool,
     reactivation_epoch_samples: usize,
+    quality_gains: [f32; 3],
 }
 
 pub(crate) struct MultiSourceRenderGraph {
@@ -533,7 +611,12 @@ pub(crate) struct MultiSourceRenderGraph {
     publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
     stage_output_gain_writer: Option<fightbox_runtime::SnapshotWriter<StageOutputGains>>,
     stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
+    governor_quality: fightbox_runtime::SnapshotReader<GovernorRenderSnapshot>,
+    applied_governor_quality: GovernorRenderSnapshot,
+    reflection_output_gain: f32,
     propagation_block_retention: f32,
+    #[cfg(test)]
+    governor_snapshot_reads: u64,
     // Must drop after every SDK effect and audio buffer. Keeping the world
     // last also keeps its context alive when the simulation half dropped first.
     world: Arc<WorldGeneration>,
@@ -572,6 +655,12 @@ impl MultiSourceRenderGraph {
             return Err(BackendRenderError::InactiveGraph);
         }
         let stage_output_gains = self.stage_output_gains.read();
+        let governor_quality = self.governor_quality.read();
+        #[cfg(test)]
+        {
+            self.governor_snapshot_reads = self.governor_snapshot_reads.saturating_add(1);
+        }
+        self.applied_governor_quality = governor_quality;
         for (index, state) in self.sources.iter_mut().enumerate() {
             if !snapshot.sources[index].active {
                 state.propagation_smoother.reset();
@@ -596,6 +685,7 @@ impl MultiSourceRenderGraph {
                 block.output_left,
                 block.output_right,
                 stage_output_gains,
+                governor_quality,
             );
         }
         self.render_reflection_mix(
@@ -603,6 +693,7 @@ impl MultiSourceRenderGraph {
             block.output_left,
             block.output_right,
             stage_output_gains.reflections,
+            governor_quality,
         );
         Ok(())
     }
@@ -616,8 +707,34 @@ impl MultiSourceRenderGraph {
         output_left: &mut [f32],
         output_right: &mut [f32],
         stage_output_gains: StageOutputGains,
+        governor_quality: GovernorRenderSnapshot,
     ) {
         let state = &mut self.sources[source_block.source_index];
+        let source_quality = governor_quality.sources[source_block.source_index];
+        let listener_centric_reflection = governor_quality.reverb
+            != ReverbStrategy::ListenerCentric
+            || usize::from(governor_quality.listener_centric_source) == source_block.source_index;
+        let targets = match source_quality {
+            SourceQualityLevel::Full => [
+                1.0,
+                1.0,
+                if listener_centric_reflection {
+                    1.0
+                } else {
+                    0.0
+                },
+            ],
+            SourceQualityLevel::DirectOnly => [1.0, 0.0, 0.0],
+            SourceQualityLevel::Virtualized => [0.0, 0.0, 0.0],
+        };
+        let quality_ramps: [GainRamp; 3] = std::array::from_fn(|index| {
+            GainRamp::new(
+                state.quality_gains[index],
+                targets[index],
+                self.audio.frame_size as usize,
+            )
+        });
+        state.quality_gains = targets;
         let smoothed = state
             .propagation_smoother
             .advance(
@@ -671,89 +788,101 @@ impl MultiSourceRenderGraph {
         state.input.write_mono(&mut self.mono_work);
 
         let mut input = state.input.raw();
-        let mut direct_mono = state.direct_mono.raw();
-        let mut direct_stereo = state.direct_stereo.raw();
-        // DirectEffect retains the preceding parameter frame and interpolates
-        // through this block toward the exact backend endpoint supplied here.
-        let mut direct_params = ffi::IPLDirectEffectParams {
-            flags: ffi::IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION
-                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION
-                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY
-                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION
-                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION,
-            transmissionType: ffi::IPL_TRANSMISSIONTYPE_FREQDEPENDENT,
-            distanceAttenuation: smoothed.direct.distance_attenuation,
-            airAbsorption: smoothed.direct.air_absorption,
-            directivity: smoothed.direct.directivity,
-            occlusion: smoothed.direct.occlusion,
-            transmission: smoothed.direct.transmission,
-        };
-        ffi::direct_effect_apply(
-            handle(state.direct_effect),
-            &mut direct_params,
-            &mut input,
-            &mut direct_mono,
-        );
-        let mut binaural_params = ffi::IPLBinauralEffectParams {
-            direction: relative_direction_steam(
-                smoothed.source_position,
-                smoothed.listener_position,
-                listener,
-            ),
-            interpolation: ffi::IPL_HRTFINTERPOLATION_BILINEAR,
-            spatialBlend: 1.0,
-            hrtf: handle(self.hrtf),
-            peakDelays: core::ptr::null_mut(),
-        };
-        ffi::binaural_effect_apply(
-            handle(state.binaural_effect),
-            &mut binaural_params,
-            &mut direct_mono,
-            &mut direct_stereo,
-        );
-        state.direct_stereo.read_interleaved(&mut self.stereo_work);
-        accumulate_stereo(
-            &self.stereo_work,
-            output_left,
-            output_right,
-            stage_output_gains.direct,
-        );
+        if quality_ramps[0].is_audible() {
+            let mut direct_mono = state.direct_mono.raw();
+            let mut direct_stereo = state.direct_stereo.raw();
+            // DirectEffect retains the preceding parameter frame and interpolates
+            // through this block toward the exact backend endpoint supplied here.
+            let mut direct_params = ffi::IPLDirectEffectParams {
+                flags: ffi::IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION
+                    | ffi::IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION
+                    | ffi::IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY
+                    | ffi::IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION
+                    | ffi::IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION,
+                transmissionType: ffi::IPL_TRANSMISSIONTYPE_FREQDEPENDENT,
+                distanceAttenuation: smoothed.direct.distance_attenuation,
+                airAbsorption: smoothed.direct.air_absorption,
+                directivity: smoothed.direct.directivity,
+                occlusion: smoothed.direct.occlusion,
+                transmission: smoothed.direct.transmission,
+            };
+            ffi::direct_effect_apply(
+                handle(state.direct_effect),
+                &mut direct_params,
+                &mut input,
+                &mut direct_mono,
+            );
+            let mut binaural_params = ffi::IPLBinauralEffectParams {
+                direction: relative_direction_steam(
+                    smoothed.source_position,
+                    smoothed.listener_position,
+                    listener,
+                ),
+                interpolation: ffi::IPL_HRTFINTERPOLATION_BILINEAR,
+                spatialBlend: 1.0,
+                hrtf: handle(self.hrtf),
+                peakDelays: core::ptr::null_mut(),
+            };
+            ffi::binaural_effect_apply(
+                handle(state.binaural_effect),
+                &mut binaural_params,
+                &mut direct_mono,
+                &mut direct_stereo,
+            );
+            state.direct_stereo.read_interleaved(&mut self.stereo_work);
+            accumulate_stereo_ramped(
+                &self.stereo_work,
+                output_left,
+                output_right,
+                stage_output_gains.direct,
+                quality_ramps[0],
+            );
+        }
 
         // PathEffect likewise retains its EQ/SH parameter frame and
         // interpolates toward these one-pole endpoints within the block.
-        let mut path_coefficients = smoothed.path_sh;
-        let mut path_params = ffi::IPLPathEffectParams {
-            eqCoeffs: smoothed.path_eq,
-            shCoeffs: path_coefficients.as_mut_ptr(),
-            order: i32::from(propagation.configured_pathing_order),
-            binaural: ffi::IPL_TRUE,
-            hrtf: handle(self.hrtf),
-            listener: coordinate_space(SteamPose {
-                position: smoothed.listener_position,
-                ..listener
-            })
-            .expect("validated listener orientation"),
-            normalizeEQ: ffi::IPL_FALSE,
-        };
-        let mut path_stereo = state.path_stereo.raw();
-        ffi::path_effect_apply(
-            handle(state.path_effect),
-            &mut path_params,
-            &mut input,
-            &mut path_stereo,
-        );
-        state.path_stereo.read_interleaved(&mut self.stereo_work);
-        accumulate_stereo(
-            &self.stereo_work,
-            output_left,
-            output_right,
-            stage_output_gains.pathing,
-        );
+        if quality_ramps[1].is_audible() {
+            let mut path_coefficients = smoothed.path_sh;
+            let mut path_params = ffi::IPLPathEffectParams {
+                eqCoeffs: smoothed.path_eq,
+                shCoeffs: path_coefficients.as_mut_ptr(),
+                order: i32::from(propagation.configured_pathing_order),
+                binaural: ffi::IPL_TRUE,
+                hrtf: handle(self.hrtf),
+                listener: coordinate_space(SteamPose {
+                    position: smoothed.listener_position,
+                    ..listener
+                })
+                .expect("validated listener orientation"),
+                normalizeEQ: ffi::IPL_FALSE,
+            };
+            let mut path_stereo = state.path_stereo.raw();
+            ffi::path_effect_apply(
+                handle(state.path_effect),
+                &mut path_params,
+                &mut input,
+                &mut path_stereo,
+            );
+            state.path_stereo.read_interleaved(&mut self.stereo_work);
+            accumulate_stereo_ramped(
+                &self.stereo_work,
+                output_left,
+                output_right,
+                stage_output_gains.pathing,
+                quality_ramps[1],
+            );
+        }
 
         let reflection = propagation.reflections;
-        if reflection.ir != 0
-            || reflection_effect_uses_reverb(self.config.reflection_effect.effect_type)
+        if quality_ramps[2].is_audible()
+            && (reflection.ir != 0
+                || reflection_effect_uses_reverb(self.config.reflection_effect.effect_type))
         {
+            for (frame, sample) in self.mono_work.iter_mut().enumerate() {
+                *sample *= quality_ramps[2].at(frame);
+            }
+            state.input.write_mono(&mut self.mono_work);
+            input = state.input.raw();
             let mut reflection_params = reflection_effect_params(reflection, self.config);
             let mut scratch = state.reflection_scratch.raw();
             ffi::reflection_effect_apply_to_mixer(
@@ -772,6 +901,7 @@ impl MultiSourceRenderGraph {
         output_left: &mut [f32],
         output_right: &mut [f32],
         gain: f32,
+        governor_quality: GovernorRenderSnapshot,
     ) {
         let mut mixer_params = ffi::IPLReflectionEffectParams {
             type_: reflection_effect_ffi_type(self.config.reflection_effect.effect_type)
@@ -780,10 +910,10 @@ impl MultiSourceRenderGraph {
             reverbTimes: [0.0; 3],
             eq: [1.0; 3],
             delay: 0,
-            numChannels: ambisonics_channel_count(self.config.reflection_order)
+            numChannels: ambisonics_channel_count(governor_quality.ambisonic_order)
                 .expect("validated reflection order"),
             irSize: reflection_ir_size(
-                self.config.reflection_duration_s,
+                governor_quality.reflections.ir_duration_s,
                 self.audio.sample_rate_hz,
             )
             .expect("validated reflection duration"),
@@ -797,7 +927,7 @@ impl MultiSourceRenderGraph {
             &mut reflection_mix,
         );
         let mut decode_params = ffi::IPLAmbisonicsDecodeEffectParams {
-            order: self.config.reflection_order,
+            order: governor_quality.ambisonic_order,
             hrtf: handle(self.hrtf),
             orientation: coordinate_space(listener).expect("validated listener orientation"),
             binaural: ffi::IPL_TRUE,
@@ -811,30 +941,75 @@ impl MultiSourceRenderGraph {
         );
         self.reflection_stereo
             .read_interleaved(&mut self.stereo_work);
-        accumulate_stereo(&self.stereo_work, output_left, output_right, gain);
+        let reflection_gain_ramp = GainRamp::new(
+            self.reflection_output_gain,
+            governor_quality.reflection_output_gain,
+            self.audio.frame_size as usize,
+        );
+        self.reflection_output_gain = governor_quality.reflection_output_gain;
+        accumulate_stereo_ramped(
+            &self.stereo_work,
+            output_left,
+            output_right,
+            gain,
+            reflection_gain_ramp,
+        );
     }
 }
 
-fn accumulate_stereo(interleaved: &[f32], left: &mut [f32], right: &mut [f32], gain: f32) {
-    if gain == 0.0 {
-        return;
-    }
-    if gain == 1.0 {
-        for ((frame, left), right) in interleaved
-            .chunks_exact(2)
-            .zip(left.iter_mut())
-            .zip(right.iter_mut())
-        {
-            *left += frame[0];
-            *right += frame[1];
+#[derive(Clone, Copy)]
+struct GainRamp {
+    start: f32,
+    step: f32,
+    end: f32,
+}
+
+impl GainRamp {
+    fn new(start: f32, end: f32, frames: usize) -> Self {
+        Self {
+            start,
+            step: if frames > 1 {
+                (end - start) / (frames - 1) as f32
+            } else {
+                0.0
+            },
+            end,
         }
+    }
+
+    fn at(self, frame: usize) -> f32 {
+        if frame == 0 && self.step != 0.0 {
+            self.start
+        } else if self.step == 0.0 {
+            self.end
+        } else {
+            (self.start + self.step * frame as f32)
+                .clamp(self.start.min(self.end), self.start.max(self.end))
+        }
+    }
+
+    fn is_audible(self) -> bool {
+        self.start != 0.0 || self.end != 0.0
+    }
+}
+
+fn accumulate_stereo_ramped(
+    interleaved: &[f32],
+    left: &mut [f32],
+    right: &mut [f32],
+    stage_gain: f32,
+    ramp: GainRamp,
+) {
+    if stage_gain == 0.0 || !ramp.is_audible() {
         return;
     }
-    for ((frame, left), right) in interleaved
+    for (frame_index, ((frame, left), right)) in interleaved
         .chunks_exact(2)
         .zip(left.iter_mut())
         .zip(right.iter_mut())
+        .enumerate()
     {
+        let gain = stage_gain * ramp.at(frame_index);
         *left += frame[0] * gain;
         *right += frame[1] * gain;
     }
@@ -941,6 +1116,7 @@ pub(crate) fn build_multi_source_session(
     let (writer, reader) = SnapshotPublication::new(initial);
     let (stage_output_gain_writer, stage_output_gains) =
         SnapshotPublication::new(StageOutputGains::UNITY);
+    let (governor, governor_quality) = QualityGovernor::new(audio, config, descriptors);
     let render = create_render_graph(
         Arc::clone(&world),
         audio,
@@ -948,6 +1124,7 @@ pub(crate) fn build_multi_source_session(
         reader,
         stage_output_gain_writer,
         stage_output_gains,
+        governor_quality,
     )?;
     let simulation = MultiSourceSimulation {
         world,
@@ -961,6 +1138,9 @@ pub(crate) fn build_multi_source_session(
         valid_update: true,
         snapshot: initial,
         publication: writer,
+        governor,
+        reflection_cadence_tick: 0,
+        last_pass_started_ns: [None; 3],
         started: Instant::now(),
     };
     Ok((simulation, render))
@@ -981,12 +1161,11 @@ fn validate_multi_source_config(
             "multi-source session requires between one and MAX_ACTIVE_SOURCES descriptors",
         ));
     }
-    if descriptors
-        .iter()
-        .any(|descriptor| !descriptor.initial_position_enu.is_finite())
-    {
+    if descriptors.iter().any(|descriptor| {
+        !descriptor.initial_position_enu.is_finite() || !descriptor.declared_level_db().is_finite()
+    }) {
         return Err(BackendError::InvalidInput(
-            "multi-source descriptor positions must be finite",
+            "multi-source descriptor positions and reference levels must be finite",
         ));
     }
     if config.max_occlusion_samples <= 0
@@ -1178,6 +1357,7 @@ fn create_render_graph(
     mut publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
     stage_output_gain_writer: fightbox_runtime::SnapshotWriter<StageOutputGains>,
     stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
+    mut governor_quality: fightbox_runtime::SnapshotReader<GovernorRenderSnapshot>,
 ) -> Result<MultiSourceRenderGraph, BackendError> {
     let context = world.context();
     let mut audio_settings = raw_audio_settings(audio);
@@ -1251,6 +1431,7 @@ fn create_render_graph(
             initial_delay_samples,
         )?);
     }
+    let applied_governor_quality = governor_quality.read();
     Ok(MultiSourceRenderGraph {
         world,
         config,
@@ -1266,9 +1447,14 @@ fn create_render_graph(
         publication,
         stage_output_gain_writer: Some(stage_output_gain_writer),
         stage_output_gains,
+        governor_quality,
+        applied_governor_quality,
+        reflection_output_gain: applied_governor_quality.reflection_output_gain,
         propagation_block_retention: (-(audio.frame_size as f32 / audio.sample_rate_hz as f32)
             / PROPAGATION_SLEW_TIME_SECONDS)
             .exp(),
+        #[cfg(test)]
+        governor_snapshot_reads: 0,
     })
 }
 
@@ -1357,6 +1543,7 @@ fn create_source_render_state(
         rendered_since_reset: false,
         guard_reactivation_history: false,
         reactivation_epoch_samples: 0,
+        quality_gains: [1.0; 3],
     })
 }
 
@@ -1621,6 +1808,79 @@ mod tests {
             }
         }
         ((energy / measured as f64).sqrt() as f32, direct)
+    }
+
+    #[test]
+    fn governor_virtualization_advances_transport_and_reads_one_snapshot_per_block() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptor = [
+            crate::MultiSourceDescriptor::at(ApiEnuVector3::new(1.0, 0.0, 0.0))
+                .with_reference_level(fightbox_api::ReferenceLevel::SplAtOneMeter {
+                    db_spl: -20.0,
+                }),
+        ];
+        let (mut simulation, mut render) =
+            build_multi_source_session(&mesh, &baked, audio, test_config(), &descriptor).unwrap();
+
+        // Reflection levels, validation, alternates, then the source rung.
+        for _ in 0..(5 * 16) {
+            simulation.observe_render_timing(3_000_000);
+        }
+        let zeros = vec![0.0; audio.frame_size as usize];
+        let ones = vec![1.0; audio.frame_size as usize];
+        let reads_before = render.governor_snapshot_reads;
+        render_one_source_block(&mut render, &zeros);
+        simulation.observe_render_timing(3_000_000);
+        render_one_source_block(&mut render, &ones);
+        simulation.observe_render_timing(3_000_000);
+        render_one_source_block(&mut render, &ones);
+        assert_eq!(
+            simulation.quality_governor_telemetry().sources[0].quality,
+            SourceQualityLevel::Virtualized
+        );
+
+        assert_eq!(render.governor_snapshot_reads - reads_before, 3);
+        assert_eq!(render.sources[0].quality_gains, [0.0; 3]);
+        assert!(
+            render.mono_work.iter().any(|sample| *sample > 0.5),
+            "the delay/transport path stopped while backend DSP was virtualized"
+        );
+
+        // Sustained headroom restores this first source rung. The next block
+        // ramps from silence to full quality without rewinding transport.
+        for _ in 0..(8 * 16) {
+            simulation.observe_render_timing(100_000);
+        }
+        render_one_source_block(&mut render, &ones);
+        simulation.observe_render_timing(100_000);
+        render_one_source_block(&mut render, &ones);
+        simulation.observe_render_timing(100_000);
+        render_one_source_block(&mut render, &ones);
+        assert_eq!(
+            simulation.quality_governor_telemetry().sources[0].quality,
+            SourceQualityLevel::Full
+        );
+        assert_eq!(render.governor_snapshot_reads - reads_before, 6);
+        assert_eq!(render.sources[0].quality_gains, [1.0; 3]);
+    }
+
+    #[test]
+    fn governor_gain_ramp_reaches_both_endpoints() {
+        let down = GainRamp::new(1.0, 0.0, 128);
+        assert_eq!(down.at(0), 1.0);
+        assert_eq!(down.at(127), 0.0);
+        let up = GainRamp::new(0.0, 1.0, 128);
+        assert_eq!(up.at(0), 0.0);
+        assert_eq!(up.at(127), 1.0);
     }
 
     #[test]
