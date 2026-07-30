@@ -37,6 +37,10 @@ const CLICK_PERIOD_SECONDS: f32 = 0.25;
 const DIRECT_PERIOD_BLOCKS: usize = 6;
 const PATH_PERIOD_BLOCKS: usize = 25;
 const FIXED_REFLECTION_PERIOD_BLOCKS: usize = 75;
+const PAIR_SPACING_TOLERANCE_MS: f32 = 3.0;
+// The confirmed double-render presents two nearly equal attacks. Requiring
+// the secondary to be within 2 dB rejects ordinary weaker echo reordering.
+const ARTIFACT_PAIR_MIN_RELATIVE_DB: f32 = -2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReflectionScheduling {
@@ -164,6 +168,7 @@ struct Render {
     reflection_pass_ns: Vec<u64>,
     reflection_ticks: Vec<usize>,
     max_multiplexed_pass_ns: u64,
+    render_block_ns: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +185,11 @@ struct Pair {
     spacing_ms: f32,
     relative_db: f32,
     nearest_reversal_ms: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArtifactPair {
+    pair: Pair,
 }
 
 #[test]
@@ -263,6 +273,7 @@ fn sprint_reversal_transient_diagnosis() {
             let pairs = onset_pairs(&render);
             print_pairs(&render.name, &pairs);
             print_reflection_perf(&render);
+            print_render_perf(&render);
             renders.push(render);
         }
     }
@@ -281,6 +292,30 @@ fn sprint_reversal_transient_diagnosis() {
                 pair.spacing_ms,
                 pair.relative_db,
                 pair.nearest_reversal_ms,
+            ));
+        }
+    }
+    for full in renders
+        .iter()
+        .filter(|render| render.name.contains("-full-"))
+    {
+        let frozen_name = full.name.replace("-full-", "-frozen-reflections-");
+        let Some(frozen) = renders.iter().find(|render| render.name == frozen_name) else {
+            continue;
+        };
+        let artifacts = artifact_pairs(&onset_pairs(full), &onset_pairs(frozen));
+        print_artifact_pairs(&full.name, &frozen.name, &artifacts);
+        text.push_str(&format!(
+            "differential full={} frozen={} artifact_pairs={}\n",
+            full.name,
+            frozen.name,
+            artifacts.len()
+        ));
+        for artifact in artifacts {
+            let pair = artifact.pair;
+            text.push_str(&format!(
+                "artifact click={} spacing_ms={:.3} relative_db={:.2} nearest_reversal_ms={:.3}\n",
+                pair.click, pair.spacing_ms, pair.relative_db, pair.nearest_reversal_ms,
             ));
         }
     }
@@ -387,6 +422,7 @@ fn render_case(
     let mut reflection_pass_ns = Vec::new();
     let mut reflection_ticks = Vec::new();
     let mut max_multiplexed_pass_ns = 0_u64;
+    let mut render_block_ns = Vec::with_capacity(total_blocks);
 
     for block in 0..total_blocks {
         let multiplexed_started = Instant::now();
@@ -466,6 +502,7 @@ fn render_case(
             source_index: 0,
             decoded_mono: &input,
         }];
+        let render_started = Instant::now();
         graph
             .process_block(ProcessBlock {
                 now_ns: block as u64 * 2_666_667,
@@ -474,6 +511,7 @@ fn render_case(
                 output_right: &mut right,
             })
             .unwrap();
+        render_block_ns.push(elapsed_ns(render_started));
         assert!(
             left.iter().chain(&right).all(|sample| sample.is_finite()),
             "non-finite output in {}-{}",
@@ -499,6 +537,7 @@ fn render_case(
         reflection_pass_ns,
         reflection_ticks,
         max_multiplexed_pass_ns,
+        render_block_ns,
     }
 }
 
@@ -729,6 +768,31 @@ fn onset_pairs(render: &Render) -> Vec<Pair> {
     pairs
 }
 
+fn artifact_pairs(full: &[Pair], frozen: &[Pair]) -> Vec<ArtifactPair> {
+    full.iter()
+        .copied()
+        .filter(|full_pair| {
+            if full_pair.relative_db < ARTIFACT_PAIR_MIN_RELATIVE_DB
+                || frozen.iter().any(|frozen_pair| {
+                    (frozen_pair.spacing_ms - full_pair.spacing_ms).abs()
+                        <= PAIR_SPACING_TOLERANCE_MS
+                })
+            {
+                return false;
+            }
+            // IR adoption can only create the confirmed premature duplicate:
+            // a near-equal secondary arriving materially sooner than the
+            // frozen control's pair for the same click. Longer spacings are
+            // normal motion-dependent echo evolution, not reversal doubling.
+            frozen.iter().any(|frozen_pair| {
+                frozen_pair.click == full_pair.click
+                    && full_pair.spacing_ms + PAIR_SPACING_TOLERANCE_MS < frozen_pair.spacing_ms
+            })
+        })
+        .map(|pair| ArtifactPair { pair })
+        .collect()
+}
+
 fn energy_envelope(left: &[f32], right: &[f32], radius: usize) -> Vec<f32> {
     let power = left
         .iter()
@@ -800,6 +864,25 @@ fn print_pairs(name: &str, pairs: &[Pair]) {
     }
 }
 
+fn print_artifact_pairs(full_name: &str, frozen_name: &str, artifacts: &[ArtifactPair]) {
+    let levels = artifacts
+        .iter()
+        .map(|artifact| artifact.pair.relative_db)
+        .collect::<Vec<_>>();
+    println!(
+        "DIAG differential full={full_name} frozen={frozen_name} artifact_pairs={} artifact_median_db={:.2}",
+        artifacts.len(),
+        median_f32(&levels),
+    );
+    for artifact in artifacts {
+        let pair = artifact.pair;
+        println!(
+            "DIAG artifact full={full_name} click={} spacing_ms={:.3} relative_db={:.2} nearest_reversal_ms={:.3}",
+            pair.click, pair.spacing_ms, pair.relative_db, pair.nearest_reversal_ms,
+        );
+    }
+}
+
 fn print_reflection_perf(render: &Render) {
     let reflection_p50_ns = percentile_u64(&render.reflection_pass_ns, 50.0);
     let reflection_p99_ns = percentile_u64(&render.reflection_pass_ns, 99.0);
@@ -822,6 +905,17 @@ fn print_reflection_perf(render: &Render) {
         render.max_multiplexed_pass_ns as f64 / 1_000_000.0,
         tightest_period_ns as f64 / 1_000_000.0,
         render.max_multiplexed_pass_ns < tightest_period_ns,
+    );
+}
+
+fn print_render_perf(render: &Render) {
+    println!(
+        "DIAG render-perf name={} blocks={} p50_us={:.3} p99_us={:.3} max_us={:.3}",
+        render.name,
+        render.render_block_ns.len(),
+        percentile_u64(&render.render_block_ns, 50.0) as f64 / 1_000.0,
+        percentile_u64(&render.render_block_ns, 99.0) as f64 / 1_000.0,
+        render.render_block_ns.iter().copied().max().unwrap_or(0) as f64 / 1_000.0,
     );
 }
 
@@ -1019,4 +1113,62 @@ fn write_float_wav(path: &Path, left: &[f32], right: &[f32]) -> io::Result<()> {
         file.write_all(&right.to_le_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod differential_metric_tests {
+    use super::*;
+
+    fn pair(click: usize, spacing_ms: f32, relative_db: f32) -> Pair {
+        Pair {
+            click,
+            primary: Peak {
+                sample: 100,
+                amplitude: 1.0,
+            },
+            secondary: Peak {
+                sample: 200,
+                amplitude: 0.5,
+            },
+            spacing_ms,
+            relative_db,
+            nearest_reversal_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn premature_near_equal_pair_absent_from_control_is_an_artifact() {
+        let full = [pair(0, 18.7, -0.7), pair(1, 36.7, -1.0)];
+        let frozen = [pair(0, 36.7, -0.8), pair(1, 39.6, -0.9)];
+
+        let artifacts = artifact_pairs(&full, &frozen);
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].pair.click, 0);
+        assert_eq!(artifacts[0].pair.spacing_ms, 18.7);
+    }
+
+    #[test]
+    fn pair_at_tolerance_boundary_is_not_an_artifact() {
+        let full = [pair(3, 36.0, -2.0)];
+        let frozen = [pair(3, 39.0, -3.0)];
+
+        assert!(artifact_pairs(&full, &frozen).is_empty());
+    }
+
+    #[test]
+    fn weaker_or_later_motion_echoes_are_not_doubling_artifacts() {
+        let full = [pair(0, 18.0, -2.1), pair(1, 46.0, -0.5)];
+        let frozen = [pair(0, 36.0, -1.0), pair(1, 36.0, -1.0)];
+
+        assert!(artifact_pairs(&full, &frozen).is_empty());
+    }
+
+    #[test]
+    fn control_spacing_can_match_at_another_click() {
+        let full = [pair(0, 40.9, -0.5)];
+        let frozen = [pair(0, 36.7, -1.0), pair(1, 40.8, -1.0)];
+
+        assert!(artifact_pairs(&full, &frozen).is_empty());
+    }
 }
