@@ -36,6 +36,8 @@ fn main() {
         "phonon.lib"
     } else if target_os == "macos" {
         "libphonon.dylib"
+    } else if target_os == "ios" {
+        "libphonon.a"
     } else {
         "libphonon.so"
     };
@@ -54,7 +56,11 @@ fn main() {
     }
     let library_dir = library.parent().expect("a library path has a parent");
     println!("cargo:rustc-link-search=native={}", library_dir.display());
-    println!("cargo:rustc-link-lib=dylib=phonon");
+    if target_os == "ios" {
+        println!("cargo:rustc-link-lib=static=phonon");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=phonon");
+    }
     println!("cargo:library_dir={}", library_dir.display());
     // Development and test executables must find the exact verified SDK selected above.
     // Release packaging gets an explicit runtime-loader policy when a host exists.
@@ -118,6 +124,8 @@ fn find_target_library(
     let expected_directory = match (target_os, target_arch) {
         // Steam Audio's macOS binary is in lib/osx and may be universal.
         ("macos", _) => "osx",
+        // Valve ships iPhoneOS arm64 objects only (no simulator slice).
+        ("ios", "aarch64") => "ios",
         ("windows", "x86_64") => "windows-x64",
         ("windows", "x86") => "windows-x86",
         ("windows", "aarch64") => "windows-arm64",
