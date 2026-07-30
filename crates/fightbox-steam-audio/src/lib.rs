@@ -17,6 +17,8 @@ mod governor;
 #[cfg(any(feature = "linked-sdk", test))]
 mod motion_smoothing;
 mod status;
+#[allow(unsafe_code)]
+mod world_swap;
 pub use governor::{
     DeliveredReflectionQuality, GovernorSimulationPass, GovernorTransitionReason, PathQualityLevel,
     QualityGovernorTelemetry, REVERB_RUNG_CAPABILITIES, ReflectionQualityLevel,
@@ -795,6 +797,143 @@ impl StageOutputGainControl {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvalidStageOutputGains;
 
+/// Reflection implementation present in one prepared world generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorldReflectionState {
+    RealtimeConvolution,
+    RealtimeParametric,
+    RealtimeHybrid,
+    UnsupportedTrueAudioNext,
+}
+
+impl WorldReflectionState {
+    const fn from_effect(effect: ReflectionEffectType) -> Self {
+        match effect {
+            ReflectionEffectType::Convolution => Self::RealtimeConvolution,
+            ReflectionEffectType::Parametric => Self::RealtimeParametric,
+            ReflectionEffectType::Hybrid => Self::RealtimeHybrid,
+            ReflectionEffectType::TrueAudioNext => Self::UnsupportedTrueAudioNext,
+        }
+    }
+}
+
+/// Capabilities owned by one complete world generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedWorldCapabilities {
+    pub generation: u64,
+    /// True only when a validated serialized probe batch with baked path data
+    /// was loaded into this generation.
+    pub baked_pathing: bool,
+    pub reflections: WorldReflectionState,
+}
+
+/// Render-thread adoption state observed without consulting SDK handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveredWorldState {
+    pub capabilities: PreparedWorldCapabilities,
+    /// Old and new graphs are both rendered while this count is nonzero.
+    pub transition_blocks_remaining: u8,
+}
+
+/// Rust-owned proof values copied from the latest simulation snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldGenerationDiagnostics {
+    pub generation: u64,
+    /// Prefix of the validated bake content hash; zero when pathing is absent.
+    pub baked_data_fingerprint: u64,
+    pub path_eq: [f32; 3],
+    pub path_sh_energy: f32,
+    pub reflection_reverb_times: [f32; 3],
+    pub reflection_ir_size: i32,
+}
+
+/// A fully constructed second world which has not yet been offered to the
+/// callback. It can be primed with simulation updates before adoption.
+pub struct PreparedSteamAudioWorld {
+    #[cfg(feature = "linked-sdk")]
+    inner: linked::PreparedMultiSourceWorld,
+    stage_output_gain_control: Option<StageOutputGainControl>,
+    #[cfg(not(feature = "linked-sdk"))]
+    _private: (),
+}
+
+impl PreparedSteamAudioWorld {
+    #[must_use]
+    pub fn capabilities(&self) -> PreparedWorldCapabilities {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.capabilities();
+        #[cfg(not(feature = "linked-sdk"))]
+        unreachable!("an SDK-unavailable build cannot construct a prepared world")
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> WorldGenerationDiagnostics {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.diagnostics();
+        #[cfg(not(feature = "linked-sdk"))]
+        unreachable!("an SDK-unavailable build cannot construct a prepared world")
+    }
+
+    /// Primes the prepared generation's governor off-callback before adoption.
+    pub fn observe_render_timing(&mut self, elapsed_ns: u64) {
+        #[cfg(feature = "linked-sdk")]
+        self.inner.observe_render_timing(elapsed_ns);
+        #[cfg(not(feature = "linked-sdk"))]
+        let _ = elapsed_ns;
+    }
+
+    #[must_use]
+    pub fn quality_governor_telemetry(&self) -> Option<QualityGovernorTelemetry> {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.quality_governor_telemetry();
+        #[cfg(not(feature = "linked-sdk"))]
+        None
+    }
+}
+
+impl fightbox_runtime::backend::SimulationRunner for PreparedSteamAudioWorld {
+    fn update_inputs(&mut self, update: &fightbox_runtime::backend::SimulationUpdate) {
+        #[cfg(feature = "linked-sdk")]
+        self.inner.update_inputs(update);
+        #[cfg(not(feature = "linked-sdk"))]
+        let _ = update;
+    }
+
+    fn run_direct(&mut self) -> Result<(), fightbox_runtime::backend::SimulationError> {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.run_direct();
+        #[cfg(not(feature = "linked-sdk"))]
+        Err(fightbox_runtime::backend::SimulationError::KernelFailure)
+    }
+
+    fn run_pathing(&mut self) -> Result<(), fightbox_runtime::backend::SimulationError> {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.run_pathing();
+        #[cfg(not(feature = "linked-sdk"))]
+        Err(fightbox_runtime::backend::SimulationError::KernelFailure)
+    }
+
+    fn run_reflections(&mut self) -> Result<(), fightbox_runtime::backend::SimulationError> {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.run_reflections();
+        #[cfg(not(feature = "linked-sdk"))]
+        Err(fightbox_runtime::backend::SimulationError::KernelFailure)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedWorldSwapError {
+    AdoptionPending,
+}
+
+/// Successful control-side publication of a prepared world.
+pub struct PreparedWorldSwapReceipt {
+    pub generation: u64,
+    /// Stage-gain snapshots are generation-local. This producer controls the
+    /// newly adopted graph; the preceding generation's producer may be dropped.
+    pub stage_output_gain_control: StageOutputGainControl,
+}
+
 /// Simulation half of a retained multi-source Steam Audio session.
 pub struct SteamAudioSimulationRunner {
     #[cfg(feature = "linked-sdk")]
@@ -824,12 +963,92 @@ impl SteamAudioSimulationRunner {
     }
 
     /// Returns the latest delivered-quality and governor timing telemetry.
+    ///
+    /// An unbaked generation returns `None`: the legacy governor path enum has
+    /// no "absent" value, so returning a path quality would be a capability lie.
     #[must_use]
     pub fn quality_governor_telemetry(&self) -> Option<QualityGovernorTelemetry> {
         #[cfg(feature = "linked-sdk")]
-        return Some(self.inner.quality_governor_telemetry());
+        return self.inner.quality_governor_telemetry();
         #[cfg(not(feature = "linked-sdk"))]
         None
+    }
+
+    /// Constructs a complete second scene/simulator/effect graph while the
+    /// current render graph remains usable.
+    ///
+    /// `baked = None` creates committed empty probe state and truthfully
+    /// disables path rendering for that generation.
+    pub fn prepare_world(
+        &mut self,
+        mesh: &SceneMesh,
+        baked: Option<&BakedProbeBatch>,
+        simulation: S3SimulationConfig,
+        sources: &[MultiSourceDescriptor],
+    ) -> Result<PreparedSteamAudioWorld, BackendError> {
+        #[cfg(feature = "linked-sdk")]
+        {
+            let mut inner = self.inner.prepare_world(mesh, baked, simulation, sources)?;
+            let writer = inner
+                .take_stage_output_gain_writer()
+                .expect("a freshly prepared graph owns its stage-gain producer");
+            return Ok(PreparedSteamAudioWorld {
+                inner,
+                stage_output_gain_control: Some(StageOutputGainControl { writer }),
+            });
+        }
+        #[cfg(not(feature = "linked-sdk"))]
+        {
+            let _ = (mesh, baked, simulation, sources);
+            Err(BackendError::SdkUnavailable(unavailable_metadata()))
+        }
+    }
+
+    /// Offers a fully prepared generation to the render thread.
+    ///
+    /// The callback adopts it at a later block boundary and crossfades the
+    /// summed output. This call never waits for the callback.
+    pub fn swap_prepared_world(
+        &mut self,
+        mut prepared: PreparedSteamAudioWorld,
+    ) -> Result<PreparedWorldSwapReceipt, PreparedWorldSwapError> {
+        #[cfg(feature = "linked-sdk")]
+        {
+            let generation = prepared.inner.capabilities().generation;
+            self.inner.swap_prepared_world(prepared.inner)?;
+            return Ok(PreparedWorldSwapReceipt {
+                generation,
+                stage_output_gain_control: prepared
+                    .stage_output_gain_control
+                    .take()
+                    .expect("prepared world retained its stage-gain producer"),
+            });
+        }
+        #[cfg(not(feature = "linked-sdk"))]
+        {
+            let _ = prepared;
+            Err(PreparedWorldSwapError::AdoptionPending)
+        }
+    }
+
+    /// Returns the generation and capabilities actually adopted by the render
+    /// thread, including whether its output crossfade is still in progress.
+    #[must_use]
+    pub fn delivered_world_state(&self) -> DeliveredWorldState {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.delivered_world_state();
+        #[cfg(not(feature = "linked-sdk"))]
+        unreachable!("an SDK-unavailable build cannot own a live session")
+    }
+
+    /// Copies proof values from the control-side snapshot of the current
+    /// generation. No SDK pointer is exposed.
+    #[must_use]
+    pub fn world_diagnostics(&self) -> WorldGenerationDiagnostics {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.diagnostics();
+        #[cfg(not(feature = "linked-sdk"))]
+        unreachable!("an SDK-unavailable build cannot own a live session")
     }
 }
 

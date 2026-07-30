@@ -5,8 +5,6 @@ use fightbox_api::EnuVector3 as ApiEnuVector3;
 use fightbox_runtime::backend::MAX_ACTIVE_SOURCES;
 
 pub(crate) const MAX_PATH_SH_COEFFS: usize = 16;
-pub(crate) const WORLD_GENERATION: u64 = 1;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct SteamDirectParams {
     pub(crate) distance_attenuation: f32,
@@ -70,7 +68,7 @@ pub(crate) struct SteamPropagationSnapshot {
 impl Default for SteamPropagationSnapshot {
     fn default() -> Self {
         Self {
-            world_generation: WORLD_GENERATION,
+            world_generation: 0,
             sequence: 0,
             simulated_at_ns: 0,
             listener_position: SteamVector3::default(),

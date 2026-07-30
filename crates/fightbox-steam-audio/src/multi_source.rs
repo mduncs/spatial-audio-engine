@@ -10,7 +10,7 @@ use super::*;
 use crate::StageOutputGains;
 use crate::backend_snapshot::{
     SteamDirectParams, SteamPropagationSnapshot, SteamReflectionParams, SteamSourcePropagation,
-    WORLD_GENERATION, api_enu_to_steam, fixed_path_sh, path_coefficient_count,
+    api_enu_to_steam, fixed_path_sh, path_coefficient_count,
 };
 use crate::governor::{
     GovernorRenderSnapshot, GovernorSimulationPass, QualityGovernor, QualityGovernorTelemetry,
@@ -97,6 +97,9 @@ fn handle<T>(value: usize) -> *mut T {
 }
 
 struct WorldGeneration {
+    generation: u64,
+    has_baked_pathing: bool,
+    baked_data_fingerprint: u64,
     context: usize,
     scene: usize,
     static_mesh: usize,
@@ -140,7 +143,7 @@ impl Drop for WorldGeneration {
                 }
             }
             ffi::simulator_commit(simulator);
-            if self.probe_batch != 0 {
+            if self.probe_batch != 0 && self.has_baked_pathing {
                 ffi::simulator_remove_probe_batch(simulator, self.probe_batch());
                 ffi::simulator_commit(simulator);
             }
@@ -184,6 +187,40 @@ pub(crate) struct MultiSourceSimulation {
 }
 
 impl MultiSourceSimulation {
+    pub(crate) fn audio_config(&self) -> AudioConfig {
+        self.audio
+    }
+
+    pub(crate) fn source_count(&self) -> usize {
+        self.world.source_count
+    }
+
+    pub(crate) fn capabilities(&self) -> crate::PreparedWorldCapabilities {
+        crate::PreparedWorldCapabilities {
+            generation: self.world.generation,
+            baked_pathing: self.world.has_baked_pathing,
+            reflections: crate::WorldReflectionState::from_effect(
+                self.config.reflection_effect.effect_type,
+            ),
+        }
+    }
+
+    pub(crate) fn diagnostics(&self) -> crate::WorldGenerationDiagnostics {
+        let source = self.snapshot.sources[0];
+        crate::WorldGenerationDiagnostics {
+            generation: self.world.generation,
+            baked_data_fingerprint: self.world.baked_data_fingerprint,
+            path_eq: source.path_eq,
+            path_sh_energy: source
+                .path_sh
+                .into_iter()
+                .map(|coefficient| coefficient * coefficient)
+                .sum(),
+            reflection_reverb_times: source.reflections.reverb_times,
+            reflection_ir_size: source.reflections.ir_size,
+        }
+    }
+
     pub(crate) fn observe_render_timing(&mut self, elapsed_ns: u64) {
         self.governor.observe_block_timing(elapsed_ns);
     }
@@ -240,6 +277,9 @@ impl MultiSourceSimulation {
     }
 
     pub(crate) fn run_pathing(&mut self) -> Result<(), SimulationError> {
+        if !self.world.has_baked_pathing {
+            return Err(SimulationError::KernelFailure);
+        }
         self.run_pass(
             ffi::IPL_SIMULATIONFLAGS_PATHING,
             GovernorSimulationPass::Pathing,
@@ -623,6 +663,16 @@ pub(crate) struct MultiSourceRenderGraph {
 }
 
 impl MultiSourceRenderGraph {
+    pub(crate) fn capabilities(&self) -> crate::PreparedWorldCapabilities {
+        crate::PreparedWorldCapabilities {
+            generation: self.world.generation,
+            baked_pathing: self.world.has_baked_pathing,
+            reflections: crate::WorldReflectionState::from_effect(
+                self.config.reflection_effect.effect_type,
+            ),
+        }
+    }
+
     pub(crate) fn take_stage_output_gain_writer(
         &mut self,
     ) -> Option<fightbox_runtime::SnapshotWriter<StageOutputGains>> {
@@ -651,7 +701,7 @@ impl MultiSourceRenderGraph {
         let listener =
             listener_pose(block.listener_orientation).ok_or(BackendRenderError::InactiveGraph)?;
         let snapshot = self.publication.read();
-        if snapshot.world_generation != WORLD_GENERATION {
+        if snapshot.world_generation != self.world.generation {
             return Err(BackendRenderError::InactiveGraph);
         }
         let stage_output_gains = self.stage_output_gains.read();
@@ -714,7 +764,10 @@ impl MultiSourceRenderGraph {
         let listener_centric_reflection = governor_quality.reverb
             != ReverbStrategy::ListenerCentric
             || usize::from(governor_quality.listener_centric_source) == source_block.source_index;
-        let targets = source_quality_targets(source_quality, listener_centric_reflection);
+        let mut targets = source_quality_targets(source_quality, listener_centric_reflection);
+        if !self.world.has_baked_pathing {
+            targets[1] = 0.0;
+        }
         let quality_ramps: [GainRamp; 3] = std::array::from_fn(|index| {
             GainRamp::new(
                 state.quality_gains[index],
@@ -1073,6 +1126,7 @@ impl Drop for MultiSourceRenderGraph {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_multi_source_session(
     mesh: &SceneMesh,
     baked: &BakedProbeBatch,
@@ -1080,9 +1134,28 @@ pub(crate) fn build_multi_source_session(
     config: S3SimulationConfig,
     descriptors: &[crate::MultiSourceDescriptor],
 ) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
+    build_multi_source_generation(mesh, Some(baked), audio, config, descriptors, 1)
+}
+
+pub(crate) fn build_multi_source_generation(
+    mesh: &SceneMesh,
+    baked: Option<&BakedProbeBatch>,
+    audio: AudioConfig,
+    config: S3SimulationConfig,
+    descriptors: &[crate::MultiSourceDescriptor],
+    generation: u64,
+) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
     validate_multi_source_config(mesh, baked, audio, config, descriptors)?;
-    let world = Arc::new(create_world(mesh, baked, audio, config, descriptors.len())?);
+    let world = Arc::new(create_world(
+        mesh,
+        baked,
+        audio,
+        config,
+        descriptors.len(),
+        generation,
+    )?);
     let mut initial = SteamPropagationSnapshot::default();
+    initial.world_generation = generation;
     let mut source_poses = [SteamPose {
         position: SteamVector3::default(),
         forward: SteamVector3::new(0.0, 0.0, -1.0),
@@ -1136,14 +1209,16 @@ pub(crate) fn build_multi_source_session(
 
 fn validate_multi_source_config(
     mesh: &SceneMesh,
-    baked: &BakedProbeBatch,
+    baked: Option<&BakedProbeBatch>,
     audio: AudioConfig,
     config: S3SimulationConfig,
     descriptors: &[crate::MultiSourceDescriptor],
 ) -> Result<(), BackendError> {
     validate_audio(audio)?;
     validate_mesh(mesh)?;
-    baked.validate()?;
+    if let Some(baked) = baked {
+        baked.validate()?;
+    }
     if descriptors.is_empty() || descriptors.len() > MAX_ACTIVE_SOURCES {
         return Err(BackendError::InvalidInput(
             "multi-source session requires between one and MAX_ACTIVE_SOURCES descriptors",
@@ -1194,10 +1269,11 @@ fn validate_multi_source_config(
 
 fn create_world(
     mesh: &SceneMesh,
-    baked: &BakedProbeBatch,
+    baked: Option<&BakedProbeBatch>,
     audio: AudioConfig,
     config: S3SimulationConfig,
     source_count: usize,
+    generation: u64,
 ) -> Result<WorldGeneration, BackendError> {
     let mut context = core::ptr::null_mut();
     let mut context_settings = ffi::IPLContextSettings::pinned_defaults();
@@ -1206,6 +1282,12 @@ fn create_world(
         ffi::context_create(&mut context_settings, &mut context),
     )?;
     let mut world = WorldGeneration {
+        generation,
+        has_baked_pathing: baked.is_some(),
+        baked_data_fingerprint: baked.map_or(0, |baked| {
+            u64::from_str_radix(&baked.metadata.content_sha256[..16], 16)
+                .expect("validated bake SHA-256 is lowercase hexadecimal")
+        }),
         context: context as usize,
         scene: 0,
         static_mesh: 0,
@@ -1213,7 +1295,7 @@ fn create_world(
         simulator: 0,
         sources: [0; MAX_ACTIVE_SOURCES],
         source_count: 0,
-        _serialized_bytes: baked.bytes.clone(),
+        _serialized_bytes: baked.map_or_else(Vec::new, |baked| baked.bytes.clone()),
     };
 
     let result = (|| {
@@ -1273,19 +1355,26 @@ fn create_world(
         ffi::static_mesh_add(static_mesh, scene);
         ffi::scene_commit(scene);
 
-        let mut serialized_settings = ffi::IPLSerializedObjectSettings {
-            data: world._serialized_bytes.as_mut_ptr(),
-            size: world._serialized_bytes.len(),
-        };
-        let mut serialized = core::ptr::null_mut();
-        sdk_status(
-            "iplSerializedObjectCreate",
-            ffi::serialized_object_create(context, &mut serialized_settings, &mut serialized),
-        )?;
         let mut probe_batch = core::ptr::null_mut();
-        let load_status = ffi::probe_batch_load(context, serialized, &mut probe_batch);
-        ffi::serialized_object_release(&mut serialized);
-        sdk_status("iplProbeBatchLoad", load_status)?;
+        if world.has_baked_pathing {
+            let mut serialized_settings = ffi::IPLSerializedObjectSettings {
+                data: world._serialized_bytes.as_mut_ptr(),
+                size: world._serialized_bytes.len(),
+            };
+            let mut serialized = core::ptr::null_mut();
+            sdk_status(
+                "iplSerializedObjectCreate",
+                ffi::serialized_object_create(context, &mut serialized_settings, &mut serialized),
+            )?;
+            let load_status = ffi::probe_batch_load(context, serialized, &mut probe_batch);
+            ffi::serialized_object_release(&mut serialized);
+            sdk_status("iplProbeBatchLoad", load_status)?;
+        } else {
+            sdk_status(
+                "iplProbeBatchCreate",
+                ffi::probe_batch_create(context, &mut probe_batch),
+            )?;
+        }
         world.probe_batch = probe_batch as usize;
         // Deserialization restores probes and data layers, but 4.8.1 does not
         // rebuild the query tree until this explicit commit.
@@ -1317,7 +1406,9 @@ fn create_world(
         )?;
         world.simulator = simulator as usize;
         ffi::simulator_set_scene(simulator, scene);
-        ffi::simulator_add_probe_batch(simulator, probe_batch);
+        if world.has_baked_pathing {
+            ffi::simulator_add_probe_batch(simulator, probe_batch);
+        }
         for index in 0..source_count {
             let mut settings = ffi::IPLSourceSettings {
                 flags: all_simulation_flags(),
@@ -1428,6 +1519,9 @@ fn create_render_graph(
             applied_governor_quality.sources[index],
             listener_centric_reflection,
         );
+        if !world.has_baked_pathing {
+            state.quality_gains[1] = 0.0;
+        }
     }
     Ok(MultiSourceRenderGraph {
         world,
@@ -2222,5 +2316,54 @@ mod tests {
             build_multi_source_session(&mesh, &baked, audio, config, &descriptors).unwrap();
         drop(render_second);
         drop(simulation_first);
+    }
+
+    #[test]
+    fn render_rejects_a_snapshot_from_any_other_world_generation() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptors = [crate::MultiSourceDescriptor::at(ApiEnuVector3::new(
+            2.0, 3.0, 1.5,
+        ))];
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &mesh,
+            Some(&baked),
+            audio,
+            test_config(),
+            &descriptors,
+            41,
+        )
+        .unwrap();
+        let mut wrong_generation = simulation.snapshot;
+        wrong_generation.world_generation = 42;
+        simulation.publication.publish(wrong_generation);
+
+        let input = vec![0.0; audio.frame_size as usize];
+        let sources = [BackendSourceBlock {
+            source_index: 0,
+            input_mono: &input,
+        }];
+        let mut left = vec![0.0; input.len()];
+        let mut right = vec![0.0; input.len()];
+        assert_eq!(
+            render.render_block(PropagationRenderBlock {
+                listener_orientation: ListenerOrientation {
+                    forward: ApiEnuVector3::new(0.0, 1.0, 0.0),
+                    up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+                },
+                sources: &sources,
+                output_left: &mut left,
+                output_right: &mut right,
+            }),
+            Err(BackendRenderError::InactiveGraph)
+        );
     }
 }

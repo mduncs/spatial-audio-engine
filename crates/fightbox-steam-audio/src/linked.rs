@@ -1,6 +1,8 @@
 //! Safe RAII and owned Phase A operations over the private 4.8.1 FFI module.
 
 use core::{marker::PhantomData, ptr::NonNull};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::ffi;
@@ -23,9 +25,360 @@ use crate::{
 
 #[path = "multi_source.rs"]
 mod multi_source;
-pub(crate) use multi_source::{
-    MultiSourceRenderGraph, MultiSourceSimulation, build_multi_source_session,
+use multi_source::{
+    MultiSourceRenderGraph as GenerationRenderGraph, MultiSourceSimulation as GenerationSimulation,
+    build_multi_source_generation,
 };
+
+use crate::world_swap;
+use crate::{
+    DeliveredWorldState, MultiSourceDescriptor, PreparedWorldCapabilities, PreparedWorldSwapError,
+    StageOutputGains, WorldReflectionState,
+};
+use fightbox_runtime::backend::{
+    BackendRenderError, PropagationRenderBlock, SimulationError, SimulationUpdate,
+};
+
+const WORLD_SWAP_FADE_BLOCKS: u8 = 8;
+const GENERATION_MASK: u64 = (1_u64 << 48) - 1;
+const BAKED_PATHING_BIT: u64 = 1_u64 << 48;
+const REFLECTION_SHIFT: u32 = 49;
+const TRANSITION_SHIFT: u32 = 56;
+static NEXT_WORLD_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_world_generation() -> u64 {
+    NEXT_WORLD_GENERATION.fetch_add(1, Ordering::Relaxed) & GENERATION_MASK
+}
+
+fn reflection_code(reflections: WorldReflectionState) -> u64 {
+    match reflections {
+        WorldReflectionState::RealtimeConvolution => 0,
+        WorldReflectionState::RealtimeParametric => 1,
+        WorldReflectionState::RealtimeHybrid => 2,
+        WorldReflectionState::UnsupportedTrueAudioNext => 3,
+    }
+}
+
+fn encode_delivery(capabilities: PreparedWorldCapabilities, transition_blocks: u8) -> u64 {
+    (capabilities.generation & GENERATION_MASK)
+        | if capabilities.baked_pathing {
+            BAKED_PATHING_BIT
+        } else {
+            0
+        }
+        | (reflection_code(capabilities.reflections) << REFLECTION_SHIFT)
+        | (u64::from(transition_blocks) << TRANSITION_SHIFT)
+}
+
+fn decode_delivery(encoded: u64) -> DeliveredWorldState {
+    let reflections = match (encoded >> REFLECTION_SHIFT) & 0b11 {
+        1 => WorldReflectionState::RealtimeParametric,
+        2 => WorldReflectionState::RealtimeHybrid,
+        3 => WorldReflectionState::UnsupportedTrueAudioNext,
+        _ => WorldReflectionState::RealtimeConvolution,
+    };
+    DeliveredWorldState {
+        capabilities: PreparedWorldCapabilities {
+            generation: encoded & GENERATION_MASK,
+            baked_pathing: encoded & BAKED_PATHING_BIT != 0,
+            reflections,
+        },
+        transition_blocks_remaining: (encoded >> TRANSITION_SHIFT) as u8,
+    }
+}
+
+pub(crate) struct PreparedMultiSourceWorld {
+    simulation: GenerationSimulation,
+    render: GenerationRenderGraph,
+}
+
+impl PreparedMultiSourceWorld {
+    pub(crate) fn capabilities(&self) -> PreparedWorldCapabilities {
+        self.simulation.capabilities()
+    }
+
+    pub(crate) fn take_stage_output_gain_writer(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotWriter<StageOutputGains>> {
+        self.render.take_stage_output_gain_writer()
+    }
+
+    pub(crate) fn diagnostics(&self) -> crate::WorldGenerationDiagnostics {
+        self.simulation.diagnostics()
+    }
+
+    pub(crate) fn observe_render_timing(&mut self, elapsed_ns: u64) {
+        self.simulation.observe_render_timing(elapsed_ns);
+    }
+
+    pub(crate) fn quality_governor_telemetry(&self) -> Option<crate::QualityGovernorTelemetry> {
+        self.simulation
+            .capabilities()
+            .baked_pathing
+            .then(|| self.simulation.quality_governor_telemetry())
+    }
+
+    pub(crate) fn update_inputs(&mut self, update: &SimulationUpdate) {
+        self.simulation.update_inputs(update);
+    }
+
+    pub(crate) fn run_direct(&mut self) -> Result<(), SimulationError> {
+        self.simulation.run_direct()
+    }
+
+    pub(crate) fn run_pathing(&mut self) -> Result<(), SimulationError> {
+        self.simulation.run_pathing()
+    }
+
+    pub(crate) fn run_reflections(&mut self) -> Result<(), SimulationError> {
+        self.simulation.run_reflections()
+    }
+}
+
+pub(crate) struct MultiSourceSimulation {
+    active: GenerationSimulation,
+    prepared: world_swap::Producer<GenerationRenderGraph>,
+    retired: world_swap::Consumer<GenerationRenderGraph>,
+    delivered: Arc<AtomicU64>,
+}
+
+impl MultiSourceSimulation {
+    fn collect_retired(&mut self) {
+        while self.retired.try_pop().is_some() {}
+    }
+
+    pub(crate) fn observe_render_timing(&mut self, elapsed_ns: u64) {
+        self.collect_retired();
+        self.active.observe_render_timing(elapsed_ns);
+    }
+
+    pub(crate) fn observe_simulation_lateness(
+        &mut self,
+        pass: crate::GovernorSimulationPass,
+        lateness_ns: u64,
+    ) {
+        self.collect_retired();
+        self.active.observe_simulation_lateness(pass, lateness_ns);
+    }
+
+    pub(crate) fn quality_governor_telemetry(&self) -> Option<crate::QualityGovernorTelemetry> {
+        self.active
+            .capabilities()
+            .baked_pathing
+            .then(|| self.active.quality_governor_telemetry())
+    }
+
+    pub(crate) fn update_inputs(&mut self, update: &SimulationUpdate) {
+        self.collect_retired();
+        self.active.update_inputs(update);
+    }
+
+    pub(crate) fn run_direct(&mut self) -> Result<(), SimulationError> {
+        self.collect_retired();
+        self.active.run_direct()
+    }
+
+    pub(crate) fn run_pathing(&mut self) -> Result<(), SimulationError> {
+        self.collect_retired();
+        self.active.run_pathing()
+    }
+
+    pub(crate) fn run_reflections(&mut self) -> Result<(), SimulationError> {
+        self.collect_retired();
+        self.active.run_reflections()
+    }
+
+    pub(crate) fn prepare_world(
+        &mut self,
+        mesh: &SceneMesh,
+        baked: Option<&BakedProbeBatch>,
+        config: S3SimulationConfig,
+        descriptors: &[MultiSourceDescriptor],
+    ) -> Result<PreparedMultiSourceWorld, BackendError> {
+        self.collect_retired();
+        if descriptors.len() != self.active.source_count() {
+            return Err(BackendError::InvalidInput(
+                "prepared world source count must match the active render graph",
+            ));
+        }
+        let generation = next_world_generation();
+        let (simulation, render) = build_multi_source_generation(
+            mesh,
+            baked,
+            self.active.audio_config(),
+            config,
+            descriptors,
+            generation,
+        )?;
+        Ok(PreparedMultiSourceWorld { simulation, render })
+    }
+
+    pub(crate) fn swap_prepared_world(
+        &mut self,
+        prepared: PreparedMultiSourceWorld,
+    ) -> Result<(), PreparedWorldSwapError> {
+        self.collect_retired();
+        let PreparedMultiSourceWorld { simulation, render } = prepared;
+        self.prepared
+            .try_push(render)
+            .map_err(|_| PreparedWorldSwapError::AdoptionPending)?;
+        self.active = simulation;
+        Ok(())
+    }
+
+    pub(crate) fn delivered_world_state(&self) -> DeliveredWorldState {
+        decode_delivery(self.delivered.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn diagnostics(&self) -> crate::WorldGenerationDiagnostics {
+        self.active.diagnostics()
+    }
+}
+
+struct RetiringGeneration {
+    graph: GenerationRenderGraph,
+    completed_blocks: u8,
+}
+
+pub(crate) struct MultiSourceRenderGraph {
+    active: GenerationRenderGraph,
+    prepared: world_swap::Consumer<GenerationRenderGraph>,
+    retired: world_swap::Producer<GenerationRenderGraph>,
+    retiring: Option<RetiringGeneration>,
+    retirement_backlog: Option<GenerationRenderGraph>,
+    old_left: Vec<f32>,
+    old_right: Vec<f32>,
+    new_left: Vec<f32>,
+    new_right: Vec<f32>,
+    delivered: Arc<AtomicU64>,
+}
+
+impl MultiSourceRenderGraph {
+    pub(crate) fn take_stage_output_gain_writer(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotWriter<StageOutputGains>> {
+        self.active.take_stage_output_gain_writer()
+    }
+
+    fn flush_retirement(&mut self) {
+        let Some(retired) = self.retirement_backlog.take() else {
+            return;
+        };
+        if let Err(retired) = self.retired.try_push(retired) {
+            self.retirement_backlog = Some(retired);
+        }
+    }
+
+    fn adopt_at_block_boundary(&mut self) {
+        self.flush_retirement();
+        if self.retiring.is_some() || self.retirement_backlog.is_some() {
+            return;
+        }
+        let Some(prepared) = self.prepared.try_pop() else {
+            return;
+        };
+        let old = std::mem::replace(&mut self.active, prepared);
+        let capabilities = self.active.capabilities();
+        self.retiring = Some(RetiringGeneration {
+            graph: old,
+            completed_blocks: 0,
+        });
+        self.delivered.store(
+            encode_delivery(capabilities, WORLD_SWAP_FADE_BLOCKS),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn render_block(
+        &mut self,
+        block: PropagationRenderBlock<'_>,
+    ) -> Result<(), BackendRenderError> {
+        self.adopt_at_block_boundary();
+        let Some(retiring) = self.retiring.as_mut() else {
+            return self.active.render_block(block);
+        };
+
+        self.old_left.fill(0.0);
+        self.old_right.fill(0.0);
+        self.new_left.fill(0.0);
+        self.new_right.fill(0.0);
+        retiring.graph.render_block(PropagationRenderBlock {
+            listener_orientation: block.listener_orientation,
+            sources: block.sources,
+            output_left: &mut self.old_left,
+            output_right: &mut self.old_right,
+        })?;
+        self.active.render_block(PropagationRenderBlock {
+            listener_orientation: block.listener_orientation,
+            sources: block.sources,
+            output_left: &mut self.new_left,
+            output_right: &mut self.new_right,
+        })?;
+
+        let frames = self.old_left.len();
+        let fade_frames = frames * usize::from(WORLD_SWAP_FADE_BLOCKS);
+        let start_frame = frames * usize::from(retiring.completed_blocks);
+        for frame in 0..frames {
+            let new_gain = (start_frame + frame) as f32 / (fade_frames - 1) as f32;
+            let old_gain = 1.0 - new_gain;
+            block.output_left[frame] +=
+                self.old_left[frame] * old_gain + self.new_left[frame] * new_gain;
+            block.output_right[frame] +=
+                self.old_right[frame] * old_gain + self.new_right[frame] * new_gain;
+        }
+
+        retiring.completed_blocks += 1;
+        let remaining = WORLD_SWAP_FADE_BLOCKS - retiring.completed_blocks;
+        self.delivered.store(
+            encode_delivery(self.active.capabilities(), remaining),
+            Ordering::Release,
+        );
+        if remaining == 0 {
+            let retired = self.retiring.take().expect("transition exists").graph;
+            if let Err(retired) = self.retired.try_push(retired) {
+                self.retirement_backlog = Some(retired);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn build_multi_source_session(
+    mesh: &SceneMesh,
+    baked: &BakedProbeBatch,
+    audio: AudioConfig,
+    config: S3SimulationConfig,
+    descriptors: &[MultiSourceDescriptor],
+) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
+    let generation = next_world_generation();
+    let (simulation, render) =
+        build_multi_source_generation(mesh, Some(baked), audio, config, descriptors, generation)?;
+    let capabilities = simulation.capabilities();
+    let delivered = Arc::new(AtomicU64::new(encode_delivery(capabilities, 0)));
+    let (prepared_tx, prepared_rx) = world_swap::channel();
+    let (retired_tx, retired_rx) = world_swap::channel();
+    let frames = audio.frame_size as usize;
+    Ok((
+        MultiSourceSimulation {
+            active: simulation,
+            prepared: prepared_tx,
+            retired: retired_rx,
+            delivered: Arc::clone(&delivered),
+        },
+        MultiSourceRenderGraph {
+            active: render,
+            prepared: prepared_rx,
+            retired: retired_tx,
+            retiring: None,
+            retirement_backlog: None,
+            old_left: vec![0.0; frames],
+            old_right: vec![0.0; frames],
+            new_left: vec![0.0; frames],
+            new_right: vec![0.0; frames],
+            delivered,
+        },
+    ))
+}
 
 pub struct Context {
     raw: NonNull<ffi::IPLContextOpaque>,
