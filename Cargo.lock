@@ -728,7 +728,9 @@ name = "fightbox-steam-audio"
 version = "0.1.0"
 dependencies = [
  "fightbox-api",
+ "fightbox-evidence",
  "fightbox-runtime",
+ "serde_json",
 ]
 
 [[package]]

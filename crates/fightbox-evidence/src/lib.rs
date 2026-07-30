@@ -40,8 +40,10 @@ pub use manifest::{
 };
 pub use metrics::{
     ChannelMetrics, ComparisonEnergy, ContinuityReport, DEFAULT_CLICK_RATIO_THRESHOLD,
-    DEFAULT_LEVEL_DIFFERENCE_DB, DEFAULT_SPECTRAL_L1_DIFFERENCE, MetricError, SpectralComparison,
-    channel_metrics, compare_pathing, continuity,
+    DEFAULT_LEVEL_DIFFERENCE_DB, DEFAULT_SPECTRAL_L1_DIFFERENCE, IaccReport, MetricError,
+    ReflectionDensityReport, SpectralComparison, SummedOutputContinuity, channel_metrics,
+    compare_pathing, continuity, interaural_cross_correlation, reflection_density,
+    summed_output_continuity,
 };
 pub use signal::{
     GeneratedSignal, GeneratorNormalization, SignalError, SignalKind, multitone, pink_like, sine,

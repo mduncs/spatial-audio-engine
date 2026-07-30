@@ -18,6 +18,9 @@ pub enum MetricError {
     BadSpec,
     FrameChannelMismatch,
     EmptyBins,
+    StereoRequired,
+    InvalidWindow,
+    InvalidThreshold,
 }
 
 /// Per-channel health and level summary for a finite interleaved buffer.
@@ -340,6 +343,302 @@ pub fn continuity(
     })
 }
 
+/// Maximum absolute normalized interaural cross-correlation in a bounded
+/// stereo window.
+///
+/// `max_lag_samples` states the lag search explicitly. For perceptual IACC,
+/// callers normally use ±1 ms (48 samples at 48 kHz). The means are removed
+/// independently at every lag before normalization, and silent lag overlaps
+/// contribute zero rather than a non-finite value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IaccReport {
+    pub window_start_frame: usize,
+    pub window_frames: usize,
+    pub max_lag_samples: usize,
+    pub coefficient: f32,
+    /// Signed lag at the maximum: positive values correlate `L[n]` with
+    /// `R[n + lag]`.
+    pub lag_samples: isize,
+}
+
+pub fn interaural_cross_correlation(
+    spec: WavSpec,
+    stereo: &[f32],
+    window_start_frame: usize,
+    window_frames: usize,
+    max_lag_samples: usize,
+) -> Result<IaccReport, MetricError> {
+    validate_spec(spec).map_err(|_| MetricError::BadSpec)?;
+    if spec.channels != 2 {
+        return Err(MetricError::StereoRequired);
+    }
+    if stereo.len() % 2 != 0 {
+        return Err(MetricError::FrameChannelMismatch);
+    }
+    let total_frames = stereo.len() / 2;
+    let window_end = window_start_frame
+        .checked_add(window_frames)
+        .ok_or(MetricError::InvalidWindow)?;
+    if window_frames < 2 || window_end > total_frames || max_lag_samples >= window_frames {
+        return Err(MetricError::InvalidWindow);
+    }
+
+    let left = (window_start_frame..window_end)
+        .map(|frame| stereo[frame * 2])
+        .collect::<Vec<_>>();
+    let right = (window_start_frame..window_end)
+        .map(|frame| stereo[frame * 2 + 1])
+        .collect::<Vec<_>>();
+    let mut maximum = 0.0_f64;
+    let mut best_lag = 0_isize;
+    for lag in -(max_lag_samples as isize)..=(max_lag_samples as isize) {
+        let (left_start, right_start, count) = if lag >= 0 {
+            (0, lag as usize, window_frames - lag as usize)
+        } else {
+            ((-lag) as usize, 0, window_frames - (-lag) as usize)
+        };
+        let left_slice = &left[left_start..left_start + count];
+        let right_slice = &right[right_start..right_start + count];
+        let left_mean = left_slice
+            .iter()
+            .map(|sample| f64::from(*sample))
+            .sum::<f64>()
+            / count as f64;
+        let right_mean = right_slice
+            .iter()
+            .map(|sample| f64::from(*sample))
+            .sum::<f64>()
+            / count as f64;
+        let mut cross = 0.0_f64;
+        let mut left_energy = 0.0_f64;
+        let mut right_energy = 0.0_f64;
+        for (&left, &right) in left_slice.iter().zip(right_slice) {
+            let left = f64::from(left) - left_mean;
+            let right = f64::from(right) - right_mean;
+            cross += left * right;
+            left_energy += left * left;
+            right_energy += right * right;
+        }
+        let denominator = (left_energy * right_energy).sqrt();
+        let coefficient = if denominator > 0.0 {
+            (cross / denominator).abs()
+        } else {
+            0.0
+        };
+        if coefficient > maximum {
+            maximum = coefficient;
+            best_lag = lag;
+        }
+    }
+
+    Ok(IaccReport {
+        window_start_frame,
+        window_frames,
+        max_lag_samples,
+        coefficient: maximum as f32,
+        lag_samples: best_lag,
+    })
+}
+
+/// Arrival count and rate in a bounded indirect-response window.
+///
+/// The extractor converts the interleaved response to a per-frame RMS
+/// magnitude, smooths it with a 0.5 ms centered box window, then counts local
+/// maxima above `relative_peak_threshold * window_peak`, enforcing the stated
+/// minimum separation. The caller must pass an indirect stem (normally the
+/// reflections stem), not a direct+indirect sum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReflectionDensityReport {
+    pub window_start_frame: usize,
+    pub window_frames: usize,
+    pub relative_peak_threshold: f32,
+    pub minimum_separation_samples: usize,
+    pub arrival_count: usize,
+    pub arrivals_per_second: f32,
+}
+
+pub fn reflection_density(
+    spec: WavSpec,
+    indirect: &[f32],
+    window_start_frame: usize,
+    window_frames: usize,
+    relative_peak_threshold: f32,
+    minimum_separation_samples: usize,
+) -> Result<ReflectionDensityReport, MetricError> {
+    validate_spec(spec).map_err(|_| MetricError::BadSpec)?;
+    let channels = usize::from(spec.channels);
+    if indirect.len() % channels != 0 {
+        return Err(MetricError::FrameChannelMismatch);
+    }
+    if !relative_peak_threshold.is_finite()
+        || !(0.0..=1.0).contains(&relative_peak_threshold)
+        || minimum_separation_samples == 0
+    {
+        return Err(MetricError::InvalidThreshold);
+    }
+    let total_frames = indirect.len() / channels;
+    let window_end = window_start_frame
+        .checked_add(window_frames)
+        .ok_or(MetricError::InvalidWindow)?;
+    if window_frames < 3 || window_end > total_frames {
+        return Err(MetricError::InvalidWindow);
+    }
+
+    let magnitude = (0..total_frames)
+        .map(|frame| {
+            let energy = (0..channels)
+                .map(|channel| {
+                    let sample = f64::from(indirect[frame * channels + channel]);
+                    sample * sample
+                })
+                .sum::<f64>();
+            (energy / channels as f64).sqrt() as f32
+        })
+        .collect::<Vec<_>>();
+    let smoothing_radius = (spec.sample_rate_hz as usize / 4_000).max(1);
+    let mut prefix = Vec::with_capacity(magnitude.len() + 1);
+    prefix.push(0.0_f64);
+    for sample in magnitude {
+        prefix.push(prefix.last().copied().unwrap_or(0.0) + f64::from(sample));
+    }
+    let smoothed = (0..total_frames)
+        .map(|frame| {
+            let start = frame.saturating_sub(smoothing_radius);
+            let end = (frame + smoothing_radius + 1).min(total_frames);
+            ((prefix[end] - prefix[start]) / (end - start) as f64) as f32
+        })
+        .collect::<Vec<_>>();
+    let peak = smoothed[window_start_frame..window_end]
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max);
+    let threshold = peak * relative_peak_threshold;
+    let mut arrivals = Vec::<(usize, f32)>::new();
+    for frame in window_start_frame + 1..window_end - 1 {
+        let value = smoothed[frame];
+        if value < threshold || value < smoothed[frame - 1] || value <= smoothed[frame + 1] {
+            continue;
+        }
+        if let Some((previous_frame, previous_value)) = arrivals.last_mut()
+            && frame - *previous_frame < minimum_separation_samples
+        {
+            if value > *previous_value {
+                *previous_frame = frame;
+                *previous_value = value;
+            }
+        } else {
+            arrivals.push((frame, value));
+        }
+    }
+
+    let arrival_count = arrivals.len();
+    Ok(ReflectionDensityReport {
+        window_start_frame,
+        window_frames,
+        relative_peak_threshold,
+        minimum_separation_samples,
+        arrival_count,
+        arrivals_per_second: arrival_count as f32 * spec.sample_rate_hz as f32
+            / window_frames as f32,
+    })
+}
+
+/// Summed-binaural continuity across fixed render blocks.
+///
+/// Block level is stereo RMS with a -120 dBFS measurement floor. A detected
+/// click is a boundary sample step larger than `click_ratio_threshold` times
+/// the local stereo peak in `click_window_frames` on both sides. This targets
+/// state-update discontinuities without misclassifying ordinary within-block
+/// waveform slope.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SummedOutputContinuity {
+    pub block_frames: usize,
+    pub max_inter_block_level_step_db: f32,
+    pub click_ratio_threshold: f32,
+    pub max_boundary_step_to_peak_ratio: f32,
+    pub detected_click_count: usize,
+}
+
+pub fn summed_output_continuity(
+    spec: WavSpec,
+    summed_stereo: &[f32],
+    block_frames: usize,
+    click_window_frames: usize,
+    click_ratio_threshold: f32,
+) -> Result<SummedOutputContinuity, MetricError> {
+    validate_spec(spec).map_err(|_| MetricError::BadSpec)?;
+    if spec.channels != 2 {
+        return Err(MetricError::StereoRequired);
+    }
+    if summed_stereo.len() % 2 != 0 {
+        return Err(MetricError::FrameChannelMismatch);
+    }
+    let total_frames = summed_stereo.len() / 2;
+    if block_frames == 0
+        || click_window_frames == 0
+        || total_frames < block_frames
+        || total_frames % block_frames != 0
+    {
+        return Err(MetricError::InvalidWindow);
+    }
+    if !click_ratio_threshold.is_finite() || click_ratio_threshold <= 0.0 {
+        return Err(MetricError::InvalidThreshold);
+    }
+
+    let level_db = summed_stereo
+        .chunks_exact(block_frames * 2)
+        .map(|block| {
+            let mean_square = block
+                .iter()
+                .map(|sample| f64::from(*sample) * f64::from(*sample))
+                .sum::<f64>()
+                / block.len() as f64;
+            (20.0 * (mean_square.sqrt().max(1.0e-6)).log10()) as f32
+        })
+        .collect::<Vec<_>>();
+    let max_level_step = level_db
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .fold(0.0_f32, f32::max);
+
+    let mut maximum_ratio = 0.0_f32;
+    let mut click_count = 0;
+    for boundary in (block_frames..total_frames).step_by(block_frames) {
+        let start = boundary.saturating_sub(click_window_frames);
+        let end = (boundary + click_window_frames).min(total_frames);
+        let local_peak = summed_stereo[start * 2..end * 2]
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let mut boundary_step = 0.0_f32;
+        for channel in 0..2 {
+            boundary_step = boundary_step.max(
+                (summed_stereo[boundary * 2 + channel]
+                    - summed_stereo[(boundary - 1) * 2 + channel])
+                    .abs(),
+            );
+        }
+        let ratio = if local_peak > 0.0 {
+            boundary_step / local_peak
+        } else {
+            0.0
+        };
+        maximum_ratio = maximum_ratio.max(ratio);
+        if ratio > click_ratio_threshold {
+            click_count += 1;
+        }
+    }
+
+    Ok(SummedOutputContinuity {
+        block_frames,
+        max_inter_block_level_step_db: max_level_step,
+        click_ratio_threshold,
+        max_boundary_step_to_peak_ratio: maximum_ratio,
+        detected_click_count: click_count,
+    })
+}
+
 /// RMS dBFS of the mono mixdown, or `None` if silent.
 fn mono_rms_dbfs(spec: WavSpec, samples: &[f32]) -> Result<Option<f32>, MetricError> {
     let mono = mono_mixdown(spec, samples)?;
@@ -491,6 +790,67 @@ mod tests {
         clicked[2_400] += 0.9;
         let bad = continuity(spec, &clicked, DEFAULT_CLICK_RATIO_THRESHOLD).unwrap();
         assert!(bad.click_budget_exceeded);
+    }
+
+    #[test]
+    fn iacc_finds_correlated_and_decorrelated_stereo() {
+        let spec = spec(2);
+        let correlated = (0..512)
+            .flat_map(|frame| {
+                let sample = (frame as f32 * 0.173).sin();
+                [sample, sample]
+            })
+            .collect::<Vec<_>>();
+        let correlated_report =
+            interaural_cross_correlation(spec, &correlated, 0, 512, 48).unwrap();
+        assert!((correlated_report.coefficient - 1.0).abs() < 1.0e-5);
+        assert_eq!(correlated_report.lag_samples, 0);
+
+        let decorrelated = (0..512)
+            .flat_map(|frame| {
+                let left = (frame as f32 * 0.173).sin();
+                let right = (((frame * 73 + 19) % 509) as f32 * 0.317).sin() * 0.7;
+                [left, right]
+            })
+            .collect::<Vec<_>>();
+        let decorrelated_report =
+            interaural_cross_correlation(spec, &decorrelated, 0, 512, 48).unwrap();
+        assert!(decorrelated_report.coefficient < 0.25);
+    }
+
+    #[test]
+    fn reflection_density_counts_separated_indirect_arrivals() {
+        let spec = spec(2);
+        let mut indirect = vec![0.0_f32; 4_800 * 2];
+        for (frame, amplitude) in [(480, 1.0), (960, 0.8), (1_440, 0.6), (2_400, 0.4)] {
+            indirect[frame * 2] = amplitude;
+            indirect[frame * 2 + 1] = amplitude * 0.8;
+        }
+        let report = reflection_density(spec, &indirect, 0, 4_800, 0.2, 96).unwrap();
+        assert_eq!(report.arrival_count, 4);
+        assert!((report.arrivals_per_second - 40.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn summed_continuity_reports_level_step_and_boundary_click() {
+        let spec = spec(2);
+        let block_frames = 128;
+        let smooth = (0..block_frames * 3)
+            .flat_map(|frame| {
+                let sample = (frame as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin()
+                    * if frame < block_frames { 0.1 } else { 0.2 };
+                [sample, sample]
+            })
+            .collect::<Vec<_>>();
+        let report = summed_output_continuity(spec, &smooth, block_frames, 32, 0.5).unwrap();
+        assert!(report.max_inter_block_level_step_db > 5.0);
+        assert_eq!(report.detected_click_count, 0);
+
+        let mut clicked = smooth;
+        clicked[block_frames * 2] += 1.0;
+        let clicked_report =
+            summed_output_continuity(spec, &clicked, block_frames, 32, 0.5).unwrap();
+        assert_eq!(clicked_report.detected_click_count, 1);
     }
 
     #[test]

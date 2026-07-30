@@ -19,5 +19,9 @@ linked-sdk = []
 fightbox-api = { path = "../fightbox-api" }
 fightbox-runtime = { path = "../fightbox-runtime" }
 
+[dev-dependencies]
+fightbox-evidence = { path = "../fightbox-evidence" }
+serde_json = "1"
+
 [lib]
 path = "src/lib.rs"
