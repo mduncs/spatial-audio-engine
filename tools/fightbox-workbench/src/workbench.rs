@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
 use fightbox_api::{
@@ -44,6 +45,10 @@ pub struct Workbench {
     source_mix_writer: SnapshotWriter<SourceMix>,
     audio_block_reader: SnapshotReader<u64>,
     autopilot: Autopilot,
+    startup_started: Instant,
+    reflection_warmup_started: Instant,
+    reflection_warmup_reported: bool,
+    first_frame_reported: bool,
 }
 
 struct SourceView {
@@ -103,12 +108,35 @@ enum AudioState {
 }
 
 impl Workbench {
-    pub fn load(args: LaunchArgs) -> Result<Self, String> {
+    pub fn load(args: LaunchArgs, startup_started: Instant) -> Result<Self, String> {
+        let phase_started = Instant::now();
         let package = read_package(&args.package)
             .map_err(|error| format!("cannot load package {}: {error}", args.package.display()))?;
+        eprintln!(
+            "[startup] package load: {} ms",
+            phase_started.elapsed().as_millis()
+        );
+
+        let phase_started = Instant::now();
         let fixture = Fixture::read(&args.fixture)?;
+        eprintln!(
+            "[startup] fixture load: {} ms",
+            phase_started.elapsed().as_millis()
+        );
+
+        let phase_started = Instant::now();
         let baked = load_baked(&args.baked, &package)?;
+        eprintln!(
+            "[startup] baked probes load: {} ms",
+            phase_started.elapsed().as_millis()
+        );
+
+        let phase_started = Instant::now();
         let scene = scene_mesh(&package)?;
+        eprintln!(
+            "[startup] scene mesh preparation: {} ms",
+            phase_started.elapsed().as_millis()
+        );
         let listener = ListenerControl::at(
             fixture.initial_listener_position()?,
             to_enu(fixture.listener.forward_enu),
@@ -173,6 +201,7 @@ impl Workbench {
             sample_rate_hz: SAMPLE_RATE as i32,
             frame_size: BLOCK_SIZE as i32,
         };
+        let phase_started = Instant::now();
         let (runner, backend) = build_multi_source_session(
             &scene,
             &baked,
@@ -181,17 +210,27 @@ impl Workbench {
             &descriptors,
         )
         .map_err(|error| format!("cannot build Steam Audio session: {error}"))?;
+        eprintln!(
+            "[startup] steam scene + simulator build: {} ms",
+            phase_started.elapsed().as_millis()
+        );
         let initial_update = SimulationUpdate {
             listener: initial_listener,
             sources: source_motion,
         };
+        let reflection_warmup_started = Instant::now();
         let simulation = SimulationWorker::new(
             Box::new(runner),
             initial_update,
             SimulationCadences::default(),
         )
         .map_err(|error| format!("cannot start simulation worker: {error:?}"))?;
+        eprintln!(
+            "[startup] simulation worker started: {} ms",
+            reflection_warmup_started.elapsed().as_millis()
+        );
 
+        let phase_started = Instant::now();
         let propagation = PropagationSnapshot {
             sequence: 1,
             simulated_at_ns: u64::MAX,
@@ -217,6 +256,10 @@ impl Workbench {
                 .set_source(index, profile, SceneCalibration::default())
                 .map_err(|error| format!("cannot configure source {index}: {error:?}"))?;
         }
+        eprintln!(
+            "[startup] runtime graph configuration: {} ms",
+            phase_started.elapsed().as_millis()
+        );
         let (listen_gain_writer, listen_gain_reader) =
             SnapshotPublication::new(DEFAULT_LISTEN_GAIN_DB);
         let (meter_writer, meter_reader) = SnapshotPublication::new(MeterReading::SILENT);
@@ -235,6 +278,7 @@ impl Workbench {
             .into_iter()
             .map(|(_, samples)| samples)
             .collect();
+        let phase_started = Instant::now();
         let audio = start_audio(
             processor,
             engine_config,
@@ -242,9 +286,18 @@ impl Workbench {
             source_mix_reader,
             args.device.as_deref(),
         );
+        eprintln!(
+            "[startup] audio stream initialization: {} ms",
+            phase_started.elapsed().as_millis()
+        );
+        let phase_started = Instant::now();
         let edges = mesh_edges(&package.mesh);
         let camera = Camera::for_mesh(&package.mesh);
         let autopilot = Autopilot::new(Bounds2::for_mesh(&package.mesh));
+        eprintln!(
+            "[startup] workbench view preparation: {} ms",
+            phase_started.elapsed().as_millis()
+        );
         Ok(Self {
             mesh: package.mesh,
             edges,
@@ -261,6 +314,10 @@ impl Workbench {
             source_mix_writer,
             audio_block_reader,
             autopilot,
+            startup_started,
+            reflection_warmup_started,
+            reflection_warmup_reported: false,
+            first_frame_reported: false,
         })
     }
 
@@ -550,6 +607,24 @@ impl eframe::App for Workbench {
             });
         self.update_control(ctx, drag_delta_x);
         ctx.request_repaint();
+        if !self.reflection_warmup_reported {
+            let telemetry = self.simulation.telemetry();
+            if let Some(pass_ns) = telemetry.reflections.timings.newest_ns() {
+                eprintln!(
+                    "[startup] reflection warmup: {} ms (pass {} ms)",
+                    self.reflection_warmup_started.elapsed().as_millis(),
+                    pass_ns / 1_000_000
+                );
+                self.reflection_warmup_reported = true;
+            }
+        }
+        if !self.first_frame_reported {
+            eprintln!(
+                "[startup] total to first frame: {} ms",
+                self.startup_started.elapsed().as_millis()
+            );
+            self.first_frame_reported = true;
+        }
     }
 }
 

@@ -4,6 +4,7 @@ mod pose;
 mod workbench;
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 pub use pose::{ListenerControl, PoseMailbox};
 
@@ -16,6 +17,7 @@ pub struct LaunchArgs {
 }
 
 pub fn launch(args: LaunchArgs) -> Result<(), String> {
+    let startup_started = Instant::now();
     let title = "Fightbox Workbench";
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -24,7 +26,18 @@ pub fn launch(args: LaunchArgs) -> Result<(), String> {
             .with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
-    let app = workbench::Workbench::load(args)?;
-    eframe::run_native(title, options, Box::new(move |_| Ok(Box::new(app))))
-        .map_err(|error| format!("cannot open workbench window: {error}"))
+    let app = workbench::Workbench::load(args, startup_started)?;
+    let window_started = Instant::now();
+    eframe::run_native(
+        title,
+        options,
+        Box::new(move |_| {
+            eprintln!(
+                "[startup] window + wgpu bring-up: {} ms",
+                window_started.elapsed().as_millis()
+            );
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|error| format!("cannot open workbench window: {error}"))
 }
