@@ -1,0 +1,27 @@
+[package]
+name = "fightbox-ffi"
+version = "0.1.0"
+description = "C ABI and iOS static-library boundary for Fightbox"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+fightbox-api = { path = "../fightbox-api" }
+fightbox-runtime = { path = "../fightbox-runtime" }
+fightbox-world = { path = "../fightbox-world" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(all(target_os = "ios", target_abi = "sim")))'.dependencies]
+fightbox-steam-audio = { path = "../fightbox-steam-audio", features = ["linked-sdk"] }
+
+[target.'cfg(all(target_os = "ios", target_abi = "sim"))'.dependencies]
+# Valve ships an iPhoneOS-only arm64 archive. The simulator skeleton compiles
+# the ABI in unavailable-backend mode; simulator audio is intentionally a non-goal.
+fightbox-steam-audio = { path = "../fightbox-steam-audio" }
