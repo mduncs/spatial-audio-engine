@@ -82,6 +82,11 @@ impl FractionalDelayLine {
         let mut read_position = self.write_index as f32 - self.current_delay_samples;
         if read_position < 0.0 {
             read_position += len as f32;
+            // A negative offset smaller than half an ulp of the ring length
+            // rounds to exactly `len` here; that position is position 0.
+            if read_position >= len as f32 {
+                read_position = 0.0;
+            }
         }
         let center = read_position.floor() as usize;
         let fraction = read_position - center as f32;
@@ -123,6 +128,15 @@ mod tests {
         let a = (first * radians_per_sample).sin();
         let b = ((first + 1.0) * radians_per_sample).sin();
         a + (b - a) * fraction
+    }
+
+    #[test]
+    fn tiny_negative_read_offset_on_a_large_ring_stays_in_bounds() {
+        // 131072-sample ring: a -0.002 read offset wraps to a value that
+        // rounds to exactly the ring length in f32.
+        let mut delay = FractionalDelayLine::new(131_068, 0.002, 1.0);
+        let output = delay.process_sample(1.0);
+        assert!(output.is_finite());
     }
 
     #[test]
