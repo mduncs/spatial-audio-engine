@@ -716,6 +716,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fightbox-ffi"
+version = "0.1.0"
+dependencies = [
+ "fightbox-api",
+ "fightbox-runtime",
+ "fightbox-steam-audio",
+ "fightbox-world",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fightbox-runtime"
 version = "0.1.0"
 dependencies = [
