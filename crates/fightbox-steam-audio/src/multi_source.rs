@@ -1839,9 +1839,9 @@ mod tests {
         let ones = vec![1.0; audio.frame_size as usize];
         let reads_before = render.governor_snapshot_reads;
         render_one_source_block(&mut render, &zeros);
-        simulation.observe_render_timing(3_000_000);
+        simulation.observe_render_timing(100_000);
         render_one_source_block(&mut render, &ones);
-        simulation.observe_render_timing(3_000_000);
+        simulation.observe_render_timing(100_000);
         render_one_source_block(&mut render, &ones);
         assert_eq!(
             simulation.quality_governor_telemetry().sources[0].quality,

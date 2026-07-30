@@ -17,6 +17,13 @@ const EVALUATION_INTERVAL: u32 = 16;
 #[cfg(any(feature = "linked-sdk", test))]
 const RECOVERY_EVALUATIONS: u32 = 8;
 #[cfg(any(feature = "linked-sdk", test))]
+const RECOVERY_PROBATION_EVALUATIONS: u32 = 8;
+// A rung that overloads twice during probation is not a viable operating
+// point for this run. Locking that exact rung bounds recovery-induced misses
+// while leaving successful probation free to clear stale failure history.
+#[cfg(any(feature = "linked-sdk", test))]
+const MAX_RECOVERY_FAILURES: u8 = 2;
+#[cfg(any(feature = "linked-sdk", test))]
 const RECOVERY_P99_NUMERATOR: u64 = 7;
 #[cfg(any(feature = "linked-sdk", test))]
 const RECOVERY_P99_DENOMINATOR: u64 = 10;
@@ -243,6 +250,61 @@ enum PendingRenderChange {
 }
 
 #[cfg(any(feature = "linked-sdk", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryRung {
+    ReflectionFull,
+    ReflectionReduced,
+    PathValidation,
+    AlternatePaths,
+    Source(usize),
+    AmbisonicOrder(i32),
+    FullLengthReverb,
+}
+
+#[cfg(any(feature = "linked-sdk", test))]
+impl RecoveryRung {
+    const fn memory_index(self) -> usize {
+        const SOURCE_BASE: usize = 4;
+        const ORDER_BASE: usize = SOURCE_BASE + MAX_ACTIVE_SOURCES;
+        match self {
+            Self::ReflectionFull => 0,
+            Self::ReflectionReduced => 1,
+            Self::PathValidation => 2,
+            Self::AlternatePaths => 3,
+            Self::Source(index) => SOURCE_BASE + index,
+            Self::AmbisonicOrder(order) => ORDER_BASE + (order as usize - 1),
+            Self::FullLengthReverb => ORDER_BASE + 3,
+        }
+    }
+}
+
+#[cfg(any(feature = "linked-sdk", test))]
+const RECOVERY_RUNG_COUNT: usize = 4 + MAX_ACTIVE_SOURCES + 3 + 1;
+
+#[cfg(any(feature = "linked-sdk", test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RecoveryRungMemory {
+    failures: u8,
+    locked: bool,
+}
+
+#[cfg(any(feature = "linked-sdk", test))]
+#[derive(Clone, Copy, Debug)]
+struct RecoveryProbation {
+    rung: RecoveryRung,
+    remaining_evaluations: u32,
+    adopted: bool,
+}
+
+#[cfg(any(feature = "linked-sdk", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingTransitionAdvance {
+    None,
+    AdoptedQuality,
+    CompletedFade,
+}
+
+#[cfg(any(feature = "linked-sdk", test))]
 impl Default for SourceAudibility {
     fn default() -> Self {
         Self {
@@ -266,6 +328,7 @@ pub(crate) struct QualityGovernor {
     observations_since_evaluation: u32,
     headroom_evaluations: u32,
     deadline_misses: u64,
+    deadline_miss_since_evaluation: bool,
     simulation_lateness_ns: [u64; 3],
     simulation_late_since_evaluation: bool,
     reason: GovernorTransitionReason,
@@ -274,6 +337,8 @@ pub(crate) struct QualityGovernor {
     writer: fightbox_runtime::SnapshotWriter<GovernorRenderSnapshot>,
     pending_render_change: Option<PendingRenderChange>,
     pending_render_phase: u8,
+    recovery_memory: [RecoveryRungMemory; RECOVERY_RUNG_COUNT],
+    recovery_probation: Option<RecoveryProbation>,
 }
 
 #[cfg(any(feature = "linked-sdk", test))]
@@ -324,6 +389,7 @@ impl QualityGovernor {
                 observations_since_evaluation: 0,
                 headroom_evaluations: 0,
                 deadline_misses: 0,
+                deadline_miss_since_evaluation: false,
                 simulation_lateness_ns: [0; 3],
                 simulation_late_since_evaluation: false,
                 reason: GovernorTransitionReason::Initial,
@@ -332,6 +398,8 @@ impl QualityGovernor {
                 writer,
                 pending_render_change: None,
                 pending_render_phase: 0,
+                recovery_memory: [RecoveryRungMemory::default(); RECOVERY_RUNG_COUNT],
+                recovery_probation: None,
             },
             reader,
         )
@@ -370,16 +438,24 @@ impl QualityGovernor {
     }
 
     pub(crate) fn observe_block_timing(&mut self, elapsed_ns: u64) {
-        if self.advance_pending_render_transition() {
-            self.reset_timing_window();
-            return;
-        }
         self.timings[self.timing_next] = elapsed_ns;
         self.timing_next = (self.timing_next + 1) % TIMING_WINDOW;
         self.timing_len = self.timing_len.saturating_add(1).min(TIMING_WINDOW);
         self.observations_since_evaluation += 1;
         if elapsed_ns >= self.block_period_ns {
             self.deadline_misses = self.deadline_misses.saturating_add(1);
+            self.deadline_miss_since_evaluation = true;
+        }
+
+        if self.advance_pending_render_transition() == PendingTransitionAdvance::AdoptedQuality {
+            // The elapsed sample belongs to the pre-adoption snapshot. Begin
+            // the new rung's evidence window at the next rendered block.
+            self.reset_timing_window();
+            self.deadline_miss_since_evaluation = false;
+            if let Some(probation) = self.recovery_probation.as_mut() {
+                probation.adopted = true;
+            }
+            return;
         }
         if self.observations_since_evaluation < EVALUATION_INTERVAL {
             return;
@@ -431,11 +507,7 @@ impl QualityGovernor {
 
     fn evaluate(&mut self) {
         let (_, _, p99_ns, p99_9_ns) = self.percentiles();
-        let reason = if self.deadline_misses > 0
-            && self
-                .newest_timing()
-                .is_some_and(|duration| duration >= self.block_period_ns)
-        {
+        let reason = if self.deadline_miss_since_evaluation {
             Some(GovernorTransitionReason::RenderDeadlineMiss)
         } else if p99_9_ns >= self.p99_9_ceiling_ns {
             Some(GovernorTransitionReason::RenderP999OverCeiling)
@@ -447,10 +519,22 @@ impl QualityGovernor {
             None
         };
         self.simulation_late_since_evaluation = false;
+        self.deadline_miss_since_evaluation = false;
 
         if let Some(reason) = reason {
             self.headroom_evaluations = 0;
-            if self.degrade_one() {
+            let degraded = if let Some(probation) = self
+                .recovery_probation
+                .filter(|probation| probation.adopted)
+            {
+                self.record_recovery_failure(probation.rung);
+                self.recovery_probation = None;
+                self.degrade_recovered_rung(probation.rung)
+            } else {
+                self.recovery_probation = None;
+                self.degrade_one()
+            };
+            if degraded {
                 self.reason = reason;
                 self.reset_timing_window();
                 self.publish();
@@ -464,21 +548,60 @@ impl QualityGovernor {
             self.p99_budget_ns.saturating_mul(RECOVERY_P99_NUMERATOR) / RECOVERY_P99_DENOMINATOR;
         let recovery_p99_9 =
             self.p99_9_ceiling_ns.saturating_mul(RECOVERY_P99_NUMERATOR) / RECOVERY_P99_DENOMINATOR;
-        if p99_ns <= recovery_p99 && p99_9_ns <= recovery_p99_9 {
-            self.headroom_evaluations += 1;
-            if self.headroom_evaluations >= RECOVERY_EVALUATIONS {
-                self.headroom_evaluations = 0;
-                if self.recover_one() {
-                    self.reason = GovernorTransitionReason::SustainedHeadroom;
-                    self.reset_timing_window();
-                    self.publish();
+        let has_headroom = p99_ns <= recovery_p99 && p99_9_ns <= recovery_p99_9;
+
+        if let Some(mut probation) = self.recovery_probation {
+            self.headroom_evaluations = 0;
+            if probation.adopted && has_headroom {
+                probation.remaining_evaluations = probation.remaining_evaluations.saturating_sub(1);
+                if probation.remaining_evaluations == 0 {
+                    self.recovery_memory[probation.rung.memory_index()] =
+                        RecoveryRungMemory::default();
+                    self.recovery_probation = None;
                 } else {
+                    self.recovery_probation = Some(probation);
+                }
+            }
+            return;
+        }
+
+        if has_headroom {
+            self.headroom_evaluations += 1;
+            let Some(rung) = self.recovery_candidate() else {
+                if self.headroom_evaluations >= RECOVERY_EVALUATIONS {
+                    self.headroom_evaluations = 0;
                     self.reason = GovernorTransitionReason::AtFullQuality;
                 }
+                return;
+            };
+            let memory = self.recovery_memory[rung.memory_index()];
+            if memory.locked {
+                self.headroom_evaluations = 0;
+                return;
+            }
+            let required_evaluations =
+                RECOVERY_EVALUATIONS.saturating_mul(1_u32 << u32::from(memory.failures));
+            if self.headroom_evaluations >= required_evaluations {
+                self.headroom_evaluations = 0;
+                self.apply_recovery(rung);
+                self.recovery_probation = Some(RecoveryProbation {
+                    rung,
+                    remaining_evaluations: RECOVERY_PROBATION_EVALUATIONS,
+                    adopted: self.pending_render_change.is_none(),
+                });
+                self.reason = GovernorTransitionReason::SustainedHeadroom;
+                self.reset_timing_window();
+                self.publish();
             }
         } else {
             self.headroom_evaluations = 0;
         }
+    }
+
+    fn record_recovery_failure(&mut self, rung: RecoveryRung) {
+        let memory = &mut self.recovery_memory[rung.memory_index()];
+        memory.failures = memory.failures.saturating_add(1);
+        memory.locked = memory.failures >= MAX_RECOVERY_FAILURES;
     }
 
     fn degrade_one(&mut self) -> bool {
@@ -542,14 +665,10 @@ impl QualityGovernor {
         }
     }
 
-    fn recover_one(&mut self) -> bool {
+    fn recovery_candidate(&self) -> Option<RecoveryRung> {
         match self.render.reverb {
             ReverbStrategy::ShortIrLowerOrder => {
-                self.begin_render_transition(PendingRenderChange::Reverb {
-                    strategy: ReverbStrategy::SdkMixerConvolution,
-                    final_short_ir: false,
-                });
-                return true;
+                return Some(RecoveryRung::FullLengthReverb);
             }
             ReverbStrategy::SdkMixerConvolution
             | ReverbStrategy::Hybrid
@@ -557,39 +676,93 @@ impl QualityGovernor {
             | ReverbStrategy::ListenerCentric => {}
         }
         if self.render.ambisonic_order < self.requested.reflection_order {
-            self.begin_render_transition(PendingRenderChange::AmbisonicOrder(
+            return Some(RecoveryRung::AmbisonicOrder(
                 self.render.ambisonic_order + 1,
             ));
-            return true;
         }
         if let Some(index) = self.most_audible_degraded_source() {
-            self.begin_render_transition(PendingRenderChange::SourceQuality {
-                source_index: index,
-                quality: SourceQualityLevel::Full,
-            });
-            return true;
+            return Some(RecoveryRung::Source(index));
         }
         if !self.render.find_alternate_paths && self.requested.find_alternate_paths {
-            self.render.find_alternate_paths = true;
-            return true;
+            return Some(RecoveryRung::AlternatePaths);
         }
         if !self.render.validate_paths && self.requested.validate_paths {
-            self.render.validate_paths = true;
-            return true;
+            return Some(RecoveryRung::PathValidation);
         }
         match self.render.reflections.level {
-            ReflectionQualityLevel::Minimum => {
-                self.render.reflections =
-                    delivered_reflections(self.requested, ReflectionQualityLevel::Reduced, false);
-                true
-            }
-            ReflectionQualityLevel::Reduced => {
+            ReflectionQualityLevel::Minimum => Some(RecoveryRung::ReflectionReduced),
+            ReflectionQualityLevel::Reduced => Some(RecoveryRung::ReflectionFull),
+            ReflectionQualityLevel::Full => None,
+        }
+    }
+
+    fn apply_recovery(&mut self, rung: RecoveryRung) {
+        match rung {
+            RecoveryRung::ReflectionFull => {
                 self.render.reflections =
                     delivered_reflections(self.requested, ReflectionQualityLevel::Full, false);
-                true
             }
-            ReflectionQualityLevel::Full => false,
+            RecoveryRung::ReflectionReduced => {
+                self.render.reflections =
+                    delivered_reflections(self.requested, ReflectionQualityLevel::Reduced, false);
+            }
+            RecoveryRung::PathValidation => self.render.validate_paths = true,
+            RecoveryRung::AlternatePaths => self.render.find_alternate_paths = true,
+            RecoveryRung::Source(source_index) => {
+                self.begin_render_transition(PendingRenderChange::SourceQuality {
+                    source_index,
+                    quality: SourceQualityLevel::Full,
+                });
+            }
+            RecoveryRung::AmbisonicOrder(order) => {
+                self.begin_render_transition(PendingRenderChange::AmbisonicOrder(order));
+            }
+            RecoveryRung::FullLengthReverb => {
+                self.begin_render_transition(PendingRenderChange::Reverb {
+                    strategy: ReverbStrategy::SdkMixerConvolution,
+                    final_short_ir: false,
+                });
+            }
         }
+    }
+
+    fn degrade_recovered_rung(&mut self, rung: RecoveryRung) -> bool {
+        match rung {
+            RecoveryRung::ReflectionFull => {
+                self.render.reflections =
+                    delivered_reflections(self.requested, ReflectionQualityLevel::Reduced, false);
+            }
+            RecoveryRung::ReflectionReduced => {
+                self.render.reflections =
+                    delivered_reflections(self.requested, ReflectionQualityLevel::Minimum, false);
+            }
+            RecoveryRung::PathValidation => self.render.validate_paths = false,
+            RecoveryRung::AlternatePaths => self.render.find_alternate_paths = false,
+            RecoveryRung::Source(source_index) => {
+                let audibility = self.audibility[source_index];
+                let quality = if audibility.physically_calibrated
+                    && audibility.predicted_db < HEARING_THRESHOLD_DB_SPL
+                {
+                    SourceQualityLevel::Virtualized
+                } else {
+                    SourceQualityLevel::DirectOnly
+                };
+                self.begin_render_transition(PendingRenderChange::SourceQuality {
+                    source_index,
+                    quality,
+                });
+            }
+            RecoveryRung::AmbisonicOrder(order) => {
+                self.begin_render_transition(PendingRenderChange::AmbisonicOrder(order - 1));
+            }
+            RecoveryRung::FullLengthReverb => {
+                self.begin_render_transition(PendingRenderChange::Reverb {
+                    strategy: ReverbStrategy::ShortIrLowerOrder,
+                    final_short_ir: true,
+                });
+            }
+        }
+        true
     }
 
     fn least_audible_full_source(&self) -> Option<usize> {
@@ -636,11 +809,11 @@ impl QualityGovernor {
         self.pending_render_phase = 0;
     }
 
-    fn advance_pending_render_transition(&mut self) -> bool {
+    fn advance_pending_render_transition(&mut self) -> PendingTransitionAdvance {
         let Some(change) = self.pending_render_change else {
-            return false;
+            return PendingTransitionAdvance::None;
         };
-        if self.pending_render_phase == 0 {
+        let advance = if self.pending_render_phase == 0 {
             match change {
                 PendingRenderChange::AmbisonicOrder(order) => {
                     self.render.ambisonic_order = order;
@@ -664,20 +837,15 @@ impl QualityGovernor {
                 }
             }
             self.pending_render_phase = 1;
+            PendingTransitionAdvance::AdoptedQuality
         } else {
             self.render.reflection_output_gain = 1.0;
             self.pending_render_change = None;
             self.pending_render_phase = 0;
-        }
+            PendingTransitionAdvance::CompletedFade
+        };
         self.publish();
-        true
-    }
-
-    fn newest_timing(&self) -> Option<u64> {
-        (self.timing_len > 0).then(|| {
-            let index = (self.timing_next + TIMING_WINDOW - 1) % TIMING_WINDOW;
-            self.timings[index]
-        })
+        advance
     }
 
     fn reset_timing_window(&mut self) {
@@ -827,25 +995,21 @@ mod tests {
         assert_eq!(governor.telemetry().pathing, PathQualityLevel::PrimaryOnly);
         evaluation(&mut governor, 3_000_000);
         assert_eq!(governor.telemetry().reflection_output_gain, 0.0);
-        settle_render_transition(&mut governor, 3_000_000);
+        settle_render_transition(&mut governor, 100_000);
         assert_eq!(
             governor.telemetry().sources[0].quality,
             SourceQualityLevel::DirectOnly
         );
         evaluation(&mut governor, 3_000_000);
-        settle_render_transition(&mut governor, 3_000_000);
+        settle_render_transition(&mut governor, 100_000);
         assert_eq!(
             governor.telemetry().sources[1].quality,
             SourceQualityLevel::DirectOnly
         );
         evaluation(&mut governor, 3_000_000);
-        assert_eq!(governor.telemetry().reflection_output_gain, 0.0);
-        governor.observe_block_timing(3_000_000);
         assert_eq!(governor.telemetry().ambisonic_order, 0);
-        governor.observe_block_timing(3_000_000);
-        assert_eq!(governor.telemetry().reflection_output_gain, 1.0);
         evaluation(&mut governor, 3_000_000);
-        settle_render_transition(&mut governor, 3_000_000);
+        settle_render_transition(&mut governor, 100_000);
         assert_eq!(
             governor.telemetry().reverb,
             ReverbStrategy::ShortIrLowerOrder
@@ -882,6 +1046,172 @@ mod tests {
         assert_eq!(
             governor.telemetry().reason,
             GovernorTransitionReason::SustainedHeadroom
+        );
+    }
+
+    #[test]
+    fn oscillating_load_locks_the_failing_rung_and_stops_reintroducing_misses() {
+        let mut governor = governor(1);
+
+        // The full reflection rung misses its deadline, while the reduced
+        // rung has ample headroom.
+        evaluation(&mut governor, 3_000_000);
+        assert_eq!(
+            governor.telemetry().reflections.level,
+            ReflectionQualityLevel::Reduced
+        );
+
+        for expected_failures in 1..=MAX_RECOVERY_FAILURES {
+            let required = RECOVERY_EVALUATIONS * (1_u32 << u32::from(expected_failures - 1));
+            for _ in 0..required {
+                evaluation(&mut governor, 100_000);
+            }
+            assert_eq!(
+                governor.telemetry().reflections.level,
+                ReflectionQualityLevel::Full
+            );
+
+            evaluation(&mut governor, 3_000_000);
+            assert_eq!(
+                governor.telemetry().reflections.level,
+                ReflectionQualityLevel::Reduced
+            );
+            let memory = governor.recovery_memory[RecoveryRung::ReflectionFull.memory_index()];
+            assert_eq!(memory.failures, expected_failures);
+        }
+
+        let converged_sequence = governor.telemetry().sequence;
+        let converged_misses = governor.telemetry().callback_deadline_misses;
+        for _ in 0..64 {
+            let duration = if governor.telemetry().reflections.level == ReflectionQualityLevel::Full
+            {
+                3_000_000
+            } else {
+                100_000
+            };
+            evaluation(&mut governor, duration);
+        }
+
+        let memory = governor.recovery_memory[RecoveryRung::ReflectionFull.memory_index()];
+        assert!(memory.locked);
+        assert_eq!(governor.telemetry().sequence, converged_sequence);
+        assert_eq!(
+            governor.telemetry().callback_deadline_misses,
+            converged_misses,
+            "the converged reduced rung must not reintroduce deadline misses"
+        );
+    }
+
+    #[test]
+    fn sustained_load_drop_recovers_after_backoff_and_resets_rung_memory() {
+        let mut governor = governor(1);
+        evaluation(&mut governor, 3_000_000);
+
+        for _ in 0..RECOVERY_EVALUATIONS {
+            evaluation(&mut governor, 100_000);
+        }
+        assert_eq!(
+            governor.telemetry().reflections.level,
+            ReflectionQualityLevel::Full
+        );
+        evaluation(&mut governor, 3_000_000);
+
+        let memory_index = RecoveryRung::ReflectionFull.memory_index();
+        assert_eq!(governor.recovery_memory[memory_index].failures, 1);
+        for _ in 0..(RECOVERY_EVALUATIONS * 2 - 1) {
+            evaluation(&mut governor, 100_000);
+        }
+        assert_eq!(
+            governor.telemetry().reflections.level,
+            ReflectionQualityLevel::Reduced,
+            "one failed climb must double the sustained-headroom requirement"
+        );
+        evaluation(&mut governor, 100_000);
+        assert_eq!(
+            governor.telemetry().reflections.level,
+            ReflectionQualityLevel::Full
+        );
+
+        for _ in 0..RECOVERY_PROBATION_EVALUATIONS {
+            evaluation(&mut governor, 100_000);
+        }
+        assert_eq!(
+            governor.recovery_memory[memory_index],
+            RecoveryRungMemory::default(),
+            "a genuinely sustainable recovered rung must clear its old failure history"
+        );
+
+        // A later independent load increase degrades normally. Once load
+        // drops again, recovery uses the base delay rather than stale backoff.
+        evaluation(&mut governor, 3_000_000);
+        for _ in 0..(RECOVERY_EVALUATIONS - 1) {
+            evaluation(&mut governor, 100_000);
+        }
+        assert_eq!(
+            governor.telemetry().reflections.level,
+            ReflectionQualityLevel::Reduced
+        );
+        evaluation(&mut governor, 100_000);
+        assert_eq!(
+            governor.telemetry().reflections.level,
+            ReflectionQualityLevel::Full
+        );
+    }
+
+    #[test]
+    fn staged_transition_timings_are_counted_once_the_new_rung_is_adopted() {
+        let mut governor = governor(1);
+        for _ in 0..5 {
+            evaluation(&mut governor, 3_000_000);
+        }
+        assert_eq!(governor.telemetry().reflection_output_gain, 0.0);
+        let misses_before = governor.telemetry().callback_deadline_misses;
+
+        governor.observe_block_timing(3_000_000);
+        governor.observe_block_timing(3_000_000);
+
+        assert_eq!(
+            governor.telemetry().callback_deadline_misses,
+            misses_before + 2,
+            "transition advancement must not hide callback deadline misses"
+        );
+        assert_eq!(governor.timing_len, 1);
+        assert_eq!(governor.timings[0], 3_000_000);
+    }
+
+    #[test]
+    fn first_adopted_staged_rung_miss_is_charged_to_that_rung() {
+        let mut governor = governor(1);
+        for _ in 0..5 {
+            evaluation(&mut governor, 3_000_000);
+        }
+        settle_render_transition(&mut governor, 100_000);
+        assert_eq!(
+            governor.telemetry().sources[0].quality,
+            SourceQualityLevel::DirectOnly
+        );
+
+        for _ in 0..RECOVERY_EVALUATIONS {
+            evaluation(&mut governor, 100_000);
+        }
+        assert_eq!(
+            governor.telemetry().sources[0].quality,
+            SourceQualityLevel::Full
+        );
+        assert_eq!(governor.pending_render_phase, 1);
+
+        // This is the first callback rendered with the recovered source DSP.
+        // Its miss survives fade completion and fails Source(0) probation.
+        governor.observe_block_timing(3_000_000);
+        for _ in 1..EVALUATION_INTERVAL {
+            governor.observe_block_timing(100_000);
+        }
+        let memory = governor.recovery_memory[RecoveryRung::Source(0).memory_index()];
+        assert_eq!(memory.failures, 1);
+        settle_render_transition(&mut governor, 100_000);
+        assert_eq!(
+            governor.telemetry().sources[0].quality,
+            SourceQualityLevel::DirectOnly
         );
     }
 
