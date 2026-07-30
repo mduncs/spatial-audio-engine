@@ -639,6 +639,473 @@ pub fn summed_output_continuity(
     })
 }
 
+/// Default rejection ceiling for [`time_varying_spectral_notches`].
+///
+/// A moving, regularly spaced notch family must reach 15 dB before it is
+/// classified as coherent comb coloration. The detector already requires at
+/// least five notches and motion between adjacent analysis windows; the 15 dB
+/// ceiling leaves margin for the roughly 0.5 dB run-to-run ray-simulation
+/// variance in the linked Steam Audio qualification.
+pub const DEFAULT_MOVING_NOTCH_THRESHOLD_DB: f32 = 15.0;
+
+/// Time-varying comb-filter evidence on a summed binaural output.
+///
+/// Each Hann-windowed output spectrum is divided by the matching source
+/// spectrum, so musical harmonics are not mistaken for render coloration.
+/// Bins more than 45 dB below the source-window peak are excluded. A local
+/// minimum is a notch when its three-bin shoulders exceed it by at least 3 dB.
+/// A regular family contains at least five such minima at a common spacing
+/// (±8%, at least two bins). A family is "moving" only when its spacing changes
+/// by at least 5% (at least two bins) in adjacent windows. The reported gate
+/// metric is the deepest weaker member of any moving pair.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MovingSpectralNotchReport {
+    pub window_frames: usize,
+    pub hop_frames: usize,
+    pub analyzed_windows: usize,
+    pub regularly_spaced_window_count: usize,
+    pub moving_window_pair_count: usize,
+    pub deepest_regular_notch_db: f32,
+    pub max_moving_notch_depth_db: f32,
+}
+
+/// Detect moving regularly spaced spectral notches on the summed output.
+///
+/// `reference_mono` is the exact point-source program sent to the renderer. It
+/// is used only to remove the recording's own spectrum; no individual render
+/// path is inspected. `window_frames` must be a power of two.
+pub fn time_varying_spectral_notches(
+    spec: WavSpec,
+    summed_stereo: &[f32],
+    reference_mono: &[f32],
+    window_frames: usize,
+    hop_frames: usize,
+) -> Result<MovingSpectralNotchReport, MetricError> {
+    validate_spec(spec).map_err(|_| MetricError::BadSpec)?;
+    if spec.channels != 2 {
+        return Err(MetricError::StereoRequired);
+    }
+    if summed_stereo.len() % 2 != 0 || summed_stereo.len() / 2 != reference_mono.len() {
+        return Err(MetricError::FrameChannelMismatch);
+    }
+    if window_frames < 256
+        || !window_frames.is_power_of_two()
+        || hop_frames == 0
+        || reference_mono.len() < window_frames
+    {
+        return Err(MetricError::InvalidWindow);
+    }
+    if summed_stereo
+        .iter()
+        .chain(reference_mono)
+        .any(|sample| !sample.is_finite())
+    {
+        return Err(MetricError::InvalidWindow);
+    }
+
+    let mono = summed_stereo
+        .chunks_exact(2)
+        .map(|frame| 0.5 * (frame[0] + frame[1]))
+        .collect::<Vec<_>>();
+    let first_bin =
+        ((200.0 * window_frames as f64 / spec.sample_rate_hz as f64).ceil() as usize).max(1);
+    let last_bin = ((8_000.0 * window_frames as f64 / spec.sample_rate_hz as f64).floor() as usize)
+        .min(window_frames / 2 - 1);
+    if last_bin <= first_bin + 8 {
+        return Err(MetricError::InvalidWindow);
+    }
+
+    let mut families = Vec::<Option<NotchFamily>>::new();
+    for start in (0..=reference_mono.len() - window_frames).step_by(hop_frames) {
+        let output_spectrum = windowed_magnitude_spectrum(&mono[start..start + window_frames]);
+        let reference_spectrum =
+            windowed_magnitude_spectrum(&reference_mono[start..start + window_frames]);
+        let reference_peak = reference_spectrum[first_bin..=last_bin]
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        if reference_peak <= f64::EPSILON {
+            families.push(None);
+            continue;
+        }
+        let eligibility_floor = reference_peak * 10.0_f64.powf(-45.0 / 20.0);
+        let transfer_db = (first_bin..=last_bin)
+            .map(|bin| {
+                (reference_spectrum[bin] >= eligibility_floor).then(|| {
+                    20.0 * ((output_spectrum[bin] + 1.0e-20) / (reference_spectrum[bin] + 1.0e-20))
+                        .log10()
+                })
+            })
+            .collect::<Vec<_>>();
+        families.push(strongest_notch_family(&transfer_db));
+    }
+
+    let deepest_regular_notch_db = families
+        .iter()
+        .flatten()
+        .map(|family| family.depth_db)
+        .fold(0.0_f32, f32::max);
+    let regularly_spaced_window_count = families.iter().flatten().count();
+    let mut moving_window_pair_count = 0;
+    let mut max_moving_notch_depth_db = 0.0_f32;
+    for pair in families.windows(2) {
+        let (Some(left), Some(right)) = (pair[0], pair[1]) else {
+            continue;
+        };
+        let required_motion = 2.0_f32.max(left.spacing_bins.min(right.spacing_bins) * 0.05);
+        if (left.spacing_bins - right.spacing_bins).abs() >= required_motion {
+            moving_window_pair_count += 1;
+            max_moving_notch_depth_db =
+                max_moving_notch_depth_db.max(left.depth_db.min(right.depth_db));
+        }
+    }
+
+    Ok(MovingSpectralNotchReport {
+        window_frames,
+        hop_frames,
+        analyzed_windows: families.len(),
+        regularly_spaced_window_count,
+        moving_window_pair_count,
+        deepest_regular_notch_db,
+        max_moving_notch_depth_db,
+    })
+}
+
+/// Default normalized 0.5–8 Hz gain-modulation ceiling for
+/// [`summed_output_pump`].
+pub const DEFAULT_PUMP_MODULATION_THRESHOLD: f32 = 0.20;
+
+/// Default allowed fall between adjacent program-compensated approach windows.
+///
+/// The linked qualification uses two-second windows. A 0.75 dB allowance
+/// rejects a real downward gain move while covering Steam Audio's known
+/// approximately 0.5 dB stochastic ray-simulation variance.
+pub const DEFAULT_APPROACH_DROP_TOLERANCE_DB: f32 = 0.75;
+
+/// Pumping and monotonic-approach evidence on the summed binaural output.
+///
+/// Both measurements divide output RMS by the matching source-program RMS.
+/// This removes the recording's intended vocal dynamics without inspecting an
+/// individual render path. `modulation_depth` is the strongest 0.5–8 Hz
+/// component of the 50 ms gain envelope after subtraction of a centered
+/// one-second trend. `max_approach_drop_db` and
+/// `approach_violation_count` apply the authority's monotonic law to adjacent
+/// non-overlapping tolerance windows, stopping if summed output reaches the
+/// stated safety ceiling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SummedOutputPumpReport {
+    pub envelope_window_frames: usize,
+    pub monotonic_window_frames: usize,
+    pub eligible_envelope_windows: usize,
+    pub modulation_depth: f32,
+    pub approach_window_count: usize,
+    pub max_approach_drop_db: f32,
+    pub approach_drop_tolerance_db: f32,
+    pub approach_violation_count: usize,
+    pub safety_ceiling_dbfs: f32,
+    pub safety_ceiling_reached: bool,
+}
+
+pub fn summed_output_pump(
+    spec: WavSpec,
+    summed_stereo: &[f32],
+    reference_mono: &[f32],
+    approach_end_frame: usize,
+    envelope_window_frames: usize,
+    monotonic_window_frames: usize,
+    safety_ceiling_dbfs: f32,
+    approach_drop_tolerance_db: f32,
+) -> Result<SummedOutputPumpReport, MetricError> {
+    validate_spec(spec).map_err(|_| MetricError::BadSpec)?;
+    if spec.channels != 2 {
+        return Err(MetricError::StereoRequired);
+    }
+    if summed_stereo.len() % 2 != 0 || summed_stereo.len() / 2 != reference_mono.len() {
+        return Err(MetricError::FrameChannelMismatch);
+    }
+    let frame_count = reference_mono.len();
+    if envelope_window_frames == 0
+        || monotonic_window_frames == 0
+        || frame_count < envelope_window_frames
+        || approach_end_frame < monotonic_window_frames * 2
+        || approach_end_frame > frame_count
+    {
+        return Err(MetricError::InvalidWindow);
+    }
+    if !safety_ceiling_dbfs.is_finite()
+        || safety_ceiling_dbfs > 0.0
+        || !approach_drop_tolerance_db.is_finite()
+        || approach_drop_tolerance_db < 0.0
+        || summed_stereo
+            .iter()
+            .chain(reference_mono)
+            .any(|sample| !sample.is_finite())
+    {
+        return Err(MetricError::InvalidThreshold);
+    }
+
+    let global_reference_rms = rms_mono(reference_mono);
+    if global_reference_rms <= f64::EPSILON {
+        return Err(MetricError::InvalidWindow);
+    }
+    let reference_floor = global_reference_rms * 10.0_f64.powf(-36.0 / 20.0);
+    let mut gain_envelope = Vec::new();
+    let mut eligible_envelope_windows = 0;
+    let mut held_gain = 0.0_f64;
+    for start in (0..=frame_count - envelope_window_frames).step_by(envelope_window_frames) {
+        let end = start + envelope_window_frames;
+        let reference_rms = rms_mono(&reference_mono[start..end]);
+        if reference_rms >= reference_floor {
+            held_gain = stereo_rms(&summed_stereo[start * 2..end * 2]) / reference_rms;
+            eligible_envelope_windows += 1;
+        }
+        gain_envelope.push(held_gain);
+    }
+    let envelope_rate_hz = spec.sample_rate_hz as f64 / envelope_window_frames as f64;
+    let trend_radius = (envelope_rate_hz / 2.0).round().max(1.0) as usize;
+    let residual = centered_fractional_residual(&gain_envelope, trend_radius);
+    let modulation_depth = strongest_modulation(&residual, envelope_rate_hz, 0.5, 8.0) as f32;
+
+    let mut approach_levels = Vec::new();
+    let mut safety_ceiling_reached = false;
+    for start in (0..=approach_end_frame - monotonic_window_frames).step_by(monotonic_window_frames)
+    {
+        let end = start + monotonic_window_frames;
+        let reference_rms = rms_mono(&reference_mono[start..end]);
+        if reference_rms < reference_floor {
+            continue;
+        }
+        let output_rms = stereo_rms(&summed_stereo[start * 2..end * 2]);
+        let output_dbfs = 20.0 * output_rms.max(1.0e-12).log10();
+        if output_dbfs >= f64::from(safety_ceiling_dbfs) {
+            safety_ceiling_reached = true;
+            break;
+        }
+        approach_levels.push((20.0 * (output_rms / reference_rms).max(1.0e-12).log10()) as f32);
+    }
+    let mut max_approach_drop_db = 0.0_f32;
+    let mut approach_violation_count = 0;
+    for pair in approach_levels.windows(2) {
+        let drop_db = (pair[0] - pair[1]).max(0.0);
+        max_approach_drop_db = max_approach_drop_db.max(drop_db);
+        if drop_db > approach_drop_tolerance_db {
+            approach_violation_count += 1;
+        }
+    }
+
+    Ok(SummedOutputPumpReport {
+        envelope_window_frames,
+        monotonic_window_frames,
+        eligible_envelope_windows,
+        modulation_depth,
+        approach_window_count: approach_levels.len(),
+        max_approach_drop_db,
+        approach_drop_tolerance_db,
+        approach_violation_count,
+        safety_ceiling_dbfs,
+        safety_ceiling_reached,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct NotchFamily {
+    spacing_bins: f32,
+    depth_db: f32,
+}
+
+fn strongest_notch_family(transfer_db: &[Option<f64>]) -> Option<NotchFamily> {
+    let mut candidates = Vec::<(usize, f32)>::new();
+    for bin in 4..transfer_db.len().saturating_sub(4) {
+        let Some(center) = transfer_db[bin] else {
+            continue;
+        };
+        let left = transfer_db[bin - 4..bin - 1]
+            .iter()
+            .copied()
+            .flatten()
+            .sum::<f64>()
+            / 3.0;
+        let right = transfer_db[bin + 2..=bin + 4]
+            .iter()
+            .copied()
+            .flatten()
+            .sum::<f64>()
+            / 3.0;
+        if transfer_db[bin - 4..bin - 1].iter().any(Option::is_none)
+            || transfer_db[bin + 2..=bin + 4].iter().any(Option::is_none)
+        {
+            continue;
+        }
+        let depth = left.min(right) - center;
+        if depth >= 3.0
+            && transfer_db[bin - 1].is_some_and(|value| center < value)
+            && transfer_db[bin + 1].is_some_and(|value| center <= value)
+        {
+            candidates.push((bin, depth as f32));
+        }
+    }
+
+    let mut strongest = None;
+    for first in 0..candidates.len() {
+        for second in first + 1..candidates.len() {
+            let spacing = candidates[second].0 - candidates[first].0;
+            if !(4..=256).contains(&spacing) {
+                continue;
+            }
+            let tolerance = ((spacing as f32 * 0.08).round() as usize).max(2);
+            let mut depths = vec![candidates[first].1, candidates[second].1];
+            let mut expected = candidates[second].0 + spacing;
+            let mut search = second + 1;
+            while expected < transfer_db.len() && search < candidates.len() {
+                while search < candidates.len()
+                    && candidates[search].0.saturating_add(tolerance) < expected
+                {
+                    search += 1;
+                }
+                if search < candidates.len() && candidates[search].0.abs_diff(expected) <= tolerance
+                {
+                    depths.push(candidates[search].1);
+                    expected = candidates[search].0 + spacing;
+                    search += 1;
+                } else {
+                    expected += spacing;
+                }
+            }
+            if depths.len() < 5 {
+                continue;
+            }
+            depths.sort_by(f32::total_cmp);
+            let depth_db = depths[depths.len() / 2];
+            if strongest.is_none_or(|family: NotchFamily| depth_db > family.depth_db) {
+                strongest = Some(NotchFamily {
+                    spacing_bins: spacing as f32,
+                    depth_db,
+                });
+            }
+        }
+    }
+    strongest
+}
+
+fn windowed_magnitude_spectrum(samples: &[f32]) -> Vec<f64> {
+    let n = samples.len();
+    let mut real = samples
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let window = 0.5 - 0.5 * (std::f64::consts::TAU * index as f64 / (n - 1) as f64).cos();
+            f64::from(*sample) * window
+        })
+        .collect::<Vec<_>>();
+    let mut imaginary = vec![0.0_f64; n];
+    fft_in_place(&mut real, &mut imaginary);
+    real.into_iter()
+        .zip(imaginary)
+        .map(|(real, imaginary)| (real * real + imaginary * imaginary).sqrt())
+        .collect()
+}
+
+fn fft_in_place(real: &mut [f64], imaginary: &mut [f64]) {
+    let n = real.len();
+    debug_assert!(n.is_power_of_two() && imaginary.len() == n);
+    let mut target = 0;
+    for source in 1..n {
+        let mut bit = n >> 1;
+        while target & bit != 0 {
+            target ^= bit;
+            bit >>= 1;
+        }
+        target ^= bit;
+        if source < target {
+            real.swap(source, target);
+            imaginary.swap(source, target);
+        }
+    }
+    let mut length = 2;
+    while length <= n {
+        let angle = -std::f64::consts::TAU / length as f64;
+        let step_real = angle.cos();
+        let step_imaginary = angle.sin();
+        for start in (0..n).step_by(length) {
+            let mut twiddle_real = 1.0;
+            let mut twiddle_imaginary = 0.0;
+            for offset in 0..length / 2 {
+                let even = start + offset;
+                let odd = even + length / 2;
+                let odd_real = real[odd] * twiddle_real - imaginary[odd] * twiddle_imaginary;
+                let odd_imaginary = real[odd] * twiddle_imaginary + imaginary[odd] * twiddle_real;
+                real[odd] = real[even] - odd_real;
+                imaginary[odd] = imaginary[even] - odd_imaginary;
+                real[even] += odd_real;
+                imaginary[even] += odd_imaginary;
+                let next_real = twiddle_real * step_real - twiddle_imaginary * step_imaginary;
+                twiddle_imaginary = twiddle_real * step_imaginary + twiddle_imaginary * step_real;
+                twiddle_real = next_real;
+            }
+        }
+        length *= 2;
+    }
+}
+
+fn rms_mono(samples: &[f32]) -> f64 {
+    (samples
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum::<f64>()
+        / samples.len().max(1) as f64)
+        .sqrt()
+}
+
+fn stereo_rms(interleaved: &[f32]) -> f64 {
+    (interleaved
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum::<f64>()
+        / interleaved.len().max(1) as f64)
+        .sqrt()
+}
+
+fn centered_fractional_residual(values: &[f64], radius: usize) -> Vec<f64> {
+    (0..values.len())
+        .map(|index| {
+            let start = index.saturating_sub(radius);
+            let end = (index + radius + 1).min(values.len());
+            let trend = values[start..end].iter().sum::<f64>() / (end - start) as f64;
+            if trend.abs() > 1.0e-12 {
+                values[index] / trend - 1.0
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+fn strongest_modulation(
+    residual: &[f64],
+    envelope_rate_hz: f64,
+    minimum_hz: f64,
+    maximum_hz: f64,
+) -> f64 {
+    if residual.is_empty() || envelope_rate_hz <= minimum_hz * 2.0 {
+        return 0.0;
+    }
+    let maximum_hz = maximum_hz.min(envelope_rate_hz * 0.5);
+    let steps = ((maximum_hz - minimum_hz) * 10.0).floor().max(0.0) as usize;
+    (0..=steps)
+        .map(|step| minimum_hz + step as f64 / 10.0)
+        .map(|frequency| {
+            let (cosine, sine) = residual.iter().enumerate().fold(
+                (0.0_f64, 0.0_f64),
+                |(cosine, sine), (index, value)| {
+                    let phase = std::f64::consts::TAU * frequency * index as f64 / envelope_rate_hz;
+                    (cosine + value * phase.cos(), sine + value * phase.sin())
+                },
+            );
+            2.0 * (cosine * cosine + sine * sine).sqrt() / residual.len() as f64
+        })
+        .fold(0.0_f64, f64::max)
+}
+
 /// RMS dBFS of the mono mixdown, or `None` if silent.
 fn mono_rms_dbfs(spec: WavSpec, samples: &[f32]) -> Result<Option<f32>, MetricError> {
     let mono = mono_mixdown(spec, samples)?;
@@ -851,6 +1318,122 @@ mod tests {
         let clicked_report =
             summed_output_continuity(spec, &clicked, block_frames, 32, 0.5).unwrap();
         assert_eq!(clicked_report.detected_click_count, 1);
+    }
+
+    #[test]
+    fn moving_spectral_notches_separate_dry_from_time_varying_comb() {
+        let spec = spec(2);
+        let window_frames = 16_384;
+        let mut state = 0x8f3a_21c7_d4e5_690b_u64;
+        let reference = (0..window_frames * 8)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 23) as f32 * 0.2
+            })
+            .collect::<Vec<_>>();
+        let dry = reference
+            .iter()
+            .flat_map(|sample| [*sample, *sample])
+            .collect::<Vec<_>>();
+        let dry_report =
+            time_varying_spectral_notches(spec, &dry, &reference, window_frames, window_frames)
+                .unwrap();
+
+        let comb_mono = reference
+            .iter()
+            .enumerate()
+            .map(|(frame, sample)| {
+                let delay = if frame < reference.len() / 2 { 48 } else { 192 };
+                let window_start = frame / window_frames * window_frames;
+                let offset = frame % window_frames;
+                let delayed = window_start + (offset + window_frames - delay) % window_frames;
+                *sample + reference[delayed] * 0.98
+            })
+            .collect::<Vec<_>>();
+        let comb = comb_mono
+            .iter()
+            .flat_map(|sample| [*sample, *sample])
+            .collect::<Vec<_>>();
+        let comb_report =
+            time_varying_spectral_notches(spec, &comb, &reference, window_frames, window_frames)
+                .unwrap();
+
+        assert!(dry_report.max_moving_notch_depth_db < 3.0, "{dry_report:?}");
+        assert!(
+            comb_report.max_moving_notch_depth_db > DEFAULT_MOVING_NOTCH_THRESHOLD_DB,
+            "{comb_report:?}"
+        );
+        assert!(comb_report.moving_window_pair_count >= 1);
+    }
+
+    #[test]
+    fn pump_detector_finds_modulation_and_approach_reversal() {
+        let spec = spec(2);
+        let frames = 48_000 * 8;
+        let reference = (0..frames)
+            .map(|frame| {
+                let time = frame as f32 / 48_000.0;
+                0.12 * (std::f32::consts::TAU * 311.0 * time).sin()
+                    + 0.08 * (std::f32::consts::TAU * 997.0 * time).sin()
+            })
+            .collect::<Vec<_>>();
+        let clean = reference
+            .iter()
+            .enumerate()
+            .flat_map(|(frame, sample)| {
+                let gain = 0.2 + 0.6 * frame as f32 / (frames - 1) as f32;
+                [*sample * gain, *sample * gain]
+            })
+            .collect::<Vec<_>>();
+        let clean_report = summed_output_pump(
+            spec,
+            &clean,
+            &reference,
+            frames,
+            2_400,
+            48_000,
+            -1.0,
+            DEFAULT_APPROACH_DROP_TOLERANCE_DB,
+        )
+        .unwrap();
+        assert!(clean_report.modulation_depth < 0.05, "{clean_report:?}");
+        assert_eq!(clean_report.approach_violation_count, 0);
+
+        let pumped = reference
+            .iter()
+            .enumerate()
+            .flat_map(|(frame, sample)| {
+                let time = frame as f32 / 48_000.0;
+                let approach = 0.2 + 0.6 * frame as f32 / (frames - 1) as f32;
+                let reversal = if (3 * 48_000..5 * 48_000).contains(&frame) {
+                    0.35
+                } else {
+                    1.0
+                };
+                let limiter = 0.7 + 0.28 * (std::f32::consts::TAU * 3.0 * time).sin();
+                let output = *sample * approach * reversal * limiter;
+                [output, output]
+            })
+            .collect::<Vec<_>>();
+        let pumped_report = summed_output_pump(
+            spec,
+            &pumped,
+            &reference,
+            frames,
+            2_400,
+            48_000,
+            -1.0,
+            DEFAULT_APPROACH_DROP_TOLERANCE_DB,
+        )
+        .unwrap();
+        assert!(
+            pumped_report.modulation_depth > DEFAULT_PUMP_MODULATION_THRESHOLD,
+            "{pumped_report:?}"
+        );
+        assert!(pumped_report.approach_violation_count >= 1);
+        assert!(pumped_report.max_approach_drop_db > DEFAULT_APPROACH_DROP_TOLERANCE_DB);
     }
 
     #[test]

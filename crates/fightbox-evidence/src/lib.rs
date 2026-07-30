@@ -39,11 +39,13 @@ pub use manifest::{
     SourceDriveRecord, StemKind, StemRecord, WorldProvenance,
 };
 pub use metrics::{
-    ChannelMetrics, ComparisonEnergy, ContinuityReport, DEFAULT_CLICK_RATIO_THRESHOLD,
-    DEFAULT_LEVEL_DIFFERENCE_DB, DEFAULT_SPECTRAL_L1_DIFFERENCE, IaccReport, MetricError,
-    ReflectionDensityReport, SpectralComparison, SummedOutputContinuity, channel_metrics,
-    compare_pathing, continuity, interaural_cross_correlation, reflection_density,
-    summed_output_continuity,
+    ChannelMetrics, ComparisonEnergy, ContinuityReport, DEFAULT_APPROACH_DROP_TOLERANCE_DB,
+    DEFAULT_CLICK_RATIO_THRESHOLD, DEFAULT_LEVEL_DIFFERENCE_DB, DEFAULT_MOVING_NOTCH_THRESHOLD_DB,
+    DEFAULT_PUMP_MODULATION_THRESHOLD, DEFAULT_SPECTRAL_L1_DIFFERENCE, IaccReport, MetricError,
+    MovingSpectralNotchReport, ReflectionDensityReport, SpectralComparison, SummedOutputContinuity,
+    SummedOutputPumpReport, channel_metrics, compare_pathing, continuity,
+    interaural_cross_correlation, reflection_density, summed_output_continuity, summed_output_pump,
+    time_varying_spectral_notches,
 };
 pub use signal::{
     GeneratedSignal, GeneratorNormalization, SignalError, SignalKind, multitone, pink_like, sine,
