@@ -9,6 +9,31 @@ use crate::backend_snapshot::{MAX_PATH_SH_COEFFS, SteamDirectParams, SteamSource
 // effects interpolate between the endpoint frames supplied on consecutive
 // calls.
 pub(crate) const PROPAGATION_SLEW_TIME_SECONDS: f32 = 0.080;
+pub(crate) const SPEED_OF_SOUND_METERS_PER_SECOND: f32 = 343.0;
+/// Physical-distance cap for backend-owned propagation delay lines.
+///
+/// 2,048 m covers the probe-volume scale while keeping render state fixed and
+/// bounded. Distances beyond the cap retain the maximum causal delay.
+pub(crate) const MAX_PROPAGATION_DISTANCE_METERS: f32 = 2_048.0;
+
+pub(crate) fn maximum_propagation_delay_samples(sample_rate_hz: i32) -> usize {
+    (MAX_PROPAGATION_DISTANCE_METERS * sample_rate_hz as f32 / SPEED_OF_SOUND_METERS_PER_SECOND)
+        .ceil() as usize
+}
+
+pub(crate) fn propagation_delay_samples(
+    source_position: SteamVector3,
+    listener_position: SteamVector3,
+    sample_rate_hz: i32,
+) -> f32 {
+    let x = source_position.x - listener_position.x;
+    let y = source_position.y - listener_position.y;
+    let z = source_position.z - listener_position.z;
+    let distance_meters = (x * x + y * y + z * z)
+        .sqrt()
+        .min(MAX_PROPAGATION_DISTANCE_METERS);
+    distance_meters * sample_rate_hz as f32 / SPEED_OF_SOUND_METERS_PER_SECOND
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SmoothedPropagationTerms {
@@ -292,6 +317,65 @@ mod tests {
             applied,
             SmoothedPropagationTerms::from_snapshot(target, listener),
         );
+    }
+
+    #[test]
+    fn propagation_delay_converts_distance_to_samples() {
+        let delay = propagation_delay_samples(
+            SteamVector3::new(34.3, 0.0, 0.0),
+            SteamVector3::default(),
+            48_000,
+        );
+
+        assert!((delay - 4_800.0).abs() < 0.001, "delay was {delay}");
+    }
+
+    #[test]
+    fn propagation_delay_clamps_at_the_documented_distance_cap() {
+        let maximum = maximum_propagation_delay_samples(48_000) as f32;
+        let at_cap = propagation_delay_samples(
+            SteamVector3::new(MAX_PROPAGATION_DISTANCE_METERS, 0.0, 0.0),
+            SteamVector3::default(),
+            48_000,
+        );
+        let beyond_cap = propagation_delay_samples(
+            SteamVector3::new(MAX_PROPAGATION_DISTANCE_METERS * 4.0, 0.0, 0.0),
+            SteamVector3::default(),
+            48_000,
+        );
+
+        assert!(at_cap <= maximum);
+        assert_eq!(beyond_cap.to_bits(), at_cap.to_bits());
+    }
+
+    #[test]
+    fn delay_target_uses_the_smoothed_position_endpoint() {
+        let mut smoother = SourcePropagationSmoother::default();
+        let listener = SteamVector3::default();
+        smoother.advance(
+            SteamSourcePropagation {
+                source_position: SteamVector3::new(1.0, 0.0, 0.0),
+                ..SteamSourcePropagation::default()
+            },
+            listener,
+            0.5,
+        );
+        let smoothed = smoother
+            .advance(
+                SteamSourcePropagation {
+                    source_position: SteamVector3::new(81.0, 0.0, 0.0),
+                    ..SteamSourcePropagation::default()
+                },
+                listener,
+                0.5,
+            )
+            .endpoint();
+
+        assert_eq!(smoothed.source_position.x.to_bits(), 41.0_f32.to_bits());
+        let delay =
+            propagation_delay_samples(smoothed.source_position, smoothed.listener_position, 48_000);
+        let expected = 41.0 * 48_000.0 / SPEED_OF_SOUND_METERS_PER_SECOND;
+        assert_eq!(delay.to_bits(), expected.to_bits());
     }
 
     #[test]

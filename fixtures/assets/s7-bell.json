@@ -1,0 +1,19 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "s7-bell",
+  "kind": "multitone",
+  "generator": {
+    "module": "fightbox_evidence::signal",
+    "multitone": {"frequencies_hz": [440.0, 1188.0, 2134.0, 3080.0]}
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 4.0,
+  "target_rms_dbfs": -20,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The inharmonic multitone approximates a bell spectrum, but the available generator cannot encode exponential partial decay or a struck retrigger; the descriptor loops every four seconds."
+  ]
+}

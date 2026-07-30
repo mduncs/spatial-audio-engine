@@ -272,4 +272,16 @@ mod tests {
         assert!(!asset.samples.is_empty());
         assert!(asset.samples.iter().all(|sample| sample.is_finite()));
     }
+
+    #[test]
+    fn s7_generated_assets_parse_validate_and_load() {
+        for asset_id in ["s7-siren", "s7-bell"] {
+            let asset = load_asset(asset_id).unwrap();
+            assert!(!asset.samples.is_empty(), "{asset_id}");
+            assert!(
+                asset.samples.iter().all(|sample| sample.is_finite()),
+                "{asset_id}"
+            );
+        }
+    }
 }

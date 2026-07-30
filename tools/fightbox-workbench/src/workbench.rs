@@ -16,7 +16,7 @@ use fightbox_world::{AcousticMesh, read_package};
 
 use crate::LaunchArgs;
 use crate::asset::load_asset;
-use crate::fixture::{Fixture, load_baked, scene_mesh};
+use crate::fixture::{Fixture, Trajectory, load_baked, scene_mesh};
 use crate::pose::{ListenerControl, PoseMailbox};
 
 const BLOCK_SIZE: u32 = 128;
@@ -41,12 +41,40 @@ pub struct Workbench {
     listen_gain_db: f32,
     listen_gain_writer: SnapshotWriter<f32>,
     meter_reader: SnapshotReader<MeterReading>,
+    source_mix_writer: SnapshotWriter<SourceMix>,
+    audio_block_reader: SnapshotReader<u64>,
     autopilot: Autopilot,
 }
 
 struct SourceView {
     id: String,
     position: EnuVector3,
+    muted: bool,
+    soloed: bool,
+    trajectory: Option<SourceTrajectory>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceMix {
+    muted: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
+    soloed: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
+}
+
+impl SourceMix {
+    const ALL_AUDIBLE: Self = Self {
+        muted: [false; fightbox_runtime::MAX_ACTIVE_SOURCES],
+        soloed: [false; fightbox_runtime::MAX_ACTIVE_SOURCES],
+    };
+
+    #[cfg(any(feature = "live-output", test))]
+    fn gains(self, source_count: usize) -> [f32; fightbox_runtime::MAX_ACTIVE_SOURCES] {
+        let any_soloed = self.soloed[..source_count].iter().any(|soloed| *soloed);
+        std::array::from_fn(|index| {
+            f32::from(
+                index < source_count && !self.muted[index] && (!any_soloed || self.soloed[index]),
+            )
+        })
+    }
 }
 
 enum AudioState {
@@ -74,6 +102,11 @@ impl Workbench {
         let mut source_views = Vec::with_capacity(fixture.sources.len());
         for (index, source) in fixture.sources.iter().enumerate() {
             let position = source.initial_position()?;
+            let trajectory = source
+                .trajectory
+                .as_ref()
+                .map(SourceTrajectory::from_fixture)
+                .transpose()?;
             let asset = load_asset(&source.asset_id)?;
             let pose = Pose {
                 position,
@@ -89,7 +122,13 @@ impl Workbench {
                     },
                     asset_analysis: asset.analysis,
                     extent: ExtentDescriptor::Point,
-                    max_speed_mps: 0.0,
+                    max_speed_mps: source
+                        .trajectory
+                        .as_ref()
+                        .map(|trajectory| {
+                            trajectory.max_speed_mps.unwrap_or(trajectory.speed_mps) as f32
+                        })
+                        .unwrap_or(0.0),
                 },
                 asset.samples,
             ));
@@ -101,6 +140,9 @@ impl Workbench {
             source_views.push(SourceView {
                 id: source.id.clone(),
                 position,
+                muted: false,
+                soloed: false,
+                trajectory,
             });
         }
         let descriptors = source_views
@@ -158,18 +200,28 @@ impl Workbench {
         let (listen_gain_writer, listen_gain_reader) =
             SnapshotPublication::new(DEFAULT_LISTEN_GAIN_DB);
         let (meter_writer, meter_reader) = SnapshotPublication::new(MeterReading::SILENT);
+        let (source_mix_writer, source_mix_reader) =
+            SnapshotPublication::new(SourceMix::ALL_AUDIBLE);
+        let (audio_block_writer, audio_block_reader) = SnapshotPublication::new(0_u64);
         let processor = LateBoundProcessor::new(
             graph,
             pose_reader,
             listen_gain_reader,
             meter_writer,
             MeterAccumulator::new(SAMPLE_RATE, BLOCK_SIZE, METER_WINDOW_SECONDS),
+            audio_block_writer,
         );
         let signals = prepared_sources
             .into_iter()
             .map(|(_, samples)| samples)
             .collect();
-        let audio = start_audio(processor, engine_config, signals, args.device.as_deref());
+        let audio = start_audio(
+            processor,
+            engine_config,
+            signals,
+            source_mix_reader,
+            args.device.as_deref(),
+        );
         let edges = mesh_edges(&package.mesh);
         let camera = Camera::for_mesh(&package.mesh);
         let autopilot = Autopilot::new(Bounds2::for_mesh(&package.mesh));
@@ -186,8 +238,25 @@ impl Workbench {
             listen_gain_db: DEFAULT_LISTEN_GAIN_DB,
             listen_gain_writer,
             meter_reader,
+            source_mix_writer,
+            audio_block_reader,
             autopilot,
         })
+    }
+
+    fn update_source_motion(&mut self) {
+        let elapsed_blocks = self.audio_block_reader.read();
+        for (index, source) in self.sources.iter_mut().enumerate() {
+            let Some(trajectory) = &source.trajectory else {
+                continue;
+            };
+            let sample = trajectory.sample_at_block(elapsed_blocks);
+            source.position = sample.position;
+            self.source_motion[index].pose.position = sample.position;
+            self.source_motion[index].pose.forward = sample.direction;
+            self.source_motion[index].linear_velocity_mps =
+                scale(sample.direction, trajectory.speed_mps);
+        }
     }
 
     fn update_control(&mut self, ctx: &egui::Context, drag_delta_x: f32) {
@@ -340,6 +409,38 @@ impl Workbench {
         ui.monospace(format!("peak  {:7.1} dBFS", meter.peak_dbfs));
         ui.monospace(format!("RMS   {:7.1} dBFS", meter.rms_dbfs));
         ui.separator();
+        ui.heading("Sources");
+        let mut source_mix_changed = false;
+        for source in &mut self.sources {
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(source.muted, "M")
+                    .on_hover_text("Mute this source")
+                    .clicked()
+                {
+                    source.muted = !source.muted;
+                    source_mix_changed = true;
+                }
+                if ui
+                    .selectable_label(source.soloed, "S")
+                    .on_hover_text("Solo this source")
+                    .clicked()
+                {
+                    source.soloed = !source.soloed;
+                    source_mix_changed = true;
+                }
+                ui.monospace(&source.id);
+            });
+        }
+        if source_mix_changed {
+            let mut mix = SourceMix::ALL_AUDIBLE;
+            for (index, source) in self.sources.iter().enumerate() {
+                mix.muted[index] = source.muted;
+                mix.soloed[index] = source.soloed;
+            }
+            self.source_mix_writer.publish(mix);
+        }
+        ui.separator();
         ui.heading("Autopilot");
         let was_enabled = self.autopilot.enabled;
         ui.checkbox(&mut self.autopilot.enabled, "follow city circuit");
@@ -399,6 +500,7 @@ impl Workbench {
 
 impl eframe::App for Workbench {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_source_motion();
         egui::SidePanel::right("performance")
             .resizable(false)
             .default_width(270.0)
@@ -455,6 +557,8 @@ struct LateBoundProcessor<P> {
     listen_gain_reader: SnapshotReader<f32>,
     meter_writer: SnapshotWriter<MeterReading>,
     meter: MeterAccumulator,
+    audio_block_writer: SnapshotWriter<u64>,
+    elapsed_blocks: u64,
 }
 
 impl<P> LateBoundProcessor<P> {
@@ -464,6 +568,7 @@ impl<P> LateBoundProcessor<P> {
         listen_gain_reader: SnapshotReader<f32>,
         meter_writer: SnapshotWriter<MeterReading>,
         meter: MeterAccumulator,
+        audio_block_writer: SnapshotWriter<u64>,
     ) -> Self {
         Self {
             processor,
@@ -471,6 +576,8 @@ impl<P> LateBoundProcessor<P> {
             listen_gain_reader,
             meter_writer,
             meter,
+            audio_block_writer,
+            elapsed_blocks: 0,
         }
     }
 }
@@ -499,6 +606,8 @@ impl<P: BlockProcessor + ListenerStateSink> BlockProcessor for LateBoundProcesso
         apply_output_gain(output_left, output_right, gain);
         let reading = self.meter.observe(output_left, output_right);
         self.meter_writer.publish(reading);
+        self.elapsed_blocks = self.elapsed_blocks.saturating_add(1);
+        self.audio_block_writer.publish(self.elapsed_blocks);
         Ok(())
     }
 
@@ -599,11 +708,13 @@ fn amplitude_dbfs(amplitude: f32) -> f32 {
 struct LoopingInput {
     signals: Vec<Vec<f32>>,
     offsets: Vec<usize>,
+    source_mix_reader: SnapshotReader<SourceMix>,
 }
 
 #[cfg(feature = "live-output")]
 impl fightbox_runtime::live::LiveInputProvider for LoopingInput {
     fn fill_block(&mut self, sources: &mut fightbox_runtime::live::LiveSourceBuffer) {
+        let gains = self.source_mix_reader.read().gains(self.signals.len());
         for index in 0..self.signals.len() {
             let Some(output) = sources.add_source(index) else {
                 return;
@@ -611,7 +722,7 @@ impl fightbox_runtime::live::LiveInputProvider for LoopingInput {
             let signal = &self.signals[index];
             let mut offset = self.offsets[index];
             for sample in output {
-                *sample = signal[offset];
+                *sample = signal[offset] * gains[index];
                 offset = (offset + 1) % signal.len();
             }
             self.offsets[index] = offset;
@@ -624,11 +735,13 @@ fn start_audio<P: BlockProcessor + Send + 'static>(
     processor: P,
     config: EngineConfig,
     signals: Vec<Vec<f32>>,
+    source_mix_reader: SnapshotReader<SourceMix>,
     device: Option<&str>,
 ) -> AudioState {
     let input = Box::new(LoopingInput {
         offsets: vec![0; signals.len()],
         signals,
+        source_mix_reader,
     });
     let output = match device {
         Some(name) => {
@@ -652,6 +765,7 @@ fn start_audio<P: BlockProcessor + Send + 'static>(
     _processor: P,
     _config: EngineConfig,
     _signals: Vec<Vec<f32>>,
+    _source_mix_reader: SnapshotReader<SourceMix>,
     _device: Option<&str>,
 ) -> AudioState {
     AudioState::Unavailable("binary was built without the live-output feature".into())
@@ -930,6 +1044,90 @@ fn scale(vector: EnuVector3, amount: f32) -> EnuVector3 {
     )
 }
 
+#[derive(Clone, Debug)]
+struct SourceTrajectory {
+    waypoints: Vec<EnuVector3>,
+    segment_lengths_m: Vec<f32>,
+    cycle_length_m: f32,
+    speed_mps: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SourceTrajectorySample {
+    position: EnuVector3,
+    direction: EnuVector3,
+}
+
+impl SourceTrajectory {
+    fn from_fixture(trajectory: &Trajectory) -> Result<Self, String> {
+        let waypoints = trajectory
+            .waypoints_m
+            .iter()
+            .copied()
+            .map(to_enu)
+            .collect::<Vec<_>>();
+        // Source paths are cyclic: after the final waypoint they travel along
+        // the closing segment back to the first waypoint and repeat.
+        let segment_lengths_m = (0..waypoints.len())
+            .map(|index| {
+                vector_length(subtract(
+                    waypoints[(index + 1) % waypoints.len()],
+                    waypoints[index],
+                ))
+            })
+            .collect::<Vec<_>>();
+        let cycle_length_m: f32 = segment_lengths_m.iter().sum();
+        if !cycle_length_m.is_finite() || cycle_length_m <= 0.0 {
+            return Err("source trajectory must contain a non-zero segment".into());
+        }
+        Ok(Self {
+            waypoints,
+            segment_lengths_m,
+            cycle_length_m,
+            speed_mps: trajectory.speed_mps as f32,
+        })
+    }
+
+    fn sample_at_block(&self, elapsed_blocks: u64) -> SourceTrajectorySample {
+        let elapsed_seconds =
+            elapsed_blocks as f64 * f64::from(BLOCK_SIZE) / f64::from(SAMPLE_RATE);
+        let mut distance_m = (elapsed_seconds * f64::from(self.speed_mps))
+            .rem_euclid(f64::from(self.cycle_length_m)) as f32;
+        for (index, segment_length_m) in self.segment_lengths_m.iter().copied().enumerate() {
+            if segment_length_m == 0.0 {
+                continue;
+            }
+            if distance_m < segment_length_m {
+                let start = self.waypoints[index];
+                let delta = subtract(self.waypoints[(index + 1) % self.waypoints.len()], start);
+                let direction = scale(delta, 1.0 / segment_length_m);
+                return SourceTrajectorySample {
+                    position: add(start, scale(delta, distance_m / segment_length_m)),
+                    direction,
+                };
+            }
+            distance_m -= segment_length_m;
+        }
+        SourceTrajectorySample {
+            position: self.waypoints[0],
+            direction: EnuVector3::default(),
+        }
+    }
+}
+
+fn subtract(left: EnuVector3, right: EnuVector3) -> EnuVector3 {
+    EnuVector3::new(
+        left.east_m - right.east_m,
+        left.north_m - right.north_m,
+        left.up_m - right.up_m,
+    )
+}
+
+fn vector_length(vector: EnuVector3) -> f32 {
+    (vector.east_m * vector.east_m + vector.north_m * vector.north_m + vector.up_m * vector.up_m)
+        .sqrt()
+}
+
 fn to_enu(value: [f64; 3]) -> EnuVector3 {
     EnuVector3::new(value[0] as f32, value[1] as f32, value[2] as f32)
 }
@@ -1004,12 +1202,14 @@ mod tests {
         };
         let (_gain_writer, gain_reader) = SnapshotPublication::new(0.0);
         let (meter_writer, _meter_reader) = SnapshotPublication::new(MeterReading::SILENT);
+        let (audio_block_writer, _audio_block_reader) = SnapshotPublication::new(0_u64);
         let mut late = LateBoundProcessor::new(
             processor,
             reader,
             gain_reader,
             meter_writer,
             MeterAccumulator::new(48_000, 1, 0.5),
+            audio_block_writer,
         );
         let mut left = [0.0];
         let mut right = [0.0];
@@ -1053,6 +1253,42 @@ mod tests {
         apply_output_gain(&mut left, &mut right, db_to_linear(40.0));
         assert_eq!(left, [1.0, -1.0, 0.0]);
         assert_eq!(right, [1.0, -1.0, 0.1]);
+    }
+
+    #[test]
+    fn mute_and_solo_gain_matrix_is_source_local_and_mute_wins() {
+        let mut mix = SourceMix::ALL_AUDIBLE;
+        assert_eq!(&mix.gains(3)[..3], &[1.0, 1.0, 1.0]);
+
+        mix.muted[1] = true;
+        assert_eq!(&mix.gains(3)[..3], &[1.0, 0.0, 1.0]);
+
+        mix.soloed[2] = true;
+        assert_eq!(&mix.gains(3)[..3], &[0.0, 0.0, 1.0]);
+
+        mix.soloed[1] = true;
+        assert_eq!(&mix.gains(3)[..3], &[0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn source_trajectory_position_is_determined_by_elapsed_audio_blocks() {
+        let trajectory = SourceTrajectory::from_fixture(&Trajectory {
+            waypoints_m: vec![[0.0, 0.0, 1.5], [10.0, 0.0, 1.5], [10.0, 10.0, 1.5]],
+            speed_mps: 2.0,
+            max_speed_mps: Some(2.0),
+        })
+        .unwrap();
+
+        let after_one_second = trajectory.sample_at_block(375);
+        assert_eq!(after_one_second.position, EnuVector3::new(2.0, 0.0, 1.5));
+        assert_eq!(after_one_second.direction, EnuVector3::new(1.0, 0.0, 0.0));
+        let at_first_corner = trajectory.sample_at_block(1_875);
+        assert_eq!(at_first_corner.position, EnuVector3::new(10.0, 0.0, 1.5));
+        assert_eq!(at_first_corner.direction, EnuVector3::new(0.0, 1.0, 0.0));
+        assert_eq!(
+            trajectory.sample_at_block(375),
+            trajectory.sample_at_block(375)
+        );
     }
 
     #[test]

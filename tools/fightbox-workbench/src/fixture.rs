@@ -34,6 +34,8 @@ pub struct FixtureReferenceLevel {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Trajectory {
     pub waypoints_m: Vec<[f64; 3]>,
+    pub speed_mps: f64,
+    pub max_speed_mps: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -83,6 +85,12 @@ impl Fixture {
         fixture.initial_listener_position()?;
         for source in &fixture.sources {
             source.initial_position()?;
+            if let Some(trajectory) = &source.trajectory {
+                trajectory.validate(&format!("source {}", source.id))?;
+            }
+        }
+        if let Some(trajectory) = &fixture.listener.trajectory {
+            trajectory.validate("listener")?;
         }
         Ok(fixture)
     }
@@ -113,6 +121,41 @@ impl FixtureSource {
     pub fn initial_position(&self) -> Result<EnuVector3, String> {
         initial_position(self.position_m, self.trajectory.as_ref())
             .ok_or_else(|| format!("source {} requires a position or trajectory", self.id))
+    }
+}
+
+impl Trajectory {
+    fn validate(&self, owner: &str) -> Result<(), String> {
+        if self.waypoints_m.len() < 2 {
+            return Err(format!(
+                "{owner} trajectory requires at least two waypoints"
+            ));
+        }
+        if !self.speed_mps.is_finite()
+            || self.speed_mps <= 0.0
+            || !(self.speed_mps as f32).is_finite()
+        {
+            return Err(format!("{owner} trajectory speed_mps must be positive"));
+        }
+        if let Some(max_speed_mps) = self.max_speed_mps
+            && (!max_speed_mps.is_finite()
+                || max_speed_mps <= 0.0
+                || !(max_speed_mps as f32).is_finite()
+                || self.speed_mps > max_speed_mps)
+        {
+            return Err(format!(
+                "{owner} trajectory speed_mps must not exceed max_speed_mps"
+            ));
+        }
+        if self
+            .waypoints_m
+            .iter()
+            .flatten()
+            .any(|component| !component.is_finite() || !(*component as f32).is_finite())
+        {
+            return Err(format!("{owner} trajectory waypoints must be finite"));
+        }
+        Ok(())
     }
 }
 
@@ -285,6 +328,21 @@ mod tests {
         assert_eq!(
             fixture.sources[0].initial_position().unwrap(),
             EnuVector3::new(292.5, 292.5, 1.5)
+        );
+        assert_eq!(fixture.sources.len(), 3);
+        assert_eq!(fixture.sources[1].asset_id, "s7-siren");
+        assert_eq!(
+            fixture.sources[1].initial_position().unwrap(),
+            EnuVector3::new(245.0, 245.0, 1.5)
+        );
+        assert_eq!(
+            fixture.sources[1].trajectory.as_ref().unwrap().speed_mps,
+            8.0
+        );
+        assert_eq!(fixture.sources[2].asset_id, "s7-bell");
+        assert_eq!(
+            fixture.sources[2].initial_position().unwrap(),
+            EnuVector3::new(482.5, 292.5, 1.5)
         );
         let text = std::fs::read_to_string(fixture_path).unwrap();
         assert!(text.contains("4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843"));

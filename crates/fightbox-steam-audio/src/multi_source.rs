@@ -11,13 +11,16 @@ use crate::backend_snapshot::{
     SteamDirectParams, SteamPropagationSnapshot, SteamReflectionParams, SteamSourcePropagation,
     WORLD_GENERATION, api_enu_to_steam, fixed_path_sh, path_coefficient_count,
 };
-use crate::motion_smoothing::{PROPAGATION_SLEW_TIME_SECONDS, SourcePropagationSmoother};
+use crate::motion_smoothing::{
+    PROPAGATION_SLEW_TIME_SECONDS, SourcePropagationSmoother, maximum_propagation_delay_samples,
+    propagation_delay_samples,
+};
 use fightbox_api::{EnuVector3 as ApiEnuVector3, Pose};
-use fightbox_runtime::SnapshotPublication;
 use fightbox_runtime::backend::{
     BackendRenderError, BackendSourceBlock, ListenerOrientation, MAX_ACTIVE_SOURCES,
     PropagationRenderBlock, SimulationError, SimulationUpdate,
 };
+use fightbox_runtime::{FractionalDelayLine, SnapshotPublication};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -397,7 +400,8 @@ fn source_inputs(
         directFlags: ffi::IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION
             | ffi::IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION
             | ffi::IPL_DIRECTSIMULATIONFLAGS_DIRECTIVITY
-            | ffi::IPL_DIRECTSIMULATIONFLAGS_OCCLUSION,
+            | ffi::IPL_DIRECTSIMULATIONFLAGS_OCCLUSION
+            | ffi::IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION,
         source: coordinate_space(source)?,
         distanceAttenuationModel: default_distance_model(),
         airAbsorptionModel: default_air_absorption_model(),
@@ -506,6 +510,12 @@ struct SourceRenderState {
     path_stereo: OwnedAudioBuffer,
     reflection_scratch: OwnedAudioBuffer,
     propagation_smoother: SourcePropagationSmoother,
+    propagation_delay: FractionalDelayLine,
+    applied_delay_samples: f32,
+    delay_initialized: bool,
+    rendered_since_reset: bool,
+    guard_reactivation_history: bool,
+    reactivation_epoch_samples: usize,
 }
 
 pub(crate) struct MultiSourceRenderGraph {
@@ -552,13 +562,20 @@ impl MultiSourceRenderGraph {
         if snapshot.world_generation != WORLD_GENERATION {
             return Err(BackendRenderError::InactiveGraph);
         }
+        for (index, state) in self.sources.iter_mut().enumerate() {
+            if !snapshot.sources[index].active {
+                state.propagation_smoother.reset();
+                if state.rendered_since_reset {
+                    state.guard_reactivation_history = true;
+                }
+                state.delay_initialized = false;
+                state.reactivation_epoch_samples = 0;
+            }
+        }
 
         for source_block in block.sources {
             let propagation = snapshot.sources[source_block.source_index];
             if !propagation.active {
-                self.sources[source_block.source_index]
-                    .propagation_smoother
-                    .reset();
                 continue;
             }
             self.render_source(
@@ -583,7 +600,6 @@ impl MultiSourceRenderGraph {
         output_left: &mut [f32],
         output_right: &mut [f32],
     ) {
-        self.mono_work.copy_from_slice(source_block.input_mono);
         let state = &mut self.sources[source_block.source_index];
         let smoothed = state
             .propagation_smoother
@@ -593,6 +609,48 @@ impl MultiSourceRenderGraph {
                 self.propagation_block_retention,
             )
             .endpoint();
+        let delay_target_samples = propagation_delay_samples(
+            smoothed.source_position,
+            smoothed.listener_position,
+            self.audio.sample_rate_hz,
+        );
+        if !state.delay_initialized {
+            // First observation and reactivation adopt the complete target
+            // immediately. This avoids an artificial zero-delay attack ramp;
+            // normal motion is linearly traversed over each subsequent block.
+            state.applied_delay_samples = delay_target_samples;
+            state.delay_initialized = true;
+        }
+        let delay_step =
+            (delay_target_samples - state.applied_delay_samples) / self.audio.frame_size as f32;
+        let mut delay_samples = state.applied_delay_samples;
+        for (frame, input) in source_block.input_mono.iter().copied().enumerate() {
+            if frame + 1 == source_block.input_mono.len() {
+                delay_samples = delay_target_samples;
+            } else {
+                delay_samples += delay_step;
+            }
+            state
+                .propagation_delay
+                .set_target_delay_samples(delay_samples);
+            let delayed = state.propagation_delay.process_sample(input);
+            if state.guard_reactivation_history {
+                state.reactivation_epoch_samples =
+                    state.reactivation_epoch_samples.saturating_add(1);
+                if state.reactivation_epoch_samples as f32
+                    <= state.propagation_delay.current_delay_samples().ceil() + 2.0
+                {
+                    self.mono_work[frame] = 0.0;
+                } else {
+                    state.guard_reactivation_history = false;
+                    self.mono_work[frame] = delayed;
+                }
+            } else {
+                self.mono_work[frame] = delayed;
+            }
+        }
+        state.applied_delay_samples = delay_target_samples;
+        state.rendered_since_reset = true;
         state.input.write_mono(&mut self.mono_work);
 
         let mut input = state.input.raw();
@@ -604,7 +662,8 @@ impl MultiSourceRenderGraph {
             flags: ffi::IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION
                 | ffi::IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION
                 | ffi::IPL_DIRECTEFFECTFLAGS_APPLYDIRECTIVITY
-                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION,
+                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION
+                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION,
             transmissionType: ffi::IPL_TRANSMISSIONTYPE_FREQDEPENDENT,
             distanceAttenuation: smoothed.direct.distance_attenuation,
             airAbsorption: smoothed.direct.air_absorption,
@@ -1065,7 +1124,7 @@ fn create_render_graph(
     world: Arc<WorldGeneration>,
     audio: AudioConfig,
     config: S3SimulationConfig,
-    publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
+    mut publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
 ) -> Result<MultiSourceRenderGraph, BackendError> {
     let context = world.context();
     let mut audio_settings = raw_audio_settings(audio);
@@ -1119,8 +1178,15 @@ fn create_render_graph(
         ),
     )?;
 
+    let initial_snapshot = publication.read();
+    let maximum_delay_samples = maximum_propagation_delay_samples(audio.sample_rate_hz);
     let mut source_states = Vec::with_capacity(world.source_count);
-    for _ in 0..world.source_count {
+    for index in 0..world.source_count {
+        let initial_delay_samples = propagation_delay_samples(
+            initial_snapshot.sources[index].source_position,
+            initial_snapshot.listener_position,
+            audio.sample_rate_hz,
+        );
         source_states.push(create_source_render_state(
             context,
             &mut audio_settings,
@@ -1128,6 +1194,8 @@ fn create_render_graph(
             config,
             ir_size,
             channels,
+            maximum_delay_samples,
+            initial_delay_samples,
         )?);
     }
     Ok(MultiSourceRenderGraph {
@@ -1156,6 +1224,8 @@ fn create_source_render_state(
     config: S3SimulationConfig,
     ir_size: i32,
     channels: i32,
+    maximum_delay_samples: usize,
+    initial_delay_samples: f32,
 ) -> Result<SourceRenderState, BackendError> {
     let mut direct_settings = ffi::IPLDirectEffectSettings { numChannels: 1 };
     let mut direct = core::ptr::null_mut();
@@ -1219,13 +1289,28 @@ fn create_source_render_state(
             audio_settings.frameSize,
         )?,
         propagation_smoother: SourcePropagationSmoother::default(),
+        // The 2,048 m physical cap is converted at the graph's sample rate.
+        // Setting the per-sample bound to the full capacity lets the backend
+        // prescribe an exact intra-block ramp without reconstructing the line.
+        propagation_delay: FractionalDelayLine::new(
+            maximum_delay_samples,
+            initial_delay_samples,
+            maximum_delay_samples as f32,
+        ),
+        applied_delay_samples: initial_delay_samples,
+        delay_initialized: false,
+        rendered_since_reset: false,
+        guard_reactivation_history: false,
+        reactivation_epoch_samples: 0,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AcousticMaterial;
     use fightbox_runtime::backend::{BackendSourceBlock, SourceMotion};
+    use std::f32::consts::TAU;
 
     fn test_config() -> S3SimulationConfig {
         S3SimulationConfig {
@@ -1258,6 +1343,358 @@ mod tests {
             },
             sources,
         }
+    }
+
+    fn one_source_update(
+        active: bool,
+        source_position: ApiEnuVector3,
+        listener_position: ApiEnuVector3,
+    ) -> SimulationUpdate {
+        let mut sources = [SourceMotion::default(); MAX_ACTIVE_SOURCES];
+        sources[0] = SourceMotion {
+            active,
+            pose: default_api_pose(source_position),
+            linear_velocity_mps: ApiEnuVector3::default(),
+        };
+        SimulationUpdate {
+            listener: fightbox_api::ListenerState {
+                pose: default_api_pose(listener_position),
+                linear_velocity_mps: ApiEnuVector3::default(),
+            },
+            sources,
+        }
+    }
+
+    fn render_one_source_block(
+        render: &mut MultiSourceRenderGraph,
+        input: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let source = [BackendSourceBlock {
+            source_index: 0,
+            input_mono: input,
+        }];
+        let mut left = vec![0.0; input.len()];
+        let mut right = vec![0.0; input.len()];
+        render
+            .render_block(PropagationRenderBlock {
+                listener_orientation: ListenerOrientation {
+                    forward: ApiEnuVector3::new(0.0, 1.0, 0.0),
+                    up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+                },
+                sources: &source,
+                output_left: &mut left,
+                output_right: &mut right,
+            })
+            .unwrap();
+        (left, right)
+    }
+
+    fn wall_mesh(wall: AcousticMaterial) -> SceneMesh {
+        SceneMesh {
+            vertices_enu_m: vec![
+                EnuVector3::new(-5.0, 0.0, 0.0),
+                EnuVector3::new(5.0, 0.0, 0.0),
+                EnuVector3::new(5.0, 0.0, 5.0),
+                EnuVector3::new(-5.0, 0.0, 5.0),
+                EnuVector3::new(-10.0, -10.0, 0.0),
+                EnuVector3::new(10.0, -10.0, 0.0),
+                EnuVector3::new(10.0, 10.0, 0.0),
+                EnuVector3::new(-10.0, 10.0, 0.0),
+            ],
+            triangles: vec![
+                [0, 1, 2],
+                [0, 2, 3],
+                [2, 1, 0],
+                [3, 2, 0],
+                [4, 5, 6],
+                [4, 6, 7],
+                [6, 5, 4],
+                [7, 6, 4],
+            ],
+            material_indices: vec![0, 0, 0, 0, 1, 1, 1, 1],
+            materials: vec![wall, AcousticMaterial::GROUND],
+        }
+    }
+
+    fn impulse_onset_at_distance(
+        mesh: &SceneMesh,
+        baked: &BakedProbeBatch,
+        distance_meters: f32,
+    ) -> usize {
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptor = [crate::MultiSourceDescriptor::at(ApiEnuVector3::new(
+            distance_meters,
+            0.0,
+            0.0,
+        ))];
+        let (_simulation, mut render) =
+            build_multi_source_session(mesh, baked, audio, test_config(), &descriptor).unwrap();
+        let mut dry = Vec::with_capacity(6_144);
+        for block in 0..48 {
+            let mut input = vec![0.0; audio.frame_size as usize];
+            if block == 0 {
+                input[0] = 1.0;
+            }
+            render_one_source_block(&mut render, &input);
+            dry.extend_from_slice(&render.mono_work);
+        }
+        dry.iter()
+            .position(|sample| sample.abs() > 1.0e-7)
+            .expect("delayed impulse should emerge within the captured window")
+    }
+
+    fn doppler_capture(
+        mesh: &SceneMesh,
+        baked: &BakedProbeBatch,
+        initial_distance_meters: f32,
+        radial_speed_mps: f32,
+    ) -> Vec<f32> {
+        const WARMUP_BLOCKS: usize = 80;
+        const MOTION_LEAD_BLOCKS: usize = 48;
+        const CAPTURE_BLOCKS: usize = 96;
+        const TONE_HZ: f32 = 1_000.0;
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptor = [crate::MultiSourceDescriptor::at(ApiEnuVector3::new(
+            initial_distance_meters,
+            0.0,
+            0.0,
+        ))];
+        let (mut simulation, mut render) =
+            build_multi_source_session(mesh, baked, audio, test_config(), &descriptor).unwrap();
+        let mut captured = Vec::with_capacity(CAPTURE_BLOCKS * audio.frame_size as usize);
+        let mut global_frame = 0_usize;
+
+        for block in 0..(WARMUP_BLOCKS + MOTION_LEAD_BLOCKS + CAPTURE_BLOCKS) {
+            let motion_block = block.saturating_sub(WARMUP_BLOCKS);
+            let elapsed =
+                motion_block as f32 * audio.frame_size as f32 / audio.sample_rate_hz as f32;
+            let distance = initial_distance_meters + radial_speed_mps * elapsed;
+            let mut snapshot = simulation.snapshot;
+            snapshot.sequence = snapshot.sequence.wrapping_add(1);
+            snapshot.sources[0].source_position = SteamVector3::new(distance, 0.0, 0.0);
+            simulation.publication.publish(snapshot);
+
+            let input = (0..audio.frame_size)
+                .map(|_| {
+                    let sample =
+                        (TAU * TONE_HZ * global_frame as f32 / audio.sample_rate_hz as f32).sin();
+                    global_frame += 1;
+                    sample
+                })
+                .collect::<Vec<_>>();
+            render_one_source_block(&mut render, &input);
+            if block >= WARMUP_BLOCKS + MOTION_LEAD_BLOCKS {
+                captured.extend_from_slice(&render.mono_work);
+            }
+        }
+        captured
+    }
+
+    fn dominant_bin(samples: &[f32], sample_rate_hz: f32, low_hz: f32, high_hz: f32) -> usize {
+        let first = (low_hz * samples.len() as f32 / sample_rate_hz).floor() as usize;
+        let last = (high_hz * samples.len() as f32 / sample_rate_hz).ceil() as usize;
+        (first..=last)
+            .max_by(|left, right| {
+                let power = |bin: usize| {
+                    let radians_per_sample = TAU * bin as f32 / samples.len() as f32;
+                    let (real, imaginary) = samples.iter().copied().enumerate().fold(
+                        (0.0_f64, 0.0_f64),
+                        |(real, imaginary), (frame, sample)| {
+                            let phase = radians_per_sample * frame as f32;
+                            (
+                                real + f64::from(sample * phase.cos()),
+                                imaginary - f64::from(sample * phase.sin()),
+                            )
+                        },
+                    );
+                    real * real + imaginary * imaginary
+                };
+                power(*left).total_cmp(&power(*right))
+            })
+            .unwrap()
+    }
+
+    fn transmission_wall_rms(
+        mesh: &SceneMesh,
+        baked: &BakedProbeBatch,
+    ) -> (f32, SteamDirectParams) {
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let source_position = ApiEnuVector3::new(0.0, 2.0, 1.5);
+        let listener_position = ApiEnuVector3::new(0.0, -2.0, 1.5);
+        let descriptor = [crate::MultiSourceDescriptor::at(source_position)];
+        let (mut simulation, mut render) =
+            build_multi_source_session(mesh, baked, audio, test_config(), &descriptor).unwrap();
+        simulation.update_inputs(&one_source_update(true, source_position, listener_position));
+        simulation.run_direct().unwrap();
+        let direct = simulation.snapshot.sources[0].direct;
+        let mut energy = 0.0_f64;
+        let mut measured = 0_usize;
+        let mut global_frame = 0_usize;
+        let mut direct_interleaved = vec![0.0; audio.frame_size as usize * 2];
+        for block in 0..20 {
+            let input = (0..audio.frame_size)
+                .map(|_| {
+                    let sample = (TAU * 800.0 * global_frame as f32 / audio.sample_rate_hz as f32)
+                        .sin()
+                        * 0.25;
+                    global_frame += 1;
+                    sample
+                })
+                .collect::<Vec<_>>();
+            render_one_source_block(&mut render, &input);
+            if block >= 10 {
+                render.sources[0]
+                    .direct_stereo
+                    .read_interleaved(&mut direct_interleaved);
+                for sample in direct_interleaved.iter().copied() {
+                    assert!(
+                        sample.is_finite(),
+                        "non-finite transmission output: {direct:?}"
+                    );
+                    energy += f64::from(sample * sample);
+                    measured += 1;
+                }
+            }
+        }
+        ((energy / measured as f64).sqrt() as f32, direct)
+    }
+
+    #[test]
+    fn linked_distance_delay_places_far_impulse_at_its_physical_onset() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+
+        let near_onset = impulse_onset_at_distance(&mesh, &baked, 1.0);
+        let far_onset = impulse_onset_at_distance(&mesh, &baked, 34.3);
+
+        assert!(
+            (4_798..=4_802).contains(&far_onset),
+            "far onset was {far_onset}"
+        );
+        let relative_latency = far_onset - near_onset;
+        assert!(
+            (4_657..=4_663).contains(&relative_latency),
+            "far-vs-near latency was {relative_latency} samples"
+        );
+    }
+
+    #[test]
+    fn linked_delay_slope_shifts_away_tone_below_approaching_tone() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let away = doppler_capture(&mesh, &baked, 20.0, 30.0);
+        let away_repeated = doppler_capture(&mesh, &baked, 20.0, 30.0);
+        let approaching = doppler_capture(&mesh, &baked, 50.0, -30.0);
+        assert_eq!(
+            away.iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>(),
+            away_repeated
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>(),
+            "identical delay trajectories must be byte-identical"
+        );
+        let away_bin = dominant_bin(&away, 48_000.0, 700.0, 1_300.0);
+        let approaching_bin = dominant_bin(&approaching, 48_000.0, 700.0, 1_300.0);
+
+        assert!(
+            away_bin + 8 < approaching_bin,
+            "away bin {away_bin} was not measurably below approaching bin {approaching_bin}"
+        );
+    }
+
+    #[test]
+    fn linked_reactivation_adopts_new_delay_without_leaking_old_history() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptor = [crate::MultiSourceDescriptor::at(ApiEnuVector3::new(
+            1.0, 0.0, 0.0,
+        ))];
+        let (mut simulation, mut render) =
+            build_multi_source_session(&mesh, &baked, audio, test_config(), &descriptor).unwrap();
+        let ones = vec![1.0; audio.frame_size as usize];
+        let zeros = vec![0.0; audio.frame_size as usize];
+        for _ in 0..4 {
+            render_one_source_block(&mut render, &ones);
+        }
+
+        let mut snapshot = simulation.snapshot;
+        snapshot.sequence = snapshot.sequence.wrapping_add(1);
+        snapshot.sources[0].active = false;
+        simulation.publication.publish(snapshot);
+        render_one_source_block(&mut render, &zeros);
+
+        snapshot.sequence = snapshot.sequence.wrapping_add(1);
+        snapshot.sources[0].active = true;
+        snapshot.sources[0].source_position = SteamVector3::new(2.0, 0.0, 0.0);
+        simulation.publication.publish(snapshot);
+        render_one_source_block(&mut render, &zeros);
+
+        let expected_delay = 2.0 * 48_000.0 / 343.0;
+        assert!(
+            (render.sources[0].propagation_delay.current_delay_samples() - expected_delay).abs()
+                < 0.001
+        );
+        assert!(
+            render.mono_work.iter().all(|sample| sample.to_bits() == 0),
+            "reactivation leaked pre-deactivation delay history"
+        );
+    }
+
+    #[test]
+    fn linked_glass_wall_transmits_where_concrete_wall_is_near_silent() {
+        let concrete_mesh = wall_mesh(AcousticMaterial::MASONRY);
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: concrete_mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let glass_mesh = wall_mesh(AcousticMaterial {
+            absorption: [0.06, 0.03, 0.02],
+            scattering: 0.05,
+            transmission: [0.8, 0.7, 0.6],
+        });
+
+        let (concrete_rms, concrete_direct) = transmission_wall_rms(&concrete_mesh, &baked);
+        let (glass_rms, glass_direct) = transmission_wall_rms(&glass_mesh, &baked);
+
+        assert!(concrete_direct.occlusion < 0.01, "{concrete_direct:?}");
+        assert!(glass_direct.occlusion < 0.01, "{glass_direct:?}");
+        assert!(
+            glass_direct.transmission.iter().any(|band| *band > 0.1),
+            "{glass_direct:?}"
+        );
+        assert!(glass_rms > 1.0e-6, "glass RMS was {glass_rms}");
+        assert!(
+            concrete_rms < glass_rms * 0.01,
+            "concrete RMS {concrete_rms} was not near-silent beside glass RMS {glass_rms}"
+        );
     }
 
     #[test]
@@ -1303,17 +1740,21 @@ mod tests {
         ];
         let mut left = vec![0.0; audio.frame_size as usize];
         let mut right = vec![0.0; audio.frame_size as usize];
-        render
-            .render_block(PropagationRenderBlock {
-                listener_orientation: ListenerOrientation {
-                    forward: ApiEnuVector3::new(0.0, 1.0, 0.0),
-                    up: ApiEnuVector3::new(0.0, 0.0, 1.0),
-                },
-                sources: &blocks,
-                output_left: &mut left,
-                output_right: &mut right,
-            })
-            .unwrap();
+        for _ in 0..8 {
+            left.fill(0.0);
+            right.fill(0.0);
+            render
+                .render_block(PropagationRenderBlock {
+                    listener_orientation: ListenerOrientation {
+                        forward: ApiEnuVector3::new(0.0, 1.0, 0.0),
+                        up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+                    },
+                    sources: &blocks,
+                    output_left: &mut left,
+                    output_right: &mut right,
+                })
+                .unwrap();
+        }
         assert!(left.iter().chain(&right).all(|sample| sample.is_finite()));
         assert!(
             left.iter()
@@ -1356,17 +1797,21 @@ mod tests {
             simulation.run_reflections().unwrap();
             let mut isolated_left = vec![0.0; audio.frame_size as usize];
             let mut isolated_right = vec![0.0; audio.frame_size as usize];
-            render
-                .render_block(PropagationRenderBlock {
-                    listener_orientation: ListenerOrientation {
-                        forward: ApiEnuVector3::new(0.0, 1.0, 0.0),
-                        up: ApiEnuVector3::new(0.0, 0.0, 1.0),
-                    },
-                    sources: &blocks,
-                    output_left: &mut isolated_left,
-                    output_right: &mut isolated_right,
-                })
-                .unwrap();
+            for _ in 0..8 {
+                isolated_left.fill(0.0);
+                isolated_right.fill(0.0);
+                render
+                    .render_block(PropagationRenderBlock {
+                        listener_orientation: ListenerOrientation {
+                            forward: ApiEnuVector3::new(0.0, 1.0, 0.0),
+                            up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+                        },
+                        sources: &blocks,
+                        output_left: &mut isolated_left,
+                        output_right: &mut isolated_right,
+                    })
+                    .unwrap();
+            }
             (isolated_left, isolated_right)
         };
         let (only_zero_left, only_zero_right) = render_isolated(true, false);
