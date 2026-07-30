@@ -23,6 +23,7 @@ const MOVING_SIMULATION_PERIOD_BLOCKS: usize = 5;
 
 pub struct ListeningFixture {
     pub id: String,
+    pub gate: String,
     pub mesh: SceneMesh,
     pub source: Source,
     pub listener: ListenerState,
@@ -116,7 +117,11 @@ impl ClosedCycle {
 
 pub fn parse_fixture(json: &str) -> ListeningFixture {
     let root: Value = serde_json::from_str(json).expect("fixture JSON parses");
-    assert_eq!(string(&root["gate"]), "S3");
+    let gate = string(&root["gate"]);
+    assert!(
+        matches!(gate, "S1" | "S2" | "S3"),
+        "listening fixture gate must be S1, S2, or S3"
+    );
 
     let geometry = &root["geometry"];
     let material_object = geometry["materials"]
@@ -219,6 +224,7 @@ pub fn parse_fixture(json: &str) -> ListeningFixture {
     let path_bake = &simulation_json["path_bake"];
     ListeningFixture {
         id: string(&root["fixture_id"]).to_owned(),
+        gate: gate.to_owned(),
         mesh,
         source,
         listener,
@@ -397,6 +403,28 @@ pub fn channel_energy_balance(interleaved: &[f32]) -> f32 {
                 )
             });
     ((left - right) / (left + right).max(f64::MIN_POSITIVE)) as f32
+}
+
+pub fn high_pass_rms(samples: &[f32], channels: usize, cutoff_hz: f32) -> f32 {
+    assert!(channels > 0);
+    assert_eq!(samples.len() % channels, 0);
+    assert!(cutoff_hz > 0.0 && cutoff_hz < SAMPLE_RATE as f32 * 0.5);
+    let dt = 1.0 / SAMPLE_RATE as f32;
+    let rc = 1.0 / (core::f32::consts::TAU * cutoff_hz);
+    let alpha = rc / (rc + dt);
+    let mut previous_input = vec![0.0_f32; channels];
+    let mut previous_output = vec![0.0_f32; channels];
+    let mut energy = 0.0_f64;
+    for frame in samples.chunks_exact(channels) {
+        for channel in 0..channels {
+            let output =
+                alpha * (previous_output[channel] + frame[channel] - previous_input[channel]);
+            previous_input[channel] = frame[channel];
+            previous_output[channel] = output;
+            energy += f64::from(output) * f64::from(output);
+        }
+    }
+    (energy / samples.len() as f64).sqrt() as f32
 }
 
 fn load_pinned_asset(asset_id: &str, required_frames: usize) -> Vec<f32> {
