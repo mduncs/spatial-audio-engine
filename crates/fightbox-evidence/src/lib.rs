@@ -2,15 +2,16 @@
 //!
 //! This crate owns decoded-asset analysis, capture/run manifests, the canonical
 //! PCM WAV encoding, deterministic Phase A signal generation, bounded metrics,
-//! content hashing, and the provisional S3 listening-record vocabulary. It
-//! holds no SDK handles and never infers an S0/S3 pass from configuration,
-//! probe count, a non-null pointer, or `order >= 0`.
+//! content hashing, provisional listening records, and human-completed ABX
+//! session evidence. It holds no SDK handles and never infers an S0/S3 pass
+//! from configuration, probe count, a non-null pointer, or `order >= 0`.
 //!
 //! Coordinates are the engine-wide right-handed local ENU frame owned by
 //! [`fightbox_api`]; this layer does not transform them.
 
 #![forbid(unsafe_code)]
 
+mod abx;
 mod analysis;
 pub mod ears;
 mod hash;
@@ -21,6 +22,10 @@ mod metrics;
 mod signal;
 mod wav;
 
+pub use abx::{
+    ABX_MIN_TRIALS, ABX_REQUIRES_HUMAN, ABX_SCHEMA_VERSION, AbxSessionRecord, AbxTrialRecord,
+    AbxValidationError,
+};
 pub use analysis::{
     ASSET_ANALYSIS_METHOD_ID, AnalyzedAsset, AssetAnalysisError, DecodedPcmProvenance,
     PcmChannelLayout, analyze_decoded_asset,

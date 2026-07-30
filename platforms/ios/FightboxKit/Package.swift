@@ -22,6 +22,7 @@ let package = Package(
             path: "Sources/FightboxKit",
             linkerSettings: [
                 .linkedFramework("CoreMotion"),
+                .linkedFramework("CoreLocation", .when(platforms: [.iOS])),
             ]
         ),
     ]

@@ -1,7 +1,8 @@
 # FightboxKit iOS integration skeleton
 
-FightboxKit contains the Swift ownership wrapper and a compile-ready Core Motion
-head-tracking sample. It deliberately does not provide an app, an
+FightboxKit contains the Swift ownership wrapper, a compile-ready Core Motion
+head-tracking sample, a foreground GPS/local-ENU provider, and a seeded ABX
+session-record scaffold. It deliberately does not provide an app, an
 `AVAudioEngine`/Core Audio unit, device deployment, or simulator audio.
 
 The minimum supported deployment target for this package is iOS 15.0. Steam
@@ -88,5 +89,15 @@ APIs, or session destruction from the audio callback.
 
 Drive `updateListener`, `updateSource`, and `telemetryJSON` from one serialized
 control queue. `CoreMotionHeadTracker` demonstrates listener orientation
-updates. Stop the audio unit and head tracker, join their queues, and only then
-release the final `FightboxSession` reference.
+updates. `GpsLocalEnuProvider` fixes its origin at the first fresh fix with no
+more than 20 m horizontal uncertainty and supplies the tracker's ENU position;
+it requests foreground when-in-use location only. The host app must include an
+`NSLocationWhenInUseUsageDescription` string.
+
+`AbxSession` creates deterministic, seeded A/B/X assignments and emits the
+`fightbox.abx.v1` evidence record. It does not play audio: the host presents its
+own A and B stimuli according to each trial plan and captures the listener's
+forced choice through the scaffold.
+
+Stop the audio unit, location provider, and head tracker, join their queues, and
+only then release the final `FightboxSession` reference.
