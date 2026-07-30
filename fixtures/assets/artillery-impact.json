@@ -1,0 +1,24 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "artillery-impact",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/music/artillery-impact-48k-mono.wav",
+      "sha256": "1376d8461ac1f30398a2184f6c3bb7da0c64085861707be9e2f2893313560f9b",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 12.0,
+  "target_rms_dbfs": -20.5,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The source recording is a ~6 s impact padded with silence to a 12 s loop; the loop period is a fixture convenience, not a ballistic claim."
+  ]
+}

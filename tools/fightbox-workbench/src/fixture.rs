@@ -22,8 +22,14 @@ pub struct FixtureSource {
     pub id: String,
     pub asset_id: String,
     pub reference_level: FixtureReferenceLevel,
+    #[serde(default = "default_enabled")]
+    pub default_enabled: bool,
     pub position_m: Option<[f64; 3]>,
     pub trajectory: Option<Trajectory>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -329,19 +335,28 @@ mod tests {
             fixture.sources[0].initial_position().unwrap(),
             EnuVector3::new(292.5, 292.5, 1.5)
         );
-        assert_eq!(fixture.sources.len(), 3);
-        assert_eq!(fixture.sources[1].asset_id, "s7-siren");
+        assert_eq!(fixture.sources.len(), 4);
+        assert!(fixture.sources[0].default_enabled);
+        assert_eq!(fixture.sources[1].asset_id, "artillery-impact");
+        assert!(!fixture.sources[1].default_enabled);
         assert_eq!(
             fixture.sources[1].initial_position().unwrap(),
+            EnuVector3::new(203.5, 298.5, 1.5)
+        );
+        assert_eq!(fixture.sources[2].asset_id, "ff-siren");
+        assert!(!fixture.sources[2].default_enabled);
+        assert_eq!(
+            fixture.sources[2].initial_position().unwrap(),
             EnuVector3::new(245.0, 245.0, 1.5)
         );
         assert_eq!(
-            fixture.sources[1].trajectory.as_ref().unwrap().speed_mps,
+            fixture.sources[2].trajectory.as_ref().unwrap().speed_mps,
             8.0
         );
-        assert_eq!(fixture.sources[2].asset_id, "s7-bell");
+        assert_eq!(fixture.sources[3].asset_id, "church-bells");
+        assert!(!fixture.sources[3].default_enabled);
         assert_eq!(
-            fixture.sources[2].initial_position().unwrap(),
+            fixture.sources[3].initial_position().unwrap(),
             EnuVector3::new(482.5, 292.5, 1.5)
         );
         let text = std::fs::read_to_string(fixture_path).unwrap();

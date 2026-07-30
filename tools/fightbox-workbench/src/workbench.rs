@@ -49,6 +49,7 @@ pub struct Workbench {
 struct SourceView {
     id: String,
     position: EnuVector3,
+    enabled: bool,
     muted: bool,
     soloed: bool,
     trajectory: Option<SourceTrajectory>,
@@ -56,22 +57,40 @@ struct SourceView {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceMix {
+    enabled: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
     muted: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
     soloed: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
 }
 
 impl SourceMix {
     const ALL_AUDIBLE: Self = Self {
+        enabled: [true; fightbox_runtime::MAX_ACTIVE_SOURCES],
         muted: [false; fightbox_runtime::MAX_ACTIVE_SOURCES],
         soloed: [false; fightbox_runtime::MAX_ACTIVE_SOURCES],
     };
 
+    fn from_sources(sources: &[SourceView]) -> Self {
+        let mut mix = Self::ALL_AUDIBLE;
+        for (index, source) in sources.iter().enumerate() {
+            mix.enabled[index] = source.enabled;
+            mix.muted[index] = source.muted;
+            mix.soloed[index] = source.soloed;
+        }
+        mix
+    }
+
     #[cfg(any(feature = "live-output", test))]
     fn gains(self, source_count: usize) -> [f32; fightbox_runtime::MAX_ACTIVE_SOURCES] {
-        let any_soloed = self.soloed[..source_count].iter().any(|soloed| *soloed);
+        let any_soloed = self.enabled[..source_count]
+            .iter()
+            .zip(&self.soloed[..source_count])
+            .any(|(enabled, soloed)| *enabled && *soloed);
         std::array::from_fn(|index| {
             f32::from(
-                index < source_count && !self.muted[index] && (!any_soloed || self.soloed[index]),
+                index < source_count
+                    && self.enabled[index]
+                    && !self.muted[index]
+                    && (!any_soloed || self.soloed[index]),
             )
         })
     }
@@ -140,6 +159,7 @@ impl Workbench {
             source_views.push(SourceView {
                 id: source.id.clone(),
                 position,
+                enabled: source.default_enabled,
                 muted: false,
                 soloed: false,
                 trajectory,
@@ -200,8 +220,8 @@ impl Workbench {
         let (listen_gain_writer, listen_gain_reader) =
             SnapshotPublication::new(DEFAULT_LISTEN_GAIN_DB);
         let (meter_writer, meter_reader) = SnapshotPublication::new(MeterReading::SILENT);
-        let (source_mix_writer, source_mix_reader) =
-            SnapshotPublication::new(SourceMix::ALL_AUDIBLE);
+        let initial_source_mix = SourceMix::from_sources(&source_views);
+        let (source_mix_writer, source_mix_reader) = SnapshotPublication::new(initial_source_mix);
         let (audio_block_writer, audio_block_reader) = SnapshotPublication::new(0_u64);
         let processor = LateBoundProcessor::new(
             graph,
@@ -414,6 +434,13 @@ impl Workbench {
         for source in &mut self.sources {
             ui.horizontal(|ui| {
                 if ui
+                    .checkbox(&mut source.enabled, "")
+                    .on_hover_text("Enable this source")
+                    .changed()
+                {
+                    source_mix_changed = true;
+                }
+                if ui
                     .selectable_label(source.muted, "M")
                     .on_hover_text("Mute this source")
                     .clicked()
@@ -433,12 +460,8 @@ impl Workbench {
             });
         }
         if source_mix_changed {
-            let mut mix = SourceMix::ALL_AUDIBLE;
-            for (index, source) in self.sources.iter().enumerate() {
-                mix.muted[index] = source.muted;
-                mix.soloed[index] = source.soloed;
-            }
-            self.source_mix_writer.publish(mix);
+            self.source_mix_writer
+                .publish(SourceMix::from_sources(&self.sources));
         }
         ui.separator();
         ui.heading("Autopilot");
@@ -1256,18 +1279,32 @@ mod tests {
     }
 
     #[test]
-    fn mute_and_solo_gain_matrix_is_source_local_and_mute_wins() {
+    fn enable_mute_and_solo_gain_matrix_is_source_local_and_silence_wins() {
         let mut mix = SourceMix::ALL_AUDIBLE;
         assert_eq!(&mix.gains(3)[..3], &[1.0, 1.0, 1.0]);
 
+        mix.enabled[0] = false;
+        assert_eq!(&mix.gains(3)[..3], &[0.0, 1.0, 1.0]);
+
         mix.muted[1] = true;
-        assert_eq!(&mix.gains(3)[..3], &[1.0, 0.0, 1.0]);
+        assert_eq!(&mix.gains(3)[..3], &[0.0, 0.0, 1.0]);
 
         mix.soloed[2] = true;
         assert_eq!(&mix.gains(3)[..3], &[0.0, 0.0, 1.0]);
 
         mix.soloed[1] = true;
         assert_eq!(&mix.gains(3)[..3], &[0.0, 0.0, 1.0]);
+
+        mix.enabled[2] = false;
+        assert_eq!(&mix.gains(3)[..3], &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn disabled_solo_does_not_silence_enabled_sources() {
+        let mut mix = SourceMix::ALL_AUDIBLE;
+        mix.enabled[1] = false;
+        mix.soloed[1] = true;
+        assert_eq!(&mix.gains(3)[..3], &[1.0, 0.0, 1.0]);
     }
 
     #[test]

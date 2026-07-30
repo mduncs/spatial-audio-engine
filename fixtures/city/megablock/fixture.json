@@ -27,8 +27,23 @@
       ]
     },
     {
+      "id": "artillery-corner-nw-of-spawn",
+      "asset_id": "artillery-impact",
+      "default_enabled": false,
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 120
+      },
+      "position_m": [
+        203.5,
+        298.5,
+        1.5
+      ]
+    },
+    {
       "id": "siren-circling-center-block",
-      "asset_id": "s7-siren",
+      "asset_id": "ff-siren",
+      "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
         "db_spl": 85
@@ -46,7 +61,8 @@
     },
     {
       "id": "bell-two-blocks-east",
-      "asset_id": "s7-bell",
+      "asset_id": "church-bells",
+      "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
         "db_spl": 85
@@ -203,6 +219,7 @@
       "The source uses asset_id toms-diner, whose exact WAV reference is fixtures/assets/music/toms-diner-48k-mono.wav with sha256 4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843.",
       "The moving siren follows its four waypoints as a closed cycle at 8 m/s; after the last waypoint it traverses the closing segment back to the first.",
       "The static bell is two 95 m grid pitches east of the central Tom's Diner source.",
+      "The artillery source sits 1.5 m off the southwest corner of the building northeast of the listener spawn intersection, so rounding that corner flips its direct-path occlusion.",
       "The local metre coordinate frame is shared byte-for-byte in meaning by city synth, city compile, city render, and the workbench."
     ],
     "non_claims": [
