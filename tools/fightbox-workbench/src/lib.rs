@@ -1,4 +1,5 @@
 mod asset;
+mod capture;
 mod fixture;
 mod pose;
 mod workbench;

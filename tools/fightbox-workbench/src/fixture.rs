@@ -12,6 +12,8 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Fixture {
+    #[serde(default)]
+    pub fixture_id: Option<String>,
     pub sources: Vec<FixtureSource>,
     pub listener: FixtureListener,
     pub simulation: FixtureSimulation,

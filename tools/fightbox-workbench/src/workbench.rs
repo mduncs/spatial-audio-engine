@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
@@ -12,11 +13,20 @@ use fightbox_runtime::{
     SimulationCadences, SimulationWorker, SnapshotPublication, SnapshotReader, SnapshotWriter,
     SourcePropagation,
 };
-use fightbox_steam_audio::{AudioConfig, MultiSourceDescriptor, build_multi_source_session};
+use fightbox_steam_audio::{
+    AudioConfig, DirectOcclusionMode, MultiSourceDescriptor, S3SimulationConfig,
+    StageOutputGainControl, StageOutputGains, build_multi_source_session,
+};
 use fightbox_world::{AcousticMesh, read_package};
 
 use crate::LaunchArgs;
 use crate::asset::load_asset;
+use crate::capture::{
+    BakeProvenance, BrowserScan, CaptureBrowserEntry, CaptureController, CaptureDraft,
+    CaptureEndStats, CaptureEngineConfig, CaptureQualitySettings, CaptureSourceState, CaptureTap,
+    WorldPackageProvenance, default_capture_root, git_identity, json_string_field,
+    reveal_in_finder, scan_capture_bundles, sha256_file, utc_timestamp_now,
+};
 use crate::fixture::{Fixture, Trajectory, load_baked, scene_mesh};
 use crate::pose::{ListenerControl, PoseMailbox};
 
@@ -43,7 +53,15 @@ pub struct Workbench {
     listen_gain_writer: SnapshotWriter<f32>,
     meter_reader: SnapshotReader<MeterReading>,
     source_mix_writer: SnapshotWriter<SourceMix>,
+    stage_mix: StageMix,
+    stage_output_gain_control: StageOutputGainControl,
     audio_block_reader: SnapshotReader<u64>,
+    capture: CaptureController,
+    capture_state: CaptureUiState,
+    capture_static: CaptureStaticContext,
+    capture_entries: Vec<CaptureBrowserEntry>,
+    capture_warnings: Vec<String>,
+    capture_status: Option<String>,
     autopilot: Autopilot,
     startup_started: Instant,
     reflection_warmup_started: Instant,
@@ -53,11 +71,60 @@ pub struct Workbench {
 
 struct SourceView {
     id: String,
+    asset_id: String,
     position: EnuVector3,
     enabled: bool,
     muted: bool,
     soloed: bool,
     trajectory: Option<SourceTrajectory>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StageMix {
+    pub(crate) bypassed: [bool; 3],
+    pub(crate) soloed: [bool; 3],
+}
+
+impl StageMix {
+    pub(crate) const ALL_ENABLED: Self = Self {
+        bypassed: [false; 3],
+        soloed: [false; 3],
+    };
+
+    pub(crate) fn gains(self) -> StageOutputGains {
+        let any_soloed = self
+            .bypassed
+            .iter()
+            .zip(self.soloed)
+            .any(|(bypassed, soloed)| !*bypassed && soloed);
+        let enabled = std::array::from_fn::<_, 3, _>(|index| {
+            f32::from(!self.bypassed[index] && (!any_soloed || self.soloed[index]))
+        });
+        StageOutputGains {
+            direct: enabled[0],
+            pathing: enabled[1],
+            reflections: enabled[2],
+        }
+    }
+}
+
+enum CaptureUiState {
+    Idle,
+    Recording { bundle: PathBuf },
+    Stopping,
+    Finishing,
+}
+
+struct CaptureStaticContext {
+    fixture_id: String,
+    fixture_path: String,
+    fixture_content_sha256: String,
+    engine_commit: Option<String>,
+    engine_dirty: Option<bool>,
+    world_package: WorldPackageProvenance,
+    bake: BakeProvenance,
+    quality: CaptureQualitySettings,
+    engine_config: CaptureEngineConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +210,46 @@ impl Workbench {
         );
         let initial_listener = listener.listener_state(EnuVector3::default());
         let (pose_mailbox, pose_reader) = PoseMailbox::new(initial_listener);
+        let simulation_config = fixture.simulation_config();
+        let fixture_id = fixture.fixture_id.clone().unwrap_or_else(|| {
+            args.fixture
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workbench-fixture")
+                .to_owned()
+        });
+        let fixture_content_sha256 = sha256_file(&args.fixture)
+            .ok_or_else(|| format!("cannot hash fixture {}", args.fixture.display()))?;
+        let package_manifest_sha256 = sha256_file(&args.package.join("manifest.json"));
+        let bake_manifest_path = args.baked.join("city-bake-manifest.json");
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (engine_commit, engine_dirty) = git_identity(&repository);
+        let capture_static = CaptureStaticContext {
+            fixture_id,
+            fixture_path: args.fixture.display().to_string(),
+            fixture_content_sha256,
+            engine_commit,
+            engine_dirty,
+            world_package: WorldPackageProvenance {
+                path: args.package.display().to_string(),
+                package_manifest_sha256,
+                mesh_content_sha256: package.manifest.mesh_content_sha256.clone(),
+                materials_content_sha256: package.manifest.materials_content_sha256.clone(),
+            },
+            bake: BakeProvenance {
+                path: args.baked.display().to_string(),
+                identifier: json_string_field(&bake_manifest_path, "/schema_version"),
+                bake_manifest_sha256: sha256_file(&bake_manifest_path),
+                probe_batch_content_sha256: baked.metadata.content_sha256.clone(),
+            },
+            quality: capture_quality(simulation_config),
+            engine_config: CaptureEngineConfig {
+                sample_rate_hz: SAMPLE_RATE,
+                block_size_frames: BLOCK_SIZE,
+                speed_of_sound_mps: EngineConfig::default().speed_of_sound_mps,
+                max_active_sources: fixture.sources.len() as u8,
+            },
+        };
 
         let mut prepared_sources = Vec::with_capacity(fixture.sources.len());
         let mut source_motion = [SourceMotion::default(); fightbox_runtime::MAX_ACTIVE_SOURCES];
@@ -186,6 +293,7 @@ impl Workbench {
             };
             source_views.push(SourceView {
                 id: source.id.clone(),
+                asset_id: source.asset_id.clone(),
                 position,
                 enabled: source.default_enabled,
                 muted: false,
@@ -202,14 +310,17 @@ impl Workbench {
             frame_size: BLOCK_SIZE as i32,
         };
         let phase_started = Instant::now();
-        let (runner, backend) = build_multi_source_session(
+        let (runner, mut backend) = build_multi_source_session(
             &scene,
             &baked,
             audio_config,
-            fixture.simulation_config(),
+            simulation_config,
             &descriptors,
         )
         .map_err(|error| format!("cannot build Steam Audio session: {error}"))?;
+        let stage_output_gain_control = backend
+            .take_stage_output_gain_control()
+            .ok_or("Steam Audio render graph did not expose stage-gain control")?;
         eprintln!(
             "[startup] steam scene + simulator build: {} ms",
             phase_started.elapsed().as_millis()
@@ -266,6 +377,12 @@ impl Workbench {
         let initial_source_mix = SourceMix::from_sources(&source_views);
         let (source_mix_writer, source_mix_reader) = SnapshotPublication::new(initial_source_mix);
         let (audio_block_writer, audio_block_reader) = SnapshotPublication::new(0_u64);
+        let capture_root = default_capture_root()?;
+        let browser = scan_capture_bundles(&capture_root).unwrap_or_else(|error| BrowserScan {
+            entries: vec![],
+            warnings: vec![error],
+        });
+        let (capture, capture_tap) = CaptureController::new(capture_root);
         let processor = LateBoundProcessor::new(
             graph,
             pose_reader,
@@ -273,6 +390,7 @@ impl Workbench {
             meter_writer,
             MeterAccumulator::new(SAMPLE_RATE, BLOCK_SIZE, METER_WINDOW_SECONDS),
             audio_block_writer,
+            Some(capture_tap),
         );
         let signals = prepared_sources
             .into_iter()
@@ -312,7 +430,15 @@ impl Workbench {
             listen_gain_writer,
             meter_reader,
             source_mix_writer,
+            stage_mix: StageMix::ALL_ENABLED,
+            stage_output_gain_control,
             audio_block_reader,
+            capture,
+            capture_state: CaptureUiState::Idle,
+            capture_static,
+            capture_entries: browser.entries,
+            capture_warnings: browser.warnings,
+            capture_status: None,
             autopilot,
             startup_started,
             reflection_warmup_started,
@@ -455,6 +581,191 @@ impl Workbench {
         );
     }
 
+    fn capture_draft(&self) -> CaptureDraft {
+        CaptureDraft {
+            started_utc: utc_timestamp_now(),
+            fixture_id: self.capture_static.fixture_id.clone(),
+            fixture_path: self.capture_static.fixture_path.clone(),
+            fixture_content_sha256: self.capture_static.fixture_content_sha256.clone(),
+            engine_commit: self.capture_static.engine_commit.clone(),
+            engine_dirty: self.capture_static.engine_dirty,
+            world_package: self.capture_static.world_package.clone(),
+            bake: self.capture_static.bake.clone(),
+            sources: self
+                .sources
+                .iter()
+                .map(|source| CaptureSourceState {
+                    id: source.id.clone(),
+                    asset_id: source.asset_id.clone(),
+                    enabled: source.enabled,
+                    muted: source.muted,
+                    soloed: source.soloed,
+                })
+                .collect(),
+            stages: self.stage_mix.into(),
+            quality: self.capture_static.quality.clone(),
+            listen_gain_db: self.listen_gain_db,
+            engine_config: self.capture_static.engine_config,
+        }
+    }
+
+    fn capture_end_stats(&self) -> CaptureEndStats {
+        match &self.audio {
+            #[cfg(feature = "live-output")]
+            AudioState::Live(output) => {
+                let telemetry = output.telemetry();
+                CaptureEndStats {
+                    callback_count: telemetry.callback_count,
+                    window_p99_ms: telemetry.callback_timings.p99_ms,
+                    window_p99_9_ms: telemetry.callback_timings.p99_9_ms,
+                    run_p99_ms: telemetry.run_callback_timings.p99_ms,
+                    run_p99_9_ms: telemetry.run_callback_timings.p99_9_ms,
+                    deadline_misses: telemetry.deadline_misses,
+                    processing_errors: telemetry.processing_errors,
+                    stream_errors: telemetry.stream_errors,
+                    snapshot_stale: telemetry.faults.snapshot_stale,
+                    graph_deadline_miss: telemetry.faults.deadline_miss,
+                    backend_render_error: telemetry.faults.backend_render_error,
+                }
+            }
+            AudioState::Unavailable(_) => CaptureEndStats::default(),
+        }
+    }
+
+    fn update_capture_lifecycle(&mut self) {
+        if matches!(self.capture_state, CaptureUiState::Recording { .. })
+            && !self.capture.is_requested()
+        {
+            self.capture_state = CaptureUiState::Stopping;
+            if self.capture.was_auto_stopped() {
+                self.capture_status = Some("120 s limit reached; finalizing capture".into());
+            }
+        }
+        if matches!(self.capture_state, CaptureUiState::Stopping) && self.capture.ready_to_finish()
+        {
+            let stats = self.capture_end_stats();
+            match self.capture.finish(stats) {
+                Ok(()) => self.capture_state = CaptureUiState::Finishing,
+                Err(error) => {
+                    self.capture_state = CaptureUiState::Idle;
+                    self.capture_status = Some(error);
+                }
+            }
+        }
+        if let Some(completion) = self.capture.poll_completion() {
+            self.capture_state = CaptureUiState::Idle;
+            self.capture_status = Some(match completion.result {
+                Ok(()) => format!("Saved {}", completion.bundle.display()),
+                Err(error) => format!("Capture failed: {error}"),
+            });
+            self.refresh_capture_browser();
+        }
+    }
+
+    fn refresh_capture_browser(&mut self) {
+        match scan_capture_bundles(self.capture.root()) {
+            Ok(scan) => {
+                self.capture_entries = scan.entries;
+                self.capture_warnings = scan.warnings;
+            }
+            Err(error) => {
+                self.capture_entries.clear();
+                self.capture_warnings = vec![error];
+            }
+        }
+    }
+
+    fn capture_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Capture");
+        let audio_available = match &self.audio {
+            #[cfg(feature = "live-output")]
+            AudioState::Live(_) => true,
+            AudioState::Unavailable(_) => false,
+        };
+        let recording = matches!(self.capture_state, CaptureUiState::Recording { .. });
+        let idle = matches!(self.capture_state, CaptureUiState::Idle);
+        let button_label = if recording { "■ Stop" } else { "● Record" };
+        if ui
+            .add_enabled(
+                audio_available && (idle || recording),
+                egui::Button::new(button_label),
+            )
+            .clicked()
+        {
+            if recording {
+                self.capture.request_stop();
+                self.capture_state = CaptureUiState::Stopping;
+                self.capture_status = Some("Draining capture blocks…".into());
+            } else {
+                let draft = self.capture_draft();
+                match self.capture.start(draft) {
+                    Ok(bundle) => {
+                        self.capture_state = CaptureUiState::Recording { bundle };
+                        self.capture_status = None;
+                    }
+                    Err(error) => self.capture_status = Some(error),
+                }
+            }
+        }
+        match &self.capture_state {
+            CaptureUiState::Recording { bundle } => {
+                ui.monospace(format!(
+                    "REC {:6.1} / {} s",
+                    self.capture.elapsed_seconds(),
+                    crate::capture::MAX_CAPTURE_SECONDS
+                ));
+                ui.small(bundle.display().to_string());
+            }
+            CaptureUiState::Stopping => {
+                ui.monospace("stopping · draining writer queue");
+            }
+            CaptureUiState::Finishing => {
+                ui.monospace("writing manifest");
+            }
+            CaptureUiState::Idle => {}
+        }
+        if let Some(status) = &self.capture_status {
+            ui.small(status);
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.heading("Capture browser");
+            if ui.small_button("Refresh").clicked() {
+                self.refresh_capture_browser();
+            }
+        });
+        ui.small(self.capture.root().display().to_string());
+        let mut reveal = None;
+        for entry in &self.capture_entries {
+            ui.group(|ui| {
+                ui.monospace(&entry.timestamp);
+                ui.small(format!(
+                    "{:.1} s · {} · p99 {:.3} / p99.9 {:.3} ms · {} misses",
+                    entry.duration_seconds,
+                    entry.fixture_id,
+                    entry.run_p99_ms,
+                    entry.run_p99_9_ms,
+                    entry.deadline_misses
+                ));
+                if ui.small_button("Reveal in Finder").clicked() {
+                    reveal = Some(entry.bundle.join("capture.wav"));
+                }
+            });
+        }
+        if let Some(path) = reveal
+            && let Err(error) = reveal_in_finder(&path)
+        {
+            self.capture_status = Some(error);
+        }
+        if let Some(warning) = self.capture_warnings.first() {
+            ui.colored_label(
+                Color32::from_rgb(255, 172, 90),
+                format!("Skipped capture: {warning}"),
+            );
+        }
+    }
+
     fn perf_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Fightbox");
         ui.label("WASD walk · Shift sprint");
@@ -472,8 +783,10 @@ impl Workbench {
         ));
         ui.separator();
         ui.heading("Listen");
+        let mix_controls_enabled = matches!(self.capture_state, CaptureUiState::Idle);
         if ui
-            .add(
+            .add_enabled(
+                mix_controls_enabled,
                 egui::Slider::new(&mut self.listen_gain_db, 0.0..=70.0)
                     .suffix(" dB")
                     .text("makeup"),
@@ -489,36 +802,69 @@ impl Workbench {
         ui.heading("Sources");
         let mut source_mix_changed = false;
         for source in &mut self.sources {
-            ui.horizontal(|ui| {
-                if ui
-                    .checkbox(&mut source.enabled, "")
-                    .on_hover_text("Enable this source")
-                    .changed()
-                {
-                    source_mix_changed = true;
-                }
-                if ui
-                    .selectable_label(source.muted, "M")
-                    .on_hover_text("Mute this source")
-                    .clicked()
-                {
-                    source.muted = !source.muted;
-                    source_mix_changed = true;
-                }
-                if ui
-                    .selectable_label(source.soloed, "S")
-                    .on_hover_text("Solo this source")
-                    .clicked()
-                {
-                    source.soloed = !source.soloed;
-                    source_mix_changed = true;
-                }
-                ui.monospace(&source.id);
+            ui.add_enabled_ui(mix_controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut source.enabled, "")
+                        .on_hover_text("Enable this source")
+                        .changed()
+                    {
+                        source_mix_changed = true;
+                    }
+                    if ui
+                        .selectable_label(source.muted, "M")
+                        .on_hover_text("Mute this source")
+                        .clicked()
+                    {
+                        source.muted = !source.muted;
+                        source_mix_changed = true;
+                    }
+                    if ui
+                        .selectable_label(source.soloed, "S")
+                        .on_hover_text("Solo this source")
+                        .clicked()
+                    {
+                        source.soloed = !source.soloed;
+                        source_mix_changed = true;
+                    }
+                    ui.monospace(&source.id);
+                });
             });
         }
         if source_mix_changed {
             self.source_mix_writer
                 .publish(SourceMix::from_sources(&self.sources));
+        }
+        ui.separator();
+        ui.heading("Stages");
+        let mut stage_mix_changed = false;
+        for (index, label) in ["Direct", "Pathing", "Reflections"].into_iter().enumerate() {
+            ui.add_enabled_ui(mix_controls_enabled, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.stage_mix.bypassed[index], "B")
+                        .on_hover_text("Bypass this stage")
+                        .clicked()
+                    {
+                        self.stage_mix.bypassed[index] = !self.stage_mix.bypassed[index];
+                        stage_mix_changed = true;
+                    }
+                    if ui
+                        .selectable_label(self.stage_mix.soloed[index], "S")
+                        .on_hover_text("Solo this stage")
+                        .clicked()
+                    {
+                        self.stage_mix.soloed[index] = !self.stage_mix.soloed[index];
+                        stage_mix_changed = true;
+                    }
+                    ui.monospace(label);
+                });
+            });
+        }
+        if stage_mix_changed {
+            self.stage_output_gain_control
+                .publish(self.stage_mix.gains())
+                .expect("stage toggle gains are finite and non-negative");
         }
         ui.separator();
         ui.heading("Autopilot");
@@ -575,16 +921,21 @@ impl Workbench {
             simulation.pathing.failures,
             simulation.reflections.failures
         ));
+        ui.separator();
+        self.capture_panel(ui);
     }
 }
 
 impl eframe::App for Workbench {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_source_motion();
+        self.update_capture_lifecycle();
         egui::SidePanel::right("performance")
-            .resizable(false)
-            .default_width(270.0)
-            .show(ctx, |ui| self.perf_panel(ui));
+            .resizable(true)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.perf_panel(ui));
+            });
         let mut drag_delta_x = 0.0;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -656,6 +1007,7 @@ struct LateBoundProcessor<P> {
     meter_writer: SnapshotWriter<MeterReading>,
     meter: MeterAccumulator,
     audio_block_writer: SnapshotWriter<u64>,
+    capture_tap: Option<CaptureTap>,
     elapsed_blocks: u64,
 }
 
@@ -667,6 +1019,7 @@ impl<P> LateBoundProcessor<P> {
         meter_writer: SnapshotWriter<MeterReading>,
         meter: MeterAccumulator,
         audio_block_writer: SnapshotWriter<u64>,
+        capture_tap: Option<CaptureTap>,
     ) -> Self {
         Self {
             processor,
@@ -675,6 +1028,7 @@ impl<P> LateBoundProcessor<P> {
             meter_writer,
             meter,
             audio_block_writer,
+            capture_tap,
             elapsed_blocks: 0,
         }
     }
@@ -704,6 +1058,9 @@ impl<P: BlockProcessor + ListenerStateSink> BlockProcessor for LateBoundProcesso
         apply_output_gain(output_left, output_right, gain);
         let reading = self.meter.observe(output_left, output_right);
         self.meter_writer.publish(reading);
+        if let Some(capture_tap) = &self.capture_tap {
+            capture_tap.capture_block(output_left, output_right);
+        }
         self.elapsed_blocks = self.elapsed_blocks.saturating_add(1);
         self.audio_block_writer.publish(self.elapsed_blocks);
         Ok(())
@@ -721,6 +1078,30 @@ fn db_to_linear(db: f32) -> f32 {
 fn apply_output_gain(left: &mut [f32], right: &mut [f32], gain: f32) {
     for sample in left.iter_mut().chain(right) {
         *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+}
+
+fn capture_quality(config: S3SimulationConfig) -> CaptureQualitySettings {
+    let cadences = SimulationCadences::default();
+    CaptureQualitySettings {
+        direct_occlusion: match config.direct_occlusion {
+            DirectOcclusionMode::Raycast => "raycast".into(),
+            DirectOcclusionMode::Volumetric { .. } => "volumetric".into(),
+        },
+        max_occlusion_samples: config.max_occlusion_samples,
+        reflection_effect: format!("{:?}", config.reflection_effect.effect_type).to_lowercase(),
+        reflection_rays: config.reflection_rays,
+        reflection_bounces: config.reflection_bounces,
+        reflection_duration_s: config.reflection_duration_s,
+        reflection_order: config.reflection_order,
+        pathing_order: config.pathing_order,
+        validate_paths: config.validate_paths,
+        find_alternate_paths: config.find_alternate_paths,
+        direct_simulation_hz: cadences.direct_hz,
+        pathing_simulation_hz: cadences.pathing_hz,
+        reflections_simulation_hz: cadences.reflections_hz,
+        reflection_max_displacement_m: cadences.reflection_max_displacement_m,
+        reflection_max_hz: cadences.reflection_max_hz,
     }
 }
 
@@ -1308,6 +1689,7 @@ mod tests {
             meter_writer,
             MeterAccumulator::new(48_000, 1, 0.5),
             audio_block_writer,
+            None,
         );
         let mut left = [0.0];
         let mut right = [0.0];
@@ -1380,6 +1762,43 @@ mod tests {
         mix.enabled[1] = false;
         mix.soloed[1] = true;
         assert_eq!(&mix.gains(3)[..3], &[1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn stage_mix_all_on_bypass_and_solo_resolve_to_one_atomic_gain_snapshot() {
+        assert_eq!(StageMix::ALL_ENABLED.gains(), StageOutputGains::UNITY);
+
+        let mut mix = StageMix::ALL_ENABLED;
+        mix.bypassed[0] = true;
+        assert_eq!(
+            mix.gains(),
+            StageOutputGains {
+                direct: 0.0,
+                pathing: 1.0,
+                reflections: 1.0,
+            }
+        );
+
+        mix.soloed[2] = true;
+        assert_eq!(
+            mix.gains(),
+            StageOutputGains {
+                direct: 0.0,
+                pathing: 0.0,
+                reflections: 1.0,
+            }
+        );
+
+        mix.bypassed[2] = true;
+        assert_eq!(
+            mix.gains(),
+            StageOutputGains {
+                direct: 0.0,
+                pathing: 1.0,
+                reflections: 0.0,
+            },
+            "a bypassed solo must not silence the remaining audible stage"
+        );
     }
 
     #[test]

@@ -708,6 +708,54 @@ impl MultiSourceDescriptor {
     }
 }
 
+/// Output gains for the three independently rendered Steam Audio stages.
+///
+/// Unity preserves the existing summed-output behavior. A live diagnostic UI
+/// can publish a complete value through [`StageOutputGainControl`]; the render
+/// graph adopts one complete snapshot at the next block boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StageOutputGains {
+    pub direct: f32,
+    pub pathing: f32,
+    pub reflections: f32,
+}
+
+impl StageOutputGains {
+    pub const UNITY: Self = Self {
+        direct: 1.0,
+        pathing: 1.0,
+        reflections: 1.0,
+    };
+
+    fn is_valid(self) -> bool {
+        [self.direct, self.pathing, self.reflections]
+            .into_iter()
+            .all(|gain| gain.is_finite() && gain >= 0.0)
+    }
+}
+
+/// Producer handle for block-atomic stage output-gain snapshots.
+pub struct StageOutputGainControl {
+    writer: fightbox_runtime::SnapshotWriter<StageOutputGains>,
+}
+
+impl StageOutputGainControl {
+    /// Publishes all three stage gains as one immutable snapshot.
+    ///
+    /// Invalid (negative or non-finite) gains are rejected without changing the
+    /// active render snapshot.
+    pub fn publish(&mut self, gains: StageOutputGains) -> Result<(), InvalidStageOutputGains> {
+        if !gains.is_valid() {
+            return Err(InvalidStageOutputGains);
+        }
+        self.writer.publish(gains);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidStageOutputGains;
+
 /// Simulation half of a retained multi-source Steam Audio session.
 pub struct SteamAudioSimulationRunner {
     #[cfg(feature = "linked-sdk")]
@@ -720,8 +768,19 @@ pub struct SteamAudioSimulationRunner {
 pub struct SteamAudioRenderGraph {
     #[cfg(feature = "linked-sdk")]
     inner: linked::MultiSourceRenderGraph,
+    stage_output_gain_control: Option<StageOutputGainControl>,
     #[cfg(not(feature = "linked-sdk"))]
     _private: (),
+}
+
+impl SteamAudioRenderGraph {
+    /// Takes the unique producer handle for this graph's stage output gains.
+    ///
+    /// Existing callers need not use this accessor: all stages default to
+    /// unity, and taking the handle does not itself change any gain.
+    pub fn take_stage_output_gain_control(&mut self) -> Option<StageOutputGainControl> {
+        self.stage_output_gain_control.take()
+    }
 }
 
 impl fightbox_runtime::backend::SimulationRunner for SteamAudioSimulationRunner {
@@ -1372,11 +1431,19 @@ pub fn build_multi_source_session(
 ) -> Result<(SteamAudioSimulationRunner, SteamAudioRenderGraph), BackendError> {
     #[cfg(feature = "linked-sdk")]
     {
-        let (simulation, render) =
+        let (simulation, mut render) =
             linked::build_multi_source_session(mesh, baked, audio, simulation, sources)?;
+        let stage_output_gain_writer = render
+            .take_stage_output_gain_writer()
+            .expect("new render graph owns its stage-gain producer");
         Ok((
             SteamAudioSimulationRunner { inner: simulation },
-            SteamAudioRenderGraph { inner: render },
+            SteamAudioRenderGraph {
+                inner: render,
+                stage_output_gain_control: Some(StageOutputGainControl {
+                    writer: stage_output_gain_writer,
+                }),
+            },
         ))
     }
     #[cfg(not(feature = "linked-sdk"))]

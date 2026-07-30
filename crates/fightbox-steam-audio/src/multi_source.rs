@@ -7,6 +7,7 @@
 //! callback using this generation) have dropped.
 
 use super::*;
+use crate::StageOutputGains;
 use crate::backend_snapshot::{
     SteamDirectParams, SteamPropagationSnapshot, SteamReflectionParams, SteamSourcePropagation,
     WORLD_GENERATION, api_enu_to_steam, fixed_path_sh, path_coefficient_count,
@@ -530,6 +531,8 @@ pub(crate) struct MultiSourceRenderGraph {
     mono_work: Vec<f32>,
     stereo_work: Vec<f32>,
     publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
+    stage_output_gain_writer: Option<fightbox_runtime::SnapshotWriter<StageOutputGains>>,
+    stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
     propagation_block_retention: f32,
     // Must drop after every SDK effect and audio buffer. Keeping the world
     // last also keeps its context alive when the simulation half dropped first.
@@ -537,6 +540,12 @@ pub(crate) struct MultiSourceRenderGraph {
 }
 
 impl MultiSourceRenderGraph {
+    pub(crate) fn take_stage_output_gain_writer(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotWriter<StageOutputGains>> {
+        self.stage_output_gain_writer.take()
+    }
+
     pub(crate) fn render_block(
         &mut self,
         block: PropagationRenderBlock<'_>,
@@ -562,6 +571,7 @@ impl MultiSourceRenderGraph {
         if snapshot.world_generation != WORLD_GENERATION {
             return Err(BackendRenderError::InactiveGraph);
         }
+        let stage_output_gains = self.stage_output_gains.read();
         for (index, state) in self.sources.iter_mut().enumerate() {
             if !snapshot.sources[index].active {
                 state.propagation_smoother.reset();
@@ -585,9 +595,15 @@ impl MultiSourceRenderGraph {
                 snapshot.listener_position,
                 block.output_left,
                 block.output_right,
+                stage_output_gains,
             );
         }
-        self.render_reflection_mix(listener, block.output_left, block.output_right);
+        self.render_reflection_mix(
+            listener,
+            block.output_left,
+            block.output_right,
+            stage_output_gains.reflections,
+        );
         Ok(())
     }
 
@@ -599,6 +615,7 @@ impl MultiSourceRenderGraph {
         listener_position: SteamVector3,
         output_left: &mut [f32],
         output_right: &mut [f32],
+        stage_output_gains: StageOutputGains,
     ) {
         let state = &mut self.sources[source_block.source_index];
         let smoothed = state
@@ -695,7 +712,12 @@ impl MultiSourceRenderGraph {
             &mut direct_stereo,
         );
         state.direct_stereo.read_interleaved(&mut self.stereo_work);
-        accumulate_stereo(&self.stereo_work, output_left, output_right);
+        accumulate_stereo(
+            &self.stereo_work,
+            output_left,
+            output_right,
+            stage_output_gains.direct,
+        );
 
         // PathEffect likewise retains its EQ/SH parameter frame and
         // interpolates toward these one-pole endpoints within the block.
@@ -721,7 +743,12 @@ impl MultiSourceRenderGraph {
             &mut path_stereo,
         );
         state.path_stereo.read_interleaved(&mut self.stereo_work);
-        accumulate_stereo(&self.stereo_work, output_left, output_right);
+        accumulate_stereo(
+            &self.stereo_work,
+            output_left,
+            output_right,
+            stage_output_gains.pathing,
+        );
 
         let reflection = propagation.reflections;
         if reflection.ir != 0
@@ -744,6 +771,7 @@ impl MultiSourceRenderGraph {
         listener: SteamPose,
         output_left: &mut [f32],
         output_right: &mut [f32],
+        gain: f32,
     ) {
         let mut mixer_params = ffi::IPLReflectionEffectParams {
             type_: reflection_effect_ffi_type(self.config.reflection_effect.effect_type)
@@ -783,18 +811,32 @@ impl MultiSourceRenderGraph {
         );
         self.reflection_stereo
             .read_interleaved(&mut self.stereo_work);
-        accumulate_stereo(&self.stereo_work, output_left, output_right);
+        accumulate_stereo(&self.stereo_work, output_left, output_right, gain);
     }
 }
 
-fn accumulate_stereo(interleaved: &[f32], left: &mut [f32], right: &mut [f32]) {
+fn accumulate_stereo(interleaved: &[f32], left: &mut [f32], right: &mut [f32], gain: f32) {
+    if gain == 0.0 {
+        return;
+    }
+    if gain == 1.0 {
+        for ((frame, left), right) in interleaved
+            .chunks_exact(2)
+            .zip(left.iter_mut())
+            .zip(right.iter_mut())
+        {
+            *left += frame[0];
+            *right += frame[1];
+        }
+        return;
+    }
     for ((frame, left), right) in interleaved
         .chunks_exact(2)
         .zip(left.iter_mut())
         .zip(right.iter_mut())
     {
-        *left += frame[0];
-        *right += frame[1];
+        *left += frame[0] * gain;
+        *right += frame[1] * gain;
     }
 }
 
@@ -897,7 +939,16 @@ pub(crate) fn build_multi_source_session(
     let listener = SteamPose::from_api(default_api_pose(ApiEnuVector3::default()))
         .expect("canonical listener pose is valid");
     let (writer, reader) = SnapshotPublication::new(initial);
-    let render = create_render_graph(Arc::clone(&world), audio, config, reader)?;
+    let (stage_output_gain_writer, stage_output_gains) =
+        SnapshotPublication::new(StageOutputGains::UNITY);
+    let render = create_render_graph(
+        Arc::clone(&world),
+        audio,
+        config,
+        reader,
+        stage_output_gain_writer,
+        stage_output_gains,
+    )?;
     let simulation = MultiSourceSimulation {
         world,
         audio,
@@ -1125,6 +1176,8 @@ fn create_render_graph(
     audio: AudioConfig,
     config: S3SimulationConfig,
     mut publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
+    stage_output_gain_writer: fightbox_runtime::SnapshotWriter<StageOutputGains>,
+    stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
 ) -> Result<MultiSourceRenderGraph, BackendError> {
     let context = world.context();
     let mut audio_settings = raw_audio_settings(audio);
@@ -1211,6 +1264,8 @@ fn create_render_graph(
         mono_work: vec![0.0; audio.frame_size as usize],
         stereo_work: vec![0.0; audio.frame_size as usize * 2],
         publication,
+        stage_output_gain_writer: Some(stage_output_gain_writer),
+        stage_output_gains,
         propagation_block_retention: (-(audio.frame_size as f32 / audio.sample_rate_hz as f32)
             / PROPAGATION_SLEW_TIME_SECONDS)
             .exp(),
