@@ -348,7 +348,7 @@ mod tests {
         assert!(!fixture.sources[1].default_enabled);
         assert_eq!(
             fixture.sources[1].initial_position().unwrap(),
-            EnuVector3::new(7.5, 7.5, 1.5)
+            EnuVector3::new(102.5, 102.5, 1.5)
         );
         assert_eq!(fixture.sources[2].asset_id, "ff-siren");
         assert_eq!(fixture.sources[2].reference_level.db_spl, 118.0);
