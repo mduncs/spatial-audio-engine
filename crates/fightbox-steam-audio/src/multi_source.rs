@@ -20,6 +20,7 @@ use crate::motion_smoothing::{
     PROPAGATION_SLEW_TIME_SECONDS, SourcePropagationSmoother, maximum_propagation_delay_samples,
     propagation_delay_samples,
 };
+use crate::probe_influence::SerializedProbeInfluences;
 use crate::{MemoryTrackingStatus, QualityTier, SessionMemoryTelemetry};
 use fightbox_api::{EnuVector3 as ApiEnuVector3, Pose};
 use fightbox_runtime::backend::{
@@ -109,10 +110,11 @@ struct WorldGeneration {
     simulator: usize,
     sources: [usize; MAX_ACTIVE_SOURCES],
     source_count: usize,
+    probe_influences: Option<SerializedProbeInfluences>,
     // Steam Audio's serialized-object API accepts caller-owned bytes. Retain
     // them with the loaded generation so pathing never observes reclaimed
     // backing storage.
-    _serialized_bytes: Vec<u8>,
+    serialized_bytes: Vec<u8>,
 }
 
 impl WorldGeneration {
@@ -130,6 +132,11 @@ impl WorldGeneration {
 
     fn source(&self, index: usize) -> ffi::IPLSource {
         handle(self.sources[index])
+    }
+
+    fn has_influencing_probe(&self, position: SteamVector3) -> bool {
+        self.probe_influences
+            .is_some_and(|probes| probes.contains(&self.serialized_bytes, position))
     }
 }
 
@@ -185,6 +192,7 @@ pub(crate) struct MultiSourceSimulation {
     governor: QualityGovernor,
     reflection_cadence_tick: u64,
     last_pass_started_ns: [Option<u64>; 3],
+    last_direct_frame: Option<SimulationFrame>,
     started: Instant,
 }
 
@@ -374,6 +382,10 @@ impl MultiSourceSimulation {
         self.snapshot.simulated_at_ns =
             self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         self.snapshot.listener_position = self.frame.listener.position;
+        let listener_has_probe = flag == ffi::IPL_SIMULATIONFLAGS_PATHING
+            && self
+                .world
+                .has_influencing_probe(self.frame.listener.position);
 
         for index in 0..self.world.source_count {
             let source_snapshot = &mut self.snapshot.sources[index];
@@ -408,9 +420,41 @@ impl MultiSourceSimulation {
                     {
                         return Err(SimulationError::KernelFailure);
                     }
-                    source_snapshot.path_eq = outputs.pathing.eqCoeffs;
-                    source_snapshot.path_sh = fixed_path_sh(self.config.pathing_order, &copied)
-                        .map_err(|_| SimulationError::KernelFailure)?;
+                    // Steam Audio's path simulator returns without writing its
+                    // retained output when an occluded endpoint has no
+                    // influencing probe. The public result has no success bit,
+                    // so mirror that exact precondition from the serialized
+                    // probe spheres and replace the stale target with silence.
+                    //
+                    // A line-of-sight path is valid without probes. Only trust
+                    // raycast direct occlusion for this purpose when it was
+                    // simulated at the exact current endpoints. Volumetric
+                    // visibility does not expose the center ray used by
+                    // pathing, so it cannot prove this bypass.
+                    let direct_line_of_sight =
+                        matches!(self.config.direct_occlusion, DirectOcclusionMode::Raycast)
+                            && self.last_direct_frame.is_some_and(|direct_frame| {
+                                same_position(
+                                    direct_frame.listener.position,
+                                    self.frame.listener.position,
+                                ) && same_position(
+                                    direct_frame.sources[index].position,
+                                    self.frame.sources[index].position,
+                                ) && source_snapshot.direct.occlusion >= 1.0 - 1.0e-6
+                            });
+                    let endpoints_have_probes = listener_has_probe
+                        && self
+                            .world
+                            .has_influencing_probe(self.frame.sources[index].position);
+                    if direct_line_of_sight || endpoints_have_probes {
+                        source_snapshot.path_eq = outputs.pathing.eqCoeffs;
+                        source_snapshot.path_sh = fixed_path_sh(self.config.pathing_order, &copied)
+                            .map_err(|_| SimulationError::KernelFailure)?;
+                    } else {
+                        source_snapshot.path_eq = [1.0; 3];
+                        source_snapshot.path_sh =
+                            [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS];
+                    }
                     source_snapshot.configured_pathing_order = self.config.pathing_order as u8;
                 }
                 ffi::IPL_SIMULATIONFLAGS_REFLECTIONS => {
@@ -453,9 +497,18 @@ impl MultiSourceSimulation {
                 _ => return Err(SimulationError::KernelFailure),
             }
         }
+        if flag == ffi::IPL_SIMULATIONFLAGS_DIRECT {
+            self.last_direct_frame = Some(self.frame);
+        }
         self.publication.publish(self.snapshot);
         Ok(())
     }
+}
+
+fn same_position(left: SteamVector3, right: SteamVector3) -> bool {
+    left.x.to_bits() == right.x.to_bits()
+        && left.y.to_bits() == right.y.to_bits()
+        && left.z.to_bits() == right.z.to_bits()
 }
 
 fn direct_is_finite(direct: SteamDirectParams) -> bool {
@@ -1216,6 +1269,7 @@ pub(crate) fn build_multi_source_generation(
         governor,
         reflection_cadence_tick: 0,
         last_pass_started_ns: [None; 3],
+        last_direct_frame: None,
         started: Instant::now(),
     };
     Ok((simulation, render))
@@ -1362,6 +1416,12 @@ fn create_world(
     generation: u64,
     quality_tier: QualityTier,
 ) -> Result<WorldGeneration, BackendError> {
+    let probe_influences = baked
+        .map(|baked| {
+            SerializedProbeInfluences::parse(&baked.bytes, baked.metadata.probe_count)
+                .map_err(BackendError::InvalidProbeBatch)
+        })
+        .transpose()?;
     let mut context = core::ptr::null_mut();
     let mut context_settings = ffi::IPLContextSettings::pinned_defaults();
     sdk_status(
@@ -1382,7 +1442,8 @@ fn create_world(
         simulator: 0,
         sources: [0; MAX_ACTIVE_SOURCES],
         source_count: 0,
-        _serialized_bytes: baked.map_or_else(Vec::new, |baked| baked.bytes.clone()),
+        probe_influences,
+        serialized_bytes: baked.map_or_else(Vec::new, |baked| baked.bytes.clone()),
     };
 
     let result = (|| {
@@ -1445,8 +1506,8 @@ fn create_world(
         let mut probe_batch = core::ptr::null_mut();
         if world.has_baked_pathing {
             let mut serialized_settings = ffi::IPLSerializedObjectSettings {
-                data: world._serialized_bytes.as_mut_ptr(),
-                size: world._serialized_bytes.len(),
+                data: world.serialized_bytes.as_mut_ptr(),
+                size: world.serialized_bytes.len(),
             };
             let mut serialized = core::ptr::null_mut();
             sdk_status(
@@ -1749,6 +1810,10 @@ fn create_source_render_state(
         quality_gains: [1.0; 3],
     })
 }
+
+#[cfg(test)]
+#[path = "multi_source_teleport_tests.rs"]
+mod teleport_tests;
 
 #[cfg(test)]
 mod tests {

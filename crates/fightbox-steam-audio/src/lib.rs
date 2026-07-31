@@ -16,6 +16,8 @@ mod backend_snapshot;
 mod governor;
 #[cfg(any(feature = "linked-sdk", test))]
 mod motion_smoothing;
+#[cfg(any(feature = "linked-sdk", test))]
+mod probe_influence;
 mod status;
 #[allow(unsafe_code)]
 mod world_swap;
