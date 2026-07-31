@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -44,7 +43,7 @@ const PICTURE_IN_PICTURE_MARGIN: f32 = 14.0;
 
 pub struct Workbench {
     mesh: AcousticMesh,
-    edges: Vec<[usize; 2]>,
+    faces: Vec<MeshFace>,
     sources: Vec<SourceView>,
     listener: ListenerControl,
     pose_mailbox: PoseMailbox,
@@ -494,7 +493,7 @@ impl Workbench {
             phase_started.elapsed().as_millis()
         );
         let phase_started = Instant::now();
-        let edges = mesh_edges(&package.mesh);
+        let faces = mesh_faces(&package.mesh);
         let camera = Camera::for_mesh(&package.mesh);
         let autopilot = Autopilot::new(Bounds2::for_mesh(&package.mesh));
         let source_height_levels = SourceHeightLevels::for_mesh(&package.mesh);
@@ -504,7 +503,7 @@ impl Workbench {
         );
         Ok(Self {
             mesh: package.mesh,
-            edges,
+            faces,
             sources: source_views,
             listener,
             pose_mailbox,
@@ -619,13 +618,22 @@ impl Workbench {
     fn draw_scene(&self, painter: &egui::Painter, rect: Rect) {
         let painter = painter.with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(13, 18, 24));
-        for edge in &self.edges {
-            let a = self.mesh.vertices_enu_m[edge[0]];
-            let b = self.mesh.vertices_enu_m[edge[1]];
-            if let (Some(a), Some(b)) = (self.camera.project(a, rect), self.camera.project(b, rect))
-            {
-                painter.line_segment([a, b], Stroke::new(1.0, Color32::from_rgb(82, 109, 126)));
-            }
+        let mut faces = self
+            .faces
+            .iter()
+            .filter_map(|face| {
+                project_face(
+                    &self.mesh,
+                    *face,
+                    rect,
+                    |point| self.camera.camera_point(point),
+                    |point, rect| self.camera.screen_point(point, rect),
+                )
+            })
+            .collect::<Vec<_>>();
+        paint_faces(&painter, &mut faces);
+        for source in &self.sources {
+            self.draw_map_trajectory(&painter, rect, source);
         }
         for source in &self.sources {
             if let Some(point) = self.camera.project(source.position, rect) {
@@ -669,12 +677,22 @@ impl Workbench {
             FIRST_PERSON_VERTICAL_FOV_RADIANS,
             FIRST_PERSON_NEAR_M,
         );
-        for edge in &self.edges {
-            let a = self.mesh.vertices_enu_m[edge[0]];
-            let b = self.mesh.vertices_enu_m[edge[1]];
-            if let Some([a, b]) = projection.project_segment(a, b, rect) {
-                painter.line_segment([a, b], Stroke::new(1.0, Color32::from_rgb(76, 110, 130)));
-            }
+        let mut faces = self
+            .faces
+            .iter()
+            .filter_map(|face| {
+                project_face(
+                    &self.mesh,
+                    *face,
+                    rect,
+                    |point| projection.camera_point(point),
+                    |point, rect| projection.screen_point(point, rect),
+                )
+            })
+            .collect::<Vec<_>>();
+        paint_faces(&painter, &mut faces);
+        for source in &self.sources {
+            self.draw_first_person_trajectory(&painter, rect, projection, source);
         }
         for source in &self.sources {
             if let Some((point, distance)) = projection.project_point(source.position, rect) {
@@ -696,6 +714,35 @@ impl Workbench {
             egui::FontId::monospace(10.0),
             Color32::from_rgb(142, 173, 188),
         );
+    }
+
+    fn draw_map_trajectory(&self, painter: &egui::Painter, rect: Rect, source: &SourceView) {
+        let Some(trajectory) = &source.trajectory else {
+            return;
+        };
+        for [a, b] in trajectory_segments_at_height(trajectory, source.position.up_m) {
+            if let (Some(a), Some(b)) = (self.camera.project(a, rect), self.camera.project(b, rect))
+            {
+                painter.line_segment([a, b], Stroke::new(1.5, Color32::from_rgb(222, 143, 54)));
+            }
+        }
+    }
+
+    fn draw_first_person_trajectory(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        projection: FirstPersonProjection,
+        source: &SourceView,
+    ) {
+        let Some(trajectory) = &source.trajectory else {
+            return;
+        };
+        for [a, b] in trajectory_segments_at_height(trajectory, source.position.up_m) {
+            if let Some(points) = projection.project_segment(a, b, rect) {
+                painter.line_segment(points, Stroke::new(1.5, Color32::from_rgb(222, 143, 54)));
+            }
+        }
     }
 
     fn capture_draft(&self) -> CaptureDraft {
@@ -1506,23 +1553,146 @@ fn start_audio<P: BlockProcessor + Send + 'static>(
     AudioState::Unavailable("binary was built without the live-output feature".into())
 }
 
-fn mesh_edges(mesh: &AcousticMesh) -> Vec<[usize; 2]> {
-    let mut edges = BTreeSet::new();
-    for triangle in &mesh.triangles {
-        for [left, right] in [
-            [triangle[0], triangle[1]],
-            [triangle[1], triangle[2]],
-            [triangle[2], triangle[0]],
-        ] {
-            let edge = if left <= right {
-                [left as usize, right as usize]
-            } else {
-                [right as usize, left as usize]
-            };
-            edges.insert(edge);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MeshFace {
+    indices: [usize; 3],
+    normal: [f32; 3],
+    is_ground: bool,
+}
+
+fn mesh_faces(mesh: &AcousticMesh) -> Vec<MeshFace> {
+    let ground_height = mesh
+        .vertices_enu_m
+        .iter()
+        .map(|vertex| vertex.up_m)
+        .reduce(f32::min)
+        .unwrap_or_default();
+    mesh.triangles
+        .iter()
+        .map(|triangle| {
+            let indices = triangle.map(|index| index as usize);
+            let [a, b, c] = indices.map(|index| mesh.vertices_enu_m[index]);
+            let normal = normalize3(cross3(point3(b, a), point3(c, a)));
+            let is_ground = normal[2].abs() >= 0.95
+                && [a, b, c]
+                    .iter()
+                    .all(|vertex| (vertex.up_m - ground_height).abs() <= 1.0e-3);
+            MeshFace {
+                indices,
+                normal,
+                is_ground,
+            }
+        })
+        .collect()
+}
+
+struct ProjectedFace {
+    points: [Pos2; 4],
+    point_count: usize,
+    depth: f32,
+    fill: Color32,
+}
+
+fn project_face(
+    mesh: &AcousticMesh,
+    face: MeshFace,
+    rect: Rect,
+    camera_point: impl Fn(EnuVector3) -> [f32; 3],
+    screen_point: impl Fn([f32; 3], Rect) -> Pos2,
+) -> Option<ProjectedFace> {
+    let camera_points = face
+        .indices
+        .map(|index| camera_point(mesh.vertices_enu_m[index]));
+    let clipped = clip_polygon_to_near(&camera_points, FIRST_PERSON_NEAR_M);
+    if clipped.point_count < 3 {
+        return None;
+    }
+    let depth = polygon_depth(&clipped.points[..clipped.point_count]);
+    let mut points = [Pos2::ZERO; 4];
+    for (destination, point) in points
+        .iter_mut()
+        .zip(&clipped.points[..clipped.point_count])
+    {
+        *destination = screen_point(*point, rect);
+    }
+    Some(ProjectedFace {
+        points,
+        point_count: clipped.point_count,
+        depth,
+        fill: face_color(face),
+    })
+}
+
+fn paint_faces(painter: &egui::Painter, faces: &mut [ProjectedFace]) {
+    painter.add(egui::Shape::mesh(projected_faces_mesh(faces)));
+}
+
+fn projected_faces_mesh(faces: &mut [ProjectedFace]) -> egui::Mesh {
+    faces.sort_by(|left, right| right.depth.total_cmp(&left.depth));
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.reserve(faces.len() * 4);
+    mesh.indices.reserve(faces.len() * 6);
+    for face in faces {
+        let first = mesh.vertices.len() as u32;
+        for &point in &face.points[..face.point_count] {
+            mesh.colored_vertex(point, face.fill);
+        }
+        for index in 1..face.point_count - 1 {
+            mesh.add_triangle(first, first + index as u32, first + index as u32 + 1);
         }
     }
-    edges.into_iter().collect()
+    mesh
+}
+
+fn face_color(face: MeshFace) -> Color32 {
+    let brightness = face_brightness(face.normal);
+    let base = if face.is_ground {
+        [55, 67, 62]
+    } else {
+        [104, 132, 145]
+    };
+    Color32::from_rgb(
+        (base[0] as f32 * brightness).round() as u8,
+        (base[1] as f32 * brightness).round() as u8,
+        (base[2] as f32 * brightness).round() as u8,
+    )
+}
+
+fn face_brightness(normal: [f32; 3]) -> f32 {
+    const LIGHT_DIRECTION: [f32; 3] = [-0.44, -0.57, 0.69];
+    (0.46 + 0.54 * dot3(normal, LIGHT_DIRECTION).abs()).clamp(0.46, 1.0)
+}
+
+fn polygon_depth(points: &[[f32; 3]]) -> f32 {
+    points.iter().map(|point| point[2]).sum::<f32>() / points.len() as f32
+}
+
+struct ClippedPolygon {
+    points: [[f32; 3]; 4],
+    point_count: usize,
+}
+
+fn clip_polygon_to_near(points: &[[f32; 3]], near_m: f32) -> ClippedPolygon {
+    let mut clipped = ClippedPolygon {
+        points: [[0.0; 3]; 4],
+        point_count: 0,
+    };
+    let mut previous = *points.last().expect("a face has three vertices");
+    let mut previous_inside = previous[2] >= near_m;
+    for &current in points {
+        let current_inside = current[2] >= near_m;
+        if current_inside != previous_inside {
+            clipped.points[clipped.point_count] = clip_to_depth(previous, current, near_m);
+            clipped.point_count += 1;
+        }
+        if current_inside {
+            clipped.points[clipped.point_count] = current;
+            clipped.point_count += 1;
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    clipped
 }
 
 fn picture_in_picture_rect(container: Rect) -> Rect {
@@ -1579,19 +1749,28 @@ impl Camera {
     }
 
     fn project(self, point: EnuVector3, rect: Rect) -> Option<Pos2> {
+        let camera = self.camera_point(point);
+        (camera[2] > FIRST_PERSON_NEAR_M).then(|| self.screen_point(camera, rect))
+    }
+
+    fn camera_point(self, point: EnuVector3) -> [f32; 3] {
         let forward = normalize3(sub3(self.target, self.eye));
         let right = normalize3(cross3(forward, [0.0, 0.0, 1.0]));
         let up = cross3(right, forward);
         let relative = sub3([point.east_m, point.north_m, point.up_m], self.eye);
-        let depth = dot3(relative, forward);
-        if depth <= 0.1 {
-            return None;
-        }
-        let scale = rect.height().min(rect.width()) * 0.9 / depth;
-        Some(Pos2::new(
-            rect.center().x + dot3(relative, right) * scale,
-            rect.center().y - dot3(relative, up) * scale,
-        ))
+        [
+            dot3(relative, right),
+            dot3(relative, up),
+            dot3(relative, forward),
+        ]
+    }
+
+    fn screen_point(self, point: [f32; 3], rect: Rect) -> Pos2 {
+        let scale = rect.height().min(rect.width()) * 0.9 / point[2];
+        Pos2::new(
+            rect.center().x + point[0] * scale,
+            rect.center().y - point[1] * scale,
+        )
     }
 }
 
@@ -1779,6 +1958,14 @@ fn clip_to_depth(behind: [f32; 3], ahead: [f32; 3], depth: f32) -> [f32; 3] {
     ]
 }
 
+fn point3(point: EnuVector3, origin: EnuVector3) -> [f32; 3] {
+    [
+        point.east_m - origin.east_m,
+        point.north_m - origin.north_m,
+        point.up_m - origin.up_m,
+    ]
+}
+
 fn add(left: EnuVector3, right: EnuVector3) -> EnuVector3 {
     EnuVector3::new(
         left.east_m + right.east_m,
@@ -1864,6 +2051,19 @@ impl SourceTrajectory {
             direction: EnuVector3::default(),
         }
     }
+}
+
+fn trajectory_segments_at_height(
+    trajectory: &SourceTrajectory,
+    height_m: f32,
+) -> impl Iterator<Item = [EnuVector3; 2]> + '_ {
+    (0..trajectory.waypoints.len()).map(move |index| {
+        let mut a = trajectory.waypoints[index];
+        let mut b = trajectory.waypoints[(index + 1) % trajectory.waypoints.len()];
+        a.up_m = height_m;
+        b.up_m = height_m;
+        [a, b]
+    })
 }
 
 fn subtract(left: EnuVector3, right: EnuVector3) -> EnuVector3 {
@@ -2000,18 +2200,127 @@ mod tests {
     }
 
     #[test]
-    fn triangle_edges_are_deduplicated() {
+    fn mesh_faces_cache_normals_and_distinguish_ground() {
         let mesh = AcousticMesh {
             vertices_enu_m: vec![
                 EnuVector3::new(0.0, 0.0, 0.0),
                 EnuVector3::new(1.0, 0.0, 0.0),
                 EnuVector3::new(1.0, 1.0, 0.0),
-                EnuVector3::new(0.0, 1.0, 0.0),
+                EnuVector3::new(1.0, 1.0, 3.0),
             ],
-            triangles: vec![[0, 1, 2], [0, 2, 3]],
+            triangles: vec![[0, 1, 2], [1, 3, 2]],
             material_ids: vec![0, 0],
         };
-        assert_eq!(mesh_edges(&mesh).len(), 5);
+        let faces = mesh_faces(&mesh);
+        assert_eq!(faces.len(), 2);
+        assert!(faces[0].is_ground);
+        assert!(!faces[1].is_ground);
+        assert_eq!(faces[0].normal, [0.0, 0.0, 1.0]);
+        assert_eq!(faces[1].normal, [-1.0, 0.0, 0.0]);
+        assert_ne!(face_color(faces[0]), face_color(faces[1]));
+    }
+
+    #[test]
+    fn painter_depth_key_orders_far_faces_before_near_faces() {
+        let near = [[0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [0.0, 1.0, 2.0]];
+        let far = [[0.0, 0.0, 9.0], [1.0, 0.0, 9.0], [0.0, 1.0, 9.0]];
+        let mut projected = [
+            ProjectedFace {
+                points: [Pos2::ZERO; 4],
+                point_count: 3,
+                depth: polygon_depth(&near),
+                fill: Color32::RED,
+            },
+            ProjectedFace {
+                points: [Pos2::ZERO; 4],
+                point_count: 3,
+                depth: polygon_depth(&far),
+                fill: Color32::BLUE,
+            },
+        ];
+        let mesh = projected_faces_mesh(&mut projected);
+        assert_eq!(projected[0].depth, 9.0);
+        assert_eq!(projected[1].depth, 2.0);
+        assert_eq!(mesh.vertices[0].color, Color32::BLUE);
+        assert_eq!(mesh.vertices[3].color, Color32::RED);
+    }
+
+    #[test]
+    fn face_shading_stays_lit_and_varies_by_orientation() {
+        let roof = face_brightness([0.0, 0.0, 1.0]);
+        let wall = face_brightness([1.0, 0.0, 0.0]);
+        assert!((0.46..=1.0).contains(&roof));
+        assert!((0.46..=1.0).contains(&wall));
+        assert!(roof > wall);
+    }
+
+    #[test]
+    fn face_crossing_near_plane_is_clipped_to_a_quad() {
+        let triangle = [[-1.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0]];
+        let clipped = clip_polygon_to_near(&triangle, 0.5);
+        assert_eq!(clipped.point_count, 4);
+        assert!(
+            clipped.points[..clipped.point_count]
+                .iter()
+                .all(|point| point[2] >= 0.5)
+        );
+    }
+
+    #[test]
+    fn city_sized_filled_geometry_projection_stays_interactive() {
+        let mut mesh = AcousticMesh {
+            vertices_enu_m: Vec::new(),
+            triangles: Vec::new(),
+            material_ids: Vec::new(),
+        };
+        for index in 0..2_048 {
+            let column = (index % 64) as f32;
+            let row = (index / 64) as f32;
+            let left = column * 2.0 - 64.0;
+            let right = left + 1.5;
+            let north = row * 3.0 + 8.0;
+            let base = mesh.vertices_enu_m.len() as u32;
+            mesh.vertices_enu_m.extend([
+                EnuVector3::new(left, north, 0.0),
+                EnuVector3::new(right, north, 0.0),
+                EnuVector3::new(right, north, 8.0),
+                EnuVector3::new(left, north, 8.0),
+            ]);
+            mesh.triangles
+                .extend([[base, base + 1, base + 2], [base, base + 2, base + 3]]);
+            mesh.material_ids.extend([0, 0]);
+        }
+        let faces = mesh_faces(&mesh);
+        let projection = FirstPersonProjection::new(
+            EnuVector3::new(0.0, 0.0, 1.5),
+            0.0,
+            FIRST_PERSON_VERTICAL_FOV_RADIANS,
+            FIRST_PERSON_NEAR_M,
+        );
+        let rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(1_280.0, 720.0));
+        let started = Instant::now();
+        let mut index_count = 0;
+        for _ in 0..30 {
+            let mut projected = faces
+                .iter()
+                .filter_map(|face| {
+                    project_face(
+                        &mesh,
+                        *face,
+                        rect,
+                        |point| projection.camera_point(point),
+                        |point, rect| projection.screen_point(point, rect),
+                    )
+                })
+                .collect::<Vec<_>>();
+            index_count = projected_faces_mesh(&mut projected).indices.len();
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "4,096-face projection, sort, and mesh assembly: {:.2} ms/frame",
+            elapsed.as_secs_f64() * 1_000.0 / 30.0
+        );
+        assert_eq!(index_count, 4_096 * 3);
     }
 
     #[test]
