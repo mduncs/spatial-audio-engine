@@ -1,17 +1,8 @@
 # Spatial Audio Engine
 
-A city you can hear.
-
 This is a toy about walking through urban space with your ears: you move a listener
 through real or synthesized city geometry wearing ordinary headphones, and the sound
-behaves as though the buildings are actually there. A diner's jukebox localizes down
-the block and holds still while you turn your head. A wall steps in front of it and the
-sound dims and dulls. Around the corner, the music doesn't vanish — energy bends along
-the street and arrives muffled, from the direction of the opening. An impact three
-blocks away rumbles off facades before it reaches you; the same impact in an open plaza
-sounds dry and far. Distance costs level, air, and time.
-
-None of that is scripted. The engine simulates it from geometry, materials, and motion.
+behaves as though the buildings are actually there. 
 
 ## What it is
 
