@@ -211,7 +211,11 @@ pub struct OutputSafetyConfig {
 }
 
 impl OutputSafetyConfig {
-    pub const DEFAULT_SCENE_SPL_CEILING_DB: f32 = 100.0;
+    // 130 dB engages only in genuine near-field danger (inside ~70 m of a
+    // 155 dB source, ~2 m of a 118 dB siren). A city-scale ceiling like
+    // 100 dB would sit below loud sources across the whole map and flatten
+    // their distance gradient.
+    pub const DEFAULT_SCENE_SPL_CEILING_DB: f32 = 130.0;
     pub const DEFAULT_SCENE_SPL_KNEE_WIDTH_DB: f32 = 12.0;
     pub const DEFAULT_SOURCE_RADIUS_M: f32 = ONE_METER;
     pub const DEFAULT_MONITOR_GAIN_DB: f32 = 0.0;
