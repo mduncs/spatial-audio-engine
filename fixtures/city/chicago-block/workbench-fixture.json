@@ -1,0 +1,127 @@
+{
+  "schema_version": "fightbox.fixture.s6a.v1",
+  "fixture_id": "chicago-block-workbench",
+  "gate": "S5",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {
+    "name": "Steam Audio",
+    "version": "4.8.1"
+  },
+  "sources": [
+    {
+      "id": "toms-diner-dearborn-storefront",
+      "asset_id": "toms-diner",
+      "default_enabled": true,
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 85
+      },
+      "position_m": [
+        15.5,
+        -12.0,
+        1.5
+      ]
+    },
+    {
+      "id": "transportation-building-upper-floor-bells",
+      "asset_id": "church-bells",
+      "default_enabled": false,
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 85
+      },
+      "position_m": [
+        10.5,
+        100.0,
+        68.0
+      ]
+    },
+    {
+      "id": "siren-dearborn-harrison-edge",
+      "asset_id": "ff-siren",
+      "default_enabled": false,
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 85
+      },
+      "position_m": [
+        15.5,
+        150.0,
+        1.5
+      ]
+    },
+    {
+      "id": "artillery-federal-polk-corner",
+      "asset_id": "artillery-impact",
+      "default_enabled": false,
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 120
+      },
+      "position_m": [
+        -14.5,
+        -82.0,
+        1.5
+      ]
+    }
+  ],
+  "listener": {
+    "position_m": [
+      15.5,
+      -55.0,
+      1.5
+    ],
+    "forward_enu": [
+      0,
+      1,
+      0
+    ],
+    "up_enu": [
+      0,
+      0,
+      1
+    ]
+  },
+  "simulation": {
+    "direct": {
+      "distance_attenuation": true,
+      "occlusion": true,
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "enabled": true,
+      "rays": 4096,
+      "bounces": 2,
+      "duration_s": 1.0
+    },
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": [
+        "direct",
+        "path",
+        "reflections"
+      ]
+    }
+  },
+  "expected": {
+    "properties": [
+      "The listener starts on the Dearborn-side sidewalk at local ENU [15.5, -55.0, 1.5], east of the compiled building faces, and can be moved manually through the workbench.",
+      "Tom's Diner is at street level on the Dearborn side beside the Rowe Building.",
+      "The bells are high beside the Transportation Building's east face, below its compiled 70.4 m roof.",
+      "The siren is at the Dearborn/Harrison edge and the disabled artillery source is at the far Federal/Polk ground corner.",
+      "All four asset IDs resolve through the existing descriptors under fixtures/assets; this fixture adds no audio assets."
+    ],
+    "non_claims": [
+      "The placements are plausible demonstrations in the package's compiled local ENU frame, not surveyed source locations.",
+      "This fixture makes no delivered-ear-SPL claim without output calibration."
+    ]
+  }
+}
