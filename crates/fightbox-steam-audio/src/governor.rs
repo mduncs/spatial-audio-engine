@@ -5,9 +5,8 @@
 //! bounded SPSC channel used by the propagation and stage-gain paths.
 
 #[cfg(any(feature = "linked-sdk", test))]
-use crate::{
-    AudioConfig, MultiSourceDescriptor, QualityTier, S3SimulationConfig, SessionMemoryTelemetry,
-};
+use crate::{AudioConfig, MultiSourceDescriptor, S3SimulationConfig};
+use crate::{QualityTier, SessionMemoryTelemetry};
 #[cfg(any(feature = "linked-sdk", test))]
 use fightbox_runtime::SnapshotPublication;
 use fightbox_runtime::backend::MAX_ACTIVE_SOURCES;
