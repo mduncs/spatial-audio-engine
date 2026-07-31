@@ -66,6 +66,7 @@ pub struct Workbench {
     capture_warnings: Vec<String>,
     capture_status: Option<String>,
     autopilot: Autopilot,
+    source_height_levels: SourceHeightLevels,
     startup_started: Instant,
     reflection_warmup_started: Instant,
     reflection_warmup_reported: bool,
@@ -80,7 +81,53 @@ struct SourceView {
     enabled: bool,
     muted: bool,
     soloed: bool,
+    street_height_m: f32,
+    height: SourceHeight,
     trajectory: Option<SourceTrajectory>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceHeight {
+    Street,
+    Medium,
+    AboveRooves,
+}
+
+impl SourceHeight {
+    const ALL: [Self; 3] = [Self::Street, Self::Medium, Self::AboveRooves];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Street => "street",
+            Self::Medium => "medium",
+            Self::AboveRooves => "above rooves",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SourceHeightLevels {
+    tallest_roof_m: f32,
+}
+
+impl SourceHeightLevels {
+    fn for_mesh(mesh: &AcousticMesh) -> Self {
+        let tallest_roof_m = mesh
+            .vertices_enu_m
+            .iter()
+            .map(|vertex| vertex.up_m)
+            .reduce(f32::max)
+            .unwrap_or_default();
+        Self { tallest_roof_m }
+    }
+
+    fn height_m(self, selection: SourceHeight, street_height_m: f32) -> f32 {
+        match selection {
+            SourceHeight::Street => street_height_m,
+            SourceHeight::Medium => self.tallest_roof_m * 0.5,
+            SourceHeight::AboveRooves => self.tallest_roof_m + 3.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,6 +367,8 @@ impl Workbench {
                 enabled: source.default_enabled,
                 muted: false,
                 soloed: false,
+                street_height_m: position.up_m,
+                height: SourceHeight::Street,
                 trajectory,
             });
         }
@@ -448,6 +497,7 @@ impl Workbench {
         let edges = mesh_edges(&package.mesh);
         let camera = Camera::for_mesh(&package.mesh);
         let autopilot = Autopilot::new(Bounds2::for_mesh(&package.mesh));
+        let source_height_levels = SourceHeightLevels::for_mesh(&package.mesh);
         eprintln!(
             "[startup] workbench view preparation: {} ms",
             phase_started.elapsed().as_millis()
@@ -476,6 +526,7 @@ impl Workbench {
             capture_warnings: browser.warnings,
             capture_status: None,
             autopilot,
+            source_height_levels,
             startup_started,
             reflection_warmup_started,
             reflection_warmup_reported: false,
@@ -485,20 +536,42 @@ impl Workbench {
 
     fn update_source_motion(&mut self) {
         let elapsed_blocks = self.audio_block_reader.read();
-        for (index, source) in self.sources.iter_mut().enumerate() {
-            let Some(trajectory) = &source.trajectory else {
+        for index in 0..self.sources.len() {
+            let Some((mut sample, speed_mps)) =
+                self.sources[index].trajectory.as_ref().map(|trajectory| {
+                    (
+                        trajectory.sample_at_block(elapsed_blocks),
+                        trajectory.speed_mps,
+                    )
+                })
+            else {
                 continue;
             };
-            let sample = trajectory.sample_at_block(elapsed_blocks);
-            source.position = sample.position;
-            self.source_motion[index].pose.position = sample.position;
+            sample.position.up_m = self.source_height_levels.height_m(
+                self.sources[index].height,
+                self.sources[index].street_height_m,
+            );
+            self.update_source_position(index, sample.position);
             self.source_motion[index].pose.forward = sample.direction;
-            self.source_motion[index].linear_velocity_mps =
-                scale(sample.direction, trajectory.speed_mps);
-            self.output_safety_controller
-                .set_source_position(index, sample.position)
-                .expect("validated source trajectories remain finite");
+            self.source_motion[index].linear_velocity_mps = scale(sample.direction, speed_mps);
         }
+    }
+
+    fn update_source_position(&mut self, index: usize, position: EnuVector3) {
+        self.sources[index].position = position;
+        self.source_motion[index].pose.position = position;
+        self.output_safety_controller
+            .set_source_position(index, position)
+            .expect("workbench source positions remain finite");
+    }
+
+    fn apply_source_height(&mut self, index: usize, selection: SourceHeight) {
+        self.sources[index].height = selection;
+        let mut position = self.sources[index].position;
+        position.up_m = self
+            .source_height_levels
+            .height_m(selection, self.sources[index].street_height_m);
+        self.update_source_position(index, position);
     }
 
     fn update_control(&mut self, ctx: &egui::Context, drag_delta_x: f32) {
@@ -874,7 +947,9 @@ impl Workbench {
         ui.separator();
         ui.heading("Sources");
         let mut source_mix_changed = false;
-        for source in &mut self.sources {
+        let mut source_height_changed = None;
+        let source_height_levels = self.source_height_levels;
+        for (index, source) in self.sources.iter_mut().enumerate() {
             ui.add_enabled_ui(mix_controls_enabled, |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -905,7 +980,26 @@ impl Workbench {
                         ui.small(format!("{ARTILLERY_RETRIGGER_SECONDS} s retrigger"));
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    ui.small("height");
+                    for height in SourceHeight::ALL {
+                        if ui
+                            .selectable_label(source.height == height, height.label())
+                            .clicked()
+                        {
+                            source.height = height;
+                            source_height_changed = Some((index, height));
+                        }
+                    }
+                    let resulting_height_m =
+                        source_height_levels.height_m(source.height, source.street_height_m);
+                    ui.monospace(format!("{resulting_height_m:.1} m z"));
+                });
             });
+        }
+        if let Some((index, height)) = source_height_changed {
+            self.apply_source_height(index, height);
         }
         if source_mix_changed {
             self.source_mix_writer
@@ -1918,6 +2012,49 @@ mod tests {
             material_ids: vec![0, 0],
         };
         assert_eq!(mesh_edges(&mesh).len(), 5);
+    }
+
+    #[test]
+    fn source_height_levels_scan_the_tallest_mesh_roof() {
+        let mesh = AcousticMesh {
+            vertices_enu_m: vec![
+                EnuVector3::new(0.0, 0.0, 0.0),
+                EnuVector3::new(1.0, 0.0, 18.0),
+                EnuVector3::new(1.0, 1.0, 72.5),
+                EnuVector3::new(0.0, 1.0, 31.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 3]],
+            material_ids: vec![0, 0],
+        };
+
+        assert_eq!(SourceHeightLevels::for_mesh(&mesh).tallest_roof_m, 72.5);
+    }
+
+    #[test]
+    fn source_height_levels_map_medium_and_above_rooves_from_the_tallest_roof() {
+        let levels = SourceHeightLevels {
+            tallest_roof_m: 84.0,
+        };
+
+        assert_eq!(levels.height_m(SourceHeight::Medium, 1.5), 42.0);
+        assert_eq!(levels.height_m(SourceHeight::AboveRooves, 1.5), 87.0);
+    }
+
+    #[test]
+    fn street_height_restores_the_fixture_declared_height_exactly() {
+        let levels = SourceHeightLevels {
+            tallest_roof_m: 84.0,
+        };
+        let fixture_declared_height_m = f32::from_bits(0x3fca_8642);
+
+        assert_eq!(
+            levels.height_m(SourceHeight::Medium, fixture_declared_height_m),
+            42.0
+        );
+        assert_eq!(
+            levels.height_m(SourceHeight::Street, fixture_declared_height_m),
+            fixture_declared_height_m
+        );
     }
 
     #[test]
