@@ -20,6 +20,10 @@ use fightbox_steam_audio::{
 use fightbox_world::{AcousticMesh, read_package};
 
 use crate::LaunchArgs;
+use crate::acoustic_state::{
+    AcousticTelemetry, AcousticTelemetryTap, BadgeTone, ProbeCoverageQuery, SourceAcousticInputs,
+    SourceAcousticState, probe_text, probe_tone, stage_chips,
+};
 use crate::asset::load_asset;
 use crate::capture::{
     BakeProvenance, BrowserScan, CaptureBrowserEntry, CaptureController, CaptureDraft,
@@ -66,6 +70,8 @@ pub struct Workbench {
     capture_status: Option<String>,
     autopilot: Autopilot,
     source_height_levels: SourceHeightLevels,
+    probe_coverage: ProbeCoverageQuery,
+    acoustic_telemetry: SnapshotReader<AcousticTelemetry>,
     startup_started: Instant,
     reflection_warmup_started: Instant,
     reflection_warmup_reported: bool,
@@ -83,6 +89,7 @@ struct SourceView {
     street_height_m: f32,
     height: SourceHeight,
     trajectory: Option<SourceTrajectory>,
+    acoustic: SourceAcousticState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,7 +208,6 @@ impl SourceMix {
         mix
     }
 
-    #[cfg(any(feature = "live-output", test))]
     fn gains(self, source_count: usize) -> [f32; fightbox_runtime::MAX_ACTIVE_SOURCES] {
         let any_soloed = self.enabled[..source_count]
             .iter()
@@ -369,6 +375,7 @@ impl Workbench {
                 street_height_m: position.up_m,
                 height: SourceHeight::Street,
                 trajectory,
+                acoustic: SourceAcousticState::UNKNOWN,
             });
         }
         let descriptors = source_views
@@ -395,6 +402,14 @@ impl Workbench {
             "[startup] steam scene + simulator build: {} ms",
             phase_started.elapsed().as_millis()
         );
+        let probe_coverage = match baked.probe_coverage() {
+            Ok(coverage) => ProbeCoverageQuery::from_spheres(coverage.spheres().collect()),
+            Err(error) => {
+                eprintln!("[startup] probe-coverage badges unavailable: {error}");
+                ProbeCoverageQuery::unavailable()
+            }
+        };
+        let (runner, acoustic_telemetry) = AcousticTelemetryTap::new(runner);
         let initial_update = SimulationUpdate {
             listener: initial_listener,
             sources: source_motion,
@@ -526,6 +541,8 @@ impl Workbench {
             capture_status: None,
             autopilot,
             source_height_levels,
+            probe_coverage,
+            acoustic_telemetry,
             startup_started,
             reflection_warmup_started,
             reflection_warmup_reported: false,
@@ -553,6 +570,24 @@ impl Workbench {
             self.update_source_position(index, sample.position);
             self.source_motion[index].pose.forward = sample.direction;
             self.source_motion[index].linear_velocity_mps = scale(sample.direction, speed_mps);
+        }
+    }
+
+    /// Re-resolves every source's badge row from the latest simulation
+    /// publication and the source's current position. Control-tick only.
+    fn refresh_acoustic_state(&mut self) {
+        let telemetry = self.acoustic_telemetry.read();
+        let listener_probes = self.probe_coverage.coverage(self.listener.position);
+        let stage_gains = self.stage_mix.gains();
+        let mix_gains = SourceMix::from_sources(&self.sources).gains(self.sources.len());
+        for (index, source) in self.sources.iter_mut().enumerate() {
+            let inputs = SourceAcousticInputs {
+                source_probes: self.probe_coverage.coverage(source.position),
+                listener_probes,
+                audible_in_mix: mix_gains[index] > 0.0,
+                stage_gains,
+            };
+            source.acoustic = SourceAcousticState::evaluate(inputs, telemetry, index);
         }
     }
 
@@ -1044,6 +1079,7 @@ impl Workbench {
                     ui.monospace(format!("{resulting_height_m:.1} m z"));
                 });
             });
+            acoustic_badge_row(ui, source.acoustic);
         }
         if let Some((index, height)) = source_height_changed {
             self.apply_source_height(index, height);
@@ -1146,6 +1182,7 @@ impl Workbench {
 impl eframe::App for Workbench {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_source_motion();
+        self.refresh_acoustic_state();
         self.update_capture_lifecycle();
         egui::SidePanel::right("performance")
             .resizable(true)
@@ -1207,6 +1244,46 @@ fn audio_safety_telemetry(audio: &AudioState) -> Option<SafetyTelemetry> {
         #[cfg(feature = "live-output")]
         AudioState::Live(output) => Some(output.telemetry().safety),
         AudioState::Unavailable(_) => None,
+    }
+}
+
+const ACOUSTIC_BADGE_HOVER: &str = concat!(
+    "Baked path-probe coverage at this source's current position and at the listener. ",
+    "A source outside every probe has no baked path and falls back to direct-only. ",
+    "occl is Steam Audio direct occlusion audibility, 1.00 clear to 0.00 fully occluded.\n",
+    "Stage chips: + contributing, - silent, ? not reported by the session.",
+);
+
+/// One compact row per source: probe coverage, direct occlusion, and the render
+/// stages that can currently contribute.
+fn acoustic_badge_row(ui: &mut egui::Ui, state: SourceAcousticState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_space(22.0);
+        ui.colored_label(
+            badge_color(probe_tone(state)),
+            badge_text(probe_text(state)),
+        );
+        for (text, tone) in stage_chips(state) {
+            ui.colored_label(badge_color(tone), badge_text(text));
+        }
+    })
+    .response
+    .on_hover_text(ACOUSTIC_BADGE_HOVER);
+}
+
+fn badge_text(text: String) -> egui::RichText {
+    egui::RichText::new(text)
+        .family(egui::FontFamily::Monospace)
+        .small()
+}
+
+fn badge_color(tone: BadgeTone) -> Color32 {
+    match tone {
+        BadgeTone::Ok => Color32::from_rgb(112, 180, 155),
+        BadgeTone::Warn => Color32::from_rgb(255, 172, 90),
+        BadgeTone::Off => Color32::from_rgb(101, 114, 124),
+        BadgeTone::Unknown => Color32::from_rgb(142, 173, 188),
     }
 }
 

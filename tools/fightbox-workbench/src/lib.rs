@@ -1,3 +1,4 @@
+mod acoustic_state;
 mod asset;
 mod capture;
 mod fixture;
