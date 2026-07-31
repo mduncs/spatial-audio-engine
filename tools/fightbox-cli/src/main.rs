@@ -76,6 +76,8 @@ city bake        Bake probes for a city package (requires linked-sdk)\n    \
                   [--elevated-probe-layer-m <m>] (repeatable; adds a flat\n    \
                   mid-air probe layer at that ENU altitude so airborne\n    \
                   sources have influencing probes)\n    \
+                  [--elevated-probe-spacing-m <m>] (horizontal spacing of every\n    \
+                  elevated layer; defaults to the floor probe spacing)\n    \
                   defaults: 100m, 6m, 1, 0.5, 4m, 1.5m, 3m, no layers, 1 thread\n    \
 city render      Render a fixture through a packaged and baked city\n\n\
 city metamorphic Jitter assumed heights, bake, and assert the occlusion percept\n\n\
@@ -165,6 +167,7 @@ fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, cit
     let mut probe_height_above_floor_m = None;
     let mut probe_ceiling_m = None;
     let mut elevated_probe_layers_m: Vec<f32> = Vec::new();
+    let mut elevated_probe_spacing_m = None;
     let mut bake_threads = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -223,6 +226,13 @@ fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, cit
                 }
                 elevated_probe_layers_m.push(height);
             }
+            // One spacing for every layer, unlike the repeatable altitude flag:
+            // a per-layer spacing would need a pairing syntax to earn its keep.
+            "--elevated-probe-spacing-m" => set_once(
+                &mut elevated_probe_spacing_m,
+                parse_positive_f32(value, flag)?,
+                flag,
+            )?,
             "--bake-threads" => {
                 set_once(&mut bake_threads, parse_positive_i32(value, flag)?, flag)?
             }
@@ -247,6 +257,7 @@ fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, cit
                 .unwrap_or(defaults.probe_height_above_floor_m),
             probe_ceiling_m: probe_ceiling_m.unwrap_or(defaults.probe_ceiling_m),
             elevated_probe_layers_m,
+            elevated_probe_spacing_m,
             bake_threads: bake_threads.unwrap_or(defaults.bake_threads),
         },
     ))
@@ -764,9 +775,32 @@ mod tests {
                 probe_height_above_floor_m: 3.0,
                 probe_ceiling_m: 63.0,
                 elevated_probe_layers_m: vec![30.0, 80.0],
+                elevated_probe_spacing_m: None,
                 bake_threads: 10,
             }
         );
+    }
+
+    #[test]
+    fn city_bake_accepts_an_independent_elevated_probe_spacing() {
+        let (_, _, config) = parse_city_bake_args(&[
+            "--package".into(),
+            "city.fightbox".into(),
+            "--output".into(),
+            "city.baked".into(),
+            "--probe-spacing-m".into(),
+            "8".into(),
+            "--elevated-probe-layer-m".into(),
+            "30".into(),
+            "--elevated-probe-layer-m".into(),
+            "63".into(),
+            "--elevated-probe-spacing-m".into(),
+            "16".into(),
+        ])
+        .unwrap();
+        assert_eq!(config.probe_spacing_m, 8.0);
+        assert_eq!(config.elevated_probe_layers_m, vec![30.0, 63.0]);
+        assert_eq!(config.elevated_probe_spacing_m, Some(16.0));
     }
 
     #[test]
@@ -801,6 +835,9 @@ mod tests {
             ("--probe-spacing-m", "inf"),
             ("--probe-height-above-floor-m", "0"),
             ("--probe-ceiling-m", "-3"),
+            ("--elevated-probe-spacing-m", "0"),
+            ("--elevated-probe-spacing-m", "-8"),
+            ("--elevated-probe-spacing-m", "NaN"),
             ("--bake-threads", "0"),
         ] {
             let mut args = required.to_vec();
@@ -814,6 +851,12 @@ mod tests {
         duplicate.extend(["--path-range-m".into(), "100".into()]);
         duplicate.extend(["--path-range-m".into(), "200".into()]);
         assert!(parse_city_bake_args(&duplicate).is_err());
+
+        let mut duplicate_spacing = required.to_vec();
+        duplicate_spacing.extend(["--elevated-probe-spacing-m".into(), "16".into()]);
+        duplicate_spacing.extend(["--elevated-probe-spacing-m".into(), "32".into()]);
+        let error = parse_city_bake_args(&duplicate_spacing).unwrap_err();
+        assert!(error.message().contains("duplicate"));
     }
 
     #[test]

@@ -206,6 +206,27 @@ mod tests {
         assert!((samples[70] - 572.55).abs() < 1.0e-3);
     }
 
+    /// A layer coarser than the floor still lands on the floor grid's columns,
+    /// because both are centred in the same span. That matters: a probe sitting
+    /// directly above a floor probe is the case Steam Audio's visibility bake
+    /// handles best, and it makes a 16 m layer a strict thinning of the 8 m one
+    /// rather than a differently-phased grid.
+    #[test]
+    fn a_doubled_spacing_thins_the_uniform_floor_grid_instead_of_shifting_it() {
+        let dense = axis_samples(12.3, 572.8, 8.0);
+        let sparse = axis_samples(12.3, 572.8, 16.0);
+        assert_eq!(dense.len(), 71);
+        assert_eq!(sparse.len(), 36);
+        for (index, column) in sparse.iter().enumerate() {
+            assert!(
+                (column - dense[index * 2]).abs() < 1.0e-3,
+                "sparse column {index} at {column} left the dense grid"
+            );
+        }
+        assert!((sparse[0] - 12.55).abs() < 1.0e-3);
+        assert!((sparse[35] - 572.55).abs() < 1.0e-3);
+    }
+
     #[test]
     fn axis_samples_survive_a_span_shorter_than_the_spacing() {
         let samples = axis_samples(0.0, 3.0, 8.0);
@@ -249,5 +270,92 @@ mod tests {
         assert!(centers.iter().all(|center| center.z == 30.0));
         assert!(!centers.contains(&EnuVector3::new(0.0, 0.0, 30.0)));
         assert!(centers.contains(&EnuVector3::new(10.0, 0.0, 30.0)));
+    }
+
+    /// The layer's spacing no longer has to match the volume's, and widening it
+    /// only thins the grid: the same building still swallows the same column,
+    /// and every surviving probe is one the dense layer also placed.
+    #[test]
+    fn a_layer_coarser_than_the_volume_thins_the_grid_and_culls_the_same_column() {
+        let mesh = box_mesh(
+            EnuVector3::new(-5.0, -5.0, 0.0),
+            EnuVector3::new(5.0, 5.0, 60.0),
+        );
+        let volume = ProbeVolume {
+            min_enu_m: EnuVector3::new(-20.0, -20.0, 0.0),
+            max_enu_m: EnuVector3::new(20.0, 20.0, 63.0),
+            spacing_m: 10.0,
+            height_above_floor_m: 3.0,
+        };
+        let dense = layer_probe_centers(
+            volume,
+            ElevatedProbeLayer {
+                height_enu_m: 30.0,
+                spacing_m: 10.0,
+            },
+            &mesh,
+        );
+        let sparse = layer_probe_centers(
+            volume,
+            ElevatedProbeLayer {
+                height_enu_m: 30.0,
+                spacing_m: 20.0,
+            },
+            &mesh,
+        );
+        // A 3x3 grid (-20, 0, 20 on each axis) minus the buried centre.
+        assert_eq!(sparse.len(), 3 * 3 - 1);
+        assert!(!sparse.contains(&EnuVector3::new(0.0, 0.0, 30.0)));
+        assert!(sparse.contains(&EnuVector3::new(20.0, 0.0, 30.0)));
+        assert!(sparse.iter().all(|center| dense.contains(center)));
+    }
+
+    /// Widening the spacing cannot open a hole in the layer, because the
+    /// influence radius widens with it. Worst case is the centre of a cell,
+    /// `spacing * sqrt(2) / 2` ≈ 0.71 spacings from the nearest column — inside
+    /// the radius with room to spare. This is what gives a source hovering over
+    /// an open street an influencing probe at all.
+    #[test]
+    fn every_point_on_a_sparse_layer_stays_inside_some_probes_influence() {
+        // The megablock bake's real extent, at the 63 m ceiling.
+        let volume = ProbeVolume {
+            min_enu_m: EnuVector3::new(12.3, 12.3, 0.0),
+            max_enu_m: EnuVector3::new(572.8, 572.8, 63.0),
+            spacing_m: 8.0,
+            height_above_floor_m: 1.5,
+        };
+        let layer = ElevatedProbeLayer {
+            height_enu_m: 63.0,
+            spacing_m: 16.0,
+        };
+        // Open sky: nothing reaches 63 m, so no column is culled.
+        let empty = SceneMesh {
+            vertices_enu_m: Vec::new(),
+            triangles: Vec::new(),
+            material_indices: Vec::new(),
+            materials: Vec::new(),
+        };
+        let centers = layer_probe_centers(volume, layer, &empty);
+        assert_eq!(centers.len(), 36 * 36);
+
+        // The street intersection the wave-5 megablock bake left uncovered.
+        for probe_point in [
+            EnuVector3::new(102.5, 102.5, 63.0),
+            EnuVector3::new(20.55, 20.55, 63.0),
+            EnuVector3::new(292.55, 292.55, 63.0),
+        ] {
+            let nearest = centers
+                .iter()
+                .map(|center| {
+                    let dx = f64::from(center.x - probe_point.x);
+                    let dy = f64::from(center.y - probe_point.y);
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                nearest < f64::from(layer.spacing_m),
+                "{probe_point:?} sits {nearest} m from the nearest probe, outside its influence"
+            );
+        }
     }
 }

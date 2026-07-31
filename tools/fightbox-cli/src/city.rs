@@ -499,8 +499,17 @@ pub(crate) struct BakeConfig {
     pub probe_ceiling_m: f32,
     /// Absolute ENU altitudes, in metres, of extra mid-air probe layers. Empty
     /// by default; each entry adds one flat layer over the same horizontal
-    /// footprint at the same spacing as the floor probes.
+    /// footprint as the floor probes.
     pub elevated_probe_layers_m: Vec<f32>,
+    /// Horizontal spacing, in metres, shared by every elevated layer. `None`
+    /// follows [`Self::probe_spacing_m`].
+    ///
+    /// Elevated layers rarely want the floor's density: a layer above the
+    /// rooves exists so an airborne source has *some* influencing probe, and
+    /// each of those probes sees far more neighbours than a street-level one,
+    /// so halving the density quarters the layer's contribution to the baked
+    /// path data.
+    pub elevated_probe_spacing_m: Option<f32>,
     pub bake_threads: i32,
 }
 
@@ -516,9 +525,30 @@ impl Default for BakeConfig {
             probe_height_above_floor_m: PROBE_HEIGHT_M,
             probe_ceiling_m: PROBE_CEILING_M,
             elevated_probe_layers_m: Vec::new(),
+            elevated_probe_spacing_m: None,
             bake_threads: pathing.num_threads,
         }
     }
+}
+
+/// The mid-air layers `config` asks for, at their effective spacing.
+///
+/// Probe positions are a pure function of the layer, the probe volume, and the
+/// mesh, so a config that leaves `elevated_probe_spacing_m` unset produces the
+/// exact layers — and therefore the exact probe positions — it produced before
+/// the spacing was separable at all.
+fn elevated_probe_layers(config: &BakeConfig) -> Vec<ElevatedProbeLayer> {
+    let spacing_m = config
+        .elevated_probe_spacing_m
+        .unwrap_or(config.probe_spacing_m);
+    config
+        .elevated_probe_layers_m
+        .iter()
+        .map(|height_enu_m| ElevatedProbeLayer {
+            height_enu_m: *height_enu_m,
+            spacing_m,
+        })
+        .collect()
 }
 
 pub fn bake(package: &Path, output: &Path) -> Result<()> {
@@ -541,14 +571,7 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
     let baked = bake_s3(&S3BakeRequest {
         mesh: scene,
         probes,
-        elevated_probe_layers: config
-            .elevated_probe_layers_m
-            .iter()
-            .map(|height_enu_m| ElevatedProbeLayer {
-                height_enu_m: *height_enu_m,
-                spacing_m: config.probe_spacing_m,
-            })
-            .collect(),
+        elevated_probe_layers: elevated_probe_layers(&config),
         pathing: PathBakeConfig {
             num_visibility_samples: config.visibility_samples,
             probe_visibility_radius_m: defaults.probe_visibility_radius_m,
@@ -581,10 +604,14 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
     )?;
     directory.commit()?;
     eprintln!(
-        "fightbox: city bake written to {} (probes={}, elevated_layers_m={:?}, sha256={})",
+        "fightbox: city bake written to {} (probes={}, elevated_layers_m={:?}, \
+         elevated_spacing_m={}, sha256={})",
         output.display(),
         baked.metadata.probe_count,
         config.elevated_probe_layers_m,
+        config
+            .elevated_probe_spacing_m
+            .unwrap_or(config.probe_spacing_m),
         baked.metadata.content_sha256
     );
     Ok(())
@@ -1210,6 +1237,56 @@ mod tests {
             }
         );
         assert!(BakeConfig::default().elevated_probe_layers_m.is_empty());
+        assert!(BakeConfig::default().elevated_probe_spacing_m.is_none());
+    }
+
+    /// Positions are a pure function of `(volume, layer, mesh)`, and neither the
+    /// volume nor the mesh depends on the elevated spacing, so proving the
+    /// layers are unchanged proves the probe positions are too — without paying
+    /// for a rebake.
+    #[test]
+    fn unset_elevated_spacing_reproduces_the_floor_spaced_layers() {
+        let config = BakeConfig {
+            probe_spacing_m: 8.0,
+            elevated_probe_layers_m: vec![30.0, 63.0],
+            elevated_probe_spacing_m: None,
+            ..BakeConfig::default()
+        };
+        assert_eq!(
+            elevated_probe_layers(&config),
+            vec![
+                ElevatedProbeLayer {
+                    height_enu_m: 30.0,
+                    spacing_m: 8.0,
+                },
+                ElevatedProbeLayer {
+                    height_enu_m: 63.0,
+                    spacing_m: 8.0,
+                },
+            ]
+        );
+        // An empty layer list stays empty whatever the spacing says, which is
+        // what keeps a no-flag bake byte-identical.
+        let none = BakeConfig {
+            elevated_probe_spacing_m: Some(16.0),
+            ..BakeConfig::default()
+        };
+        assert!(elevated_probe_layers(&none).is_empty());
+    }
+
+    #[test]
+    fn elevated_spacing_overrides_the_floor_spacing_for_every_layer() {
+        let config = BakeConfig {
+            probe_spacing_m: 8.0,
+            elevated_probe_layers_m: vec![30.0, 63.0],
+            elevated_probe_spacing_m: Some(16.0),
+            ..BakeConfig::default()
+        };
+        let layers = elevated_probe_layers(&config);
+        assert_eq!(layers.len(), 2);
+        assert!(layers.iter().all(|layer| layer.spacing_m == 16.0));
+        assert_eq!(layers[0].height_enu_m, 30.0);
+        assert_eq!(layers[1].height_enu_m, 63.0);
     }
 
     #[test]
