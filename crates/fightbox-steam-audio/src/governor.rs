@@ -68,7 +68,9 @@ pub enum PathQualityLevel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceQualityLevel {
     Full,
-    /// Direct HRTF and occlusion remain; pathing and reflections are faded out.
+    /// Direct HRTF, occlusion, and baked pathing remain; reflections are faded
+    /// out. Retaining pathing prevents an occluded source from losing the
+    /// indirect transport that makes it audible around a corner.
     DirectOnly,
     /// Reserved for a physically calibrated prediction below the hearing threshold.
     Virtualized,

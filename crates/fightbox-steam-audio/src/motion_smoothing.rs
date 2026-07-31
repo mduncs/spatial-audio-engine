@@ -304,6 +304,57 @@ mod tests {
     }
 
     #[test]
+    fn binary_corner_target_has_a_bounded_occlusion_and_transmission_step_per_block() {
+        let block_seconds = 128.0 / 48_000.0;
+        let retention = (-block_seconds / PROPAGATION_SLEW_TIME_SECONDS).exp();
+        let maximum_endpoint_step = 1.0 - retention;
+        let listener = SteamVector3::default();
+        let mut smoother = SourcePropagationSmoother::default();
+        let visible = SteamSourcePropagation {
+            direct: SteamDirectParams {
+                occlusion: 1.0,
+                transmission: [1.0; 3],
+                ..SteamDirectParams::default()
+            },
+            ..SteamSourcePropagation::default()
+        };
+        let occluded = SteamSourcePropagation {
+            direct: SteamDirectParams {
+                occlusion: 0.0,
+                transmission: [0.0; 3],
+                ..SteamDirectParams::default()
+            },
+            ..SteamSourcePropagation::default()
+        };
+        smoother.advance(visible, listener, retention);
+
+        let mut previous = 1.0;
+        for _ in 0..128 {
+            let ramp = smoother.advance(occluded, listener, retention);
+            let applied = ramp.endpoint().direct;
+            let endpoint_step = previous - applied.occlusion;
+            assert!(
+                endpoint_step >= 0.0 && endpoint_step <= maximum_endpoint_step + f32::EPSILON,
+                "occlusion endpoint step {endpoint_step} exceeded {maximum_endpoint_step}"
+            );
+            for transmission in applied.transmission {
+                assert_eq!(transmission.to_bits(), applied.occlusion.to_bits());
+            }
+            let first_sample_step = previous - ramp.at_sample(0, 128).direct.occlusion;
+            assert!(
+                first_sample_step <= maximum_endpoint_step / 128.0 + f32::EPSILON,
+                "first intra-block occlusion step {first_sample_step} was not bounded"
+            );
+            previous = applied.occlusion;
+        }
+
+        assert!(
+            previous < 0.02,
+            "80 ms slew did not substantially reach the occluded target: {previous}"
+        );
+    }
+
+    #[test]
     fn reset_makes_reactivation_initialize_instantly() {
         let mut smoother = SourcePropagationSmoother::default();
         smoother.advance(propagation(1.0), SteamVector3::new(1.0, 2.0, 3.0), 0.9);

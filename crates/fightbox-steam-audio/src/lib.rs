@@ -645,6 +645,12 @@ pub enum DirectOcclusionMode {
     Volumetric { radius_m: f32, sample_count: i32 },
 }
 
+/// Recommended source radius for live sessions that opt into volumetric
+/// direct occlusion. The S3 evidence pipeline stays on `Raycast`.
+pub const DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS: f32 = 1.0;
+/// Recommended volumetric visibility sample count for live sessions.
+pub const DEFAULT_OCCLUSION_SAMPLE_COUNT: i32 = 32;
+
 impl DirectOcclusionMode {
     #[must_use]
     pub const fn steam_audio_discriminant(self) -> i32 {

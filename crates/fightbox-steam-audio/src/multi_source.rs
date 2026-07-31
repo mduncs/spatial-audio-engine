@@ -1650,7 +1650,13 @@ fn source_quality_targets(
                 0.0
             },
         ],
-        SourceQualityLevel::DirectOnly => [1.0, 0.0, 0.0],
+        // "DirectOnly" is the established telemetry/API name for this
+        // per-source governor rung. Baked path transport is deliberately kept
+        // audible: direct-gain ranking makes occluded sources the first ones
+        // selected for degradation, and suppressing their path send here would
+        // remove exactly the around-corner energy required by the backend
+        // contract. The no-bake override at the call sites still zeros it.
+        SourceQualityLevel::DirectOnly => [1.0, 1.0, 0.0],
         SourceQualityLevel::Virtualized => [0.0, 0.0, 0.0],
     }
 }
@@ -2216,6 +2222,77 @@ mod tests {
     }
 
     #[test]
+    fn volumetric_edge_crossing_has_partial_visibility_and_a_bounded_render_slew() {
+        let mesh = wall_mesh(AcousticMaterial::MASONRY);
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let config = S3SimulationConfig {
+            direct_occlusion: DirectOcclusionMode::Volumetric {
+                radius_m: crate::DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS,
+                sample_count: crate::DEFAULT_OCCLUSION_SAMPLE_COUNT,
+            },
+            ..test_config()
+        };
+        let initial_source = ApiEnuVector3::new(4.0, 2.0, 1.5);
+        let listener = ApiEnuVector3::new(4.0, -2.0, 1.5);
+        let descriptors = [crate::MultiSourceDescriptor::at(initial_source)];
+        let (mut simulation, _render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            config,
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        let retention = (-(audio.frame_size as f32 / audio.sample_rate_hz as f32)
+            / PROPAGATION_SLEW_TIME_SECONDS)
+            .exp();
+        let maximum_endpoint_step = 1.0 - retention;
+        let mut smoother = SourcePropagationSmoother::default();
+        let mut raw = Vec::new();
+        let mut applied = Vec::new();
+
+        for position_index in 0..=32 {
+            let source = ApiEnuVector3::new(4.0 + position_index as f32 * 0.125, 2.0, 1.5);
+            simulation.update_inputs(&one_source_update(true, source, listener));
+            simulation.run_direct().unwrap();
+            let propagation = simulation.snapshot.sources[0];
+            raw.push(propagation.direct.occlusion);
+            applied.push(
+                smoother
+                    .advance(
+                        propagation,
+                        simulation.snapshot.listener_position,
+                        retention,
+                    )
+                    .endpoint()
+                    .direct
+                    .occlusion,
+            );
+        }
+
+        assert!(
+            raw.iter().any(|value| *value > 0.0 && *value < 1.0),
+            "volumetric edge crossing never reported partial visibility: {raw:?}"
+        );
+        let maximum_applied_step = applied
+            .windows(2)
+            .map(|values| (values[1] - values[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            maximum_applied_step <= maximum_endpoint_step + f32::EPSILON,
+            "smoothed endpoint step {maximum_applied_step} exceeded {maximum_endpoint_step}: {applied:?}"
+        );
+        eprintln!(
+            "volumetric_edge_crossing raw={raw:?} applied={applied:?} max_applied_step={maximum_applied_step}"
+        );
+    }
+
+    #[test]
     fn linked_two_source_session_renders_isolates_and_drops_in_either_order() {
         let mesh = SceneMesh::controlled_s3_corner();
         let baked = bake_s3(&S3BakeRequest {
@@ -2403,6 +2480,80 @@ mod tests {
             build_multi_source_session(&mesh, &baked, audio, config, &descriptors).unwrap();
         drop(render_second);
         drop(simulation_first);
+    }
+
+    #[test]
+    fn occluded_moving_source_retains_audible_baked_path_send_at_direct_only_quality() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptors = [crate::MultiSourceDescriptor::at(ApiEnuVector3::new(
+            1.0, 0.0, 1.5,
+        ))];
+        let (mut simulation, mut render) =
+            build_multi_source_session(&mesh, &baked, audio, test_config(), &descriptors).unwrap();
+        assert_eq!(
+            simulation.quality_governor_telemetry().sources[0].quality,
+            SourceQualityLevel::DirectOnly
+        );
+        assert_eq!(render.sources[0].quality_gains, [1.0, 1.0, 0.0]);
+
+        let mut stage_gains = render.take_stage_output_gain_writer().unwrap();
+        stage_gains.publish(StageOutputGains {
+            direct: 0.0,
+            pathing: 1.0,
+            reflections: 0.0,
+        });
+
+        let mut global_frame = 0_usize;
+        let mut path_energy = 0.0_f64;
+        for block in 0..16 {
+            let mut snapshot = simulation.snapshot;
+            snapshot.sequence = snapshot.sequence.wrapping_add(1);
+            snapshot.listener_position = api_enu_to_steam(ApiEnuVector3::new(0.0, 0.0, 1.5));
+            let source = &mut snapshot.sources[0];
+            source.active = true;
+            source.source_position =
+                api_enu_to_steam(ApiEnuVector3::new(1.0 + block as f32 * 0.05, 0.0, 1.5));
+            source.direct.occlusion = 0.0;
+            source.direct.transmission = [0.0; 3];
+            source.path_eq = [1.0; 3];
+            source.path_sh = [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS];
+            source.path_sh[0] = 1.0;
+            source.configured_pathing_order = 1;
+            simulation.snapshot = snapshot;
+            simulation.publication.publish(snapshot);
+
+            let input = (0..audio.frame_size)
+                .map(|_| {
+                    let sample = (TAU * 440.0 * global_frame as f32 / audio.sample_rate_hz as f32)
+                        .sin()
+                        * 0.1;
+                    global_frame += 1;
+                    sample
+                })
+                .collect::<Vec<_>>();
+            let (left, right) = render_one_source_block(&mut render, &input);
+            path_energy += left
+                .into_iter()
+                .chain(right)
+                .map(|sample| f64::from(sample * sample))
+                .sum::<f64>();
+        }
+
+        assert!(
+            path_energy > 1.0e-8,
+            "path-only output was silent for an occluded moving source: {path_energy:.12e}"
+        );
+        eprintln!("occluded_moving_source path_only_energy={path_energy:.12e}");
+        assert_eq!(render.sources[0].quality_gains, [1.0, 1.0, 0.0]);
     }
 
     #[test]

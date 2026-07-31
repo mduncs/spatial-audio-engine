@@ -111,7 +111,10 @@ impl Fixture {
     pub fn simulation_config(&self) -> S3SimulationConfig {
         S3SimulationConfig {
             max_occlusion_samples: self.simulation.direct.occlusion_samples.unwrap_or(64) as i32,
-            direct_occlusion: DirectOcclusionMode::Raycast,
+            direct_occlusion: DirectOcclusionMode::Volumetric {
+                radius_m: 1.0,
+                sample_count: 32,
+            },
             reflection_rays: self.simulation.reflections.rays.unwrap_or(4_096) as i32,
             reflection_bounces: self.simulation.reflections.bounces.unwrap_or(2) as i32,
             reflection_duration_s: self.simulation.reflections.duration_s.unwrap_or(1.0) as f32,
