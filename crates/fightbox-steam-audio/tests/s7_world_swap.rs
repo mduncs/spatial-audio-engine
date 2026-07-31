@@ -41,12 +41,14 @@ fn prepared_world_swap_is_continuous_generation_safe_and_truthful() {
     let room_bake = bake_s3(&S3BakeRequest {
         mesh: room.clone(),
         probes,
+        elevated_probe_layers: Vec::new(),
         pathing,
     })
     .expect("bake room generation");
     let canyon_bake = bake_s3(&S3BakeRequest {
         mesh: canyon.clone(),
         probes,
+        elevated_probe_layers: Vec::new(),
         pathing,
     })
     .expect("bake canyon generation");

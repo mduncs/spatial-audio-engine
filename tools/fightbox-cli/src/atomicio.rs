@@ -20,7 +20,13 @@ use fightbox_evidence::{WavError, WavSpec, sha256_hex, write_wav};
 use crate::error::{CliError, Result};
 
 /// Resolve `path` to its canonical absolute form even when it does not yet
-/// exist, by canonicalizing the parent and rejoining the final component.
+/// exist, by canonicalizing the nearest ancestor that does exist and rejoining
+/// the components below it.
+///
+/// A run directory that has not been created yet still has to be policy-checked,
+/// and checked *before* anything is created — so this resolves through missing
+/// ancestors rather than refusing them. `AtomicDir::create` creates the parent
+/// afterwards, once the destination is known to be allowed.
 fn canonicalize_target(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return path.canonicalize().map_err(|e| {
@@ -30,22 +36,37 @@ fn canonicalize_target(path: &Path) -> Result<PathBuf> {
             ))
         });
     }
-    let parent = path.parent().ok_or_else(|| {
+    let absolute = std::path::absolute(path).map_err(|e| {
         CliError::new(format!(
-            "output path {} has no parent directory",
+            "output path {} cannot be made absolute: {e}",
             path.display()
         ))
     })?;
-    let parent_canonical = parent.canonicalize().map_err(|e| {
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let name = existing.file_name().ok_or_else(|| {
+            CliError::new(format!(
+                "output path {} has no existing ancestor to resolve against",
+                path.display()
+            ))
+        })?;
+        missing.push(name.to_owned());
+        existing = existing.parent().ok_or_else(|| {
+            CliError::new(format!(
+                "output path {} has no parent directory",
+                path.display()
+            ))
+        })?;
+    }
+    let mut resolved = existing.canonicalize().map_err(|e| {
         CliError::new(format!(
-            "output parent {} does not exist or is not accessible: {e}",
-            parent.display()
+            "output ancestor {} is not accessible: {e}",
+            existing.display()
         ))
     })?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| CliError::new(format!("output path {} has no file name", path.display())))?;
-    Ok(parent_canonical.join(file_name))
+    resolved.extend(missing.iter().rev());
+    Ok(resolved)
 }
 
 /// Reject an output location that is not absolute or that resolves into a
@@ -412,6 +433,28 @@ mod tests {
         assert_eq!(
             resolved.file_name(),
             Some(std::ffi::OsStr::new("s0-bundle"))
+        );
+    }
+
+    #[test]
+    fn validate_output_path_resolves_through_a_run_directory_that_does_not_exist_yet() {
+        // `--output <fresh-run-dir>/<name>.baked` is an ordinary request. The
+        // policy check has to reach a verdict on it without creating anything,
+        // so a long-running command can fail fast on a bad destination.
+        let dir = tempdir();
+        let target = dir.join("run-2026-07-31").join("megablock.baked");
+        let resolved = validate_output_path(&target).expect("missing parents must still resolve");
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("run-2026-07-31/megablock.baked"));
+        assert!(
+            !target.parent().unwrap().exists(),
+            "validation must not create the run directory"
+        );
+
+        // Resolving through missing ancestors must not become a way around the
+        // forbidden-target policy.
+        assert!(
+            validate_output_path(&dir.join("nested").join(".cache/steam-audio/bundle")).is_err()
         );
     }
 

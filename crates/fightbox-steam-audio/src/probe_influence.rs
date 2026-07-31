@@ -16,6 +16,34 @@ pub(crate) struct SerializedProbeInfluences {
 }
 
 impl SerializedProbeInfluences {
+    pub(crate) fn probe_count(self) -> usize {
+        self.sphere_count
+    }
+
+    /// Every probe as `(center, radius)` in Steam Audio coordinates, decoded on
+    /// demand so no copy of the probe array is ever materialized.
+    pub(crate) fn spheres(self, bytes: &[u8]) -> impl Iterator<Item = (SteamVector3, f32)> + '_ {
+        self.sphere_slice(bytes)
+            .unwrap_or_default()
+            .chunks_exact(SERIALIZED_SPHERE_BYTES)
+            .map(|sphere| {
+                (
+                    SteamVector3::new(
+                        read_chunk_f32(sphere, 0),
+                        read_chunk_f32(sphere, 4),
+                        read_chunk_f32(sphere, 8),
+                    ),
+                    read_chunk_f32(sphere, 12),
+                )
+            })
+    }
+
+    fn sphere_slice(self, bytes: &[u8]) -> Option<&[u8]> {
+        let sphere_bytes = self.sphere_count.checked_mul(SERIALIZED_SPHERE_BYTES)?;
+        let spheres_end = self.spheres_offset.checked_add(sphere_bytes)?;
+        bytes.get(self.spheres_offset..spheres_end)
+    }
+
     pub(crate) fn parse(bytes: &[u8], expected_count: u32) -> Result<Self, &'static str> {
         let table = read_u32(bytes, 0).ok_or("serialized probe batch has no root table")? as usize;
         let vtable_distance =
@@ -82,13 +110,7 @@ impl SerializedProbeInfluences {
     }
 
     pub(crate) fn contains(self, bytes: &[u8], point: SteamVector3) -> bool {
-        let Some(sphere_bytes) = self.sphere_count.checked_mul(SERIALIZED_SPHERE_BYTES) else {
-            return false;
-        };
-        let Some(spheres_end) = self.spheres_offset.checked_add(sphere_bytes) else {
-            return false;
-        };
-        let Some(spheres) = bytes.get(self.spheres_offset..spheres_end) else {
+        let Some(spheres) = self.sphere_slice(bytes) else {
             return false;
         };
         spheres.chunks_exact(SERIALIZED_SPHERE_BYTES).any(|sphere| {

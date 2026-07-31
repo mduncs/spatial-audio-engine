@@ -76,6 +76,7 @@ impl FixtureScene {
         Ok(S3BakeRequest {
             mesh: self.mesh.clone(),
             probes: probe_volume,
+            elevated_probe_layers: Vec::new(),
             // Phase A path-bake defaults match the accepted fixture (point
             // visibility, 6 m range, 100 m path range). The fixture records the
             // required call and serialization; runtime visibility is bounded by

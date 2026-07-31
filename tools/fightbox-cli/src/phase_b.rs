@@ -1913,6 +1913,7 @@ fn bake_fixture(prepared: &PreparedFixture) -> Result<BakedProbeBatch> {
     bake_s3(&S3BakeRequest {
         mesh: prepared.mesh.clone(),
         probes: prepared.probes,
+        elevated_probe_layers: Vec::new(),
         pathing: PathBakeConfig::default(),
     })
     .map_err(|error| CliError::new(format!("S6a path bake failed: {error}")))

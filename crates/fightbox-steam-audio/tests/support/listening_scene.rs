@@ -258,6 +258,7 @@ pub fn render_scene(
     let baked = bake_s3(&S3BakeRequest {
         mesh: fixture.mesh.clone(),
         probes: fixture.probes,
+        elevated_probe_layers: Vec::new(),
         pathing: PathBakeConfig {
             num_visibility_samples: 1,
             probe_visibility_radius_m: fixture.probes.spacing_m,

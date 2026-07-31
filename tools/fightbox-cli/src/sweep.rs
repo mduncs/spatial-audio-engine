@@ -1558,6 +1558,7 @@ fn bake_request(world: World, spacing: f32, range: f32) -> S3BakeRequest {
     S3BakeRequest {
         mesh,
         probes,
+        elevated_probe_layers: Vec::new(),
         pathing: PathBakeConfig {
             num_visibility_samples: 1,
             probe_visibility_radius_m: 0.0,

@@ -231,6 +231,35 @@ impl MultiSourceSimulation {
         }
     }
 
+    pub(crate) fn source_diagnostics(
+        &self,
+        source_index: usize,
+    ) -> Option<crate::SourceAcousticDiagnostics> {
+        // The snapshot array is fixed at MAX_ACTIVE_SOURCES, so bound the index
+        // by the generation's configured source count. Reading past it would
+        // report a default-constructed slot as if it were a real source.
+        if source_index >= self.world.source_count {
+            return None;
+        }
+        let source = self.snapshot.sources[source_index];
+        Some(crate::SourceAcousticDiagnostics {
+            source_index,
+            active: source.active,
+            distance_attenuation: source.direct.distance_attenuation,
+            air_absorption: source.direct.air_absorption,
+            directivity: source.direct.directivity,
+            occlusion: source.direct.occlusion,
+            transmission: source.direct.transmission,
+            path_eq: source.path_eq,
+            path_sh_energy: source
+                .path_sh
+                .into_iter()
+                .map(|coefficient| coefficient * coefficient)
+                .sum(),
+            reflection_ir_size: source.reflections.ir_size,
+        })
+    }
+
     pub(crate) fn observe_render_timing(&mut self, elapsed_ns: u64) {
         self.governor.observe_block_timing(elapsed_ns);
     }
@@ -2355,6 +2384,74 @@ mod tests {
         eprintln!(
             "volumetric_edge_crossing raw={raw:?} applied={applied:?} max_applied_step={maximum_applied_step}"
         );
+    }
+
+    #[test]
+    fn source_diagnostics_read_the_requested_source_not_source_zero() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptors = [
+            crate::MultiSourceDescriptor::at(ApiEnuVector3::new(2.0, 3.0, 1.5)),
+            crate::MultiSourceDescriptor::at(ApiEnuVector3::new(5.0, 2.0, 1.5)),
+        ];
+        let (mut simulation, _render) =
+            build_multi_source_session(&mesh, &baked, audio, test_config(), &descriptors).unwrap();
+        simulation.update_inputs(&update(true, true));
+        simulation.run_direct().unwrap();
+        simulation.run_pathing().unwrap();
+        simulation.run_reflections().unwrap();
+
+        let zero = simulation
+            .source_diagnostics(0)
+            .expect("source zero exists");
+        let one = simulation.source_diagnostics(1).expect("source one exists");
+        assert_eq!(zero.source_index, 0);
+        assert_eq!(one.source_index, 1);
+        for (diagnostics, snapshot) in [(zero, 0), (one, 1)] {
+            let snapshot = simulation.snapshot.sources[snapshot];
+            assert_eq!(
+                diagnostics.distance_attenuation.to_bits(),
+                snapshot.direct.distance_attenuation.to_bits()
+            );
+            assert_eq!(
+                diagnostics.occlusion.to_bits(),
+                snapshot.direct.occlusion.to_bits()
+            );
+            assert_eq!(
+                diagnostics.transmission.map(f32::to_bits),
+                snapshot.direct.transmission.map(f32::to_bits)
+            );
+            assert_eq!(
+                diagnostics.path_eq.map(f32::to_bits),
+                snapshot.path_eq.map(f32::to_bits)
+            );
+            assert_eq!(diagnostics.reflection_ir_size, snapshot.reflections.ir_size);
+        }
+        // The two sources sit at different distances from the listener, so a
+        // reader that silently returned source zero would be caught here.
+        assert_ne!(
+            zero.distance_attenuation.to_bits(),
+            one.distance_attenuation.to_bits(),
+            "both sources reported the same distance attenuation: {zero:?} {one:?}"
+        );
+
+        simulation.update_inputs(&update(true, false));
+        simulation.run_direct().unwrap();
+        assert!(simulation.source_diagnostics(0).unwrap().active);
+        assert!(!simulation.source_diagnostics(1).unwrap().active);
+
+        // The snapshot array is MAX_ACTIVE_SOURCES wide regardless of how many
+        // sources this session configured; unconfigured slots are not sources.
+        assert!(simulation.source_diagnostics(2).is_none());
+        assert!(simulation.source_diagnostics(MAX_ACTIVE_SOURCES).is_none());
     }
 
     #[test]

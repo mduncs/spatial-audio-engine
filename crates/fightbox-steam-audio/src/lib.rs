@@ -13,14 +13,15 @@
 
 #[cfg(any(feature = "linked-sdk", test))]
 mod backend_snapshot;
+mod elevated_probes;
 mod governor;
 #[cfg(any(feature = "linked-sdk", test))]
 mod motion_smoothing;
-#[cfg(any(feature = "linked-sdk", test))]
 mod probe_influence;
 mod status;
 #[allow(unsafe_code)]
 mod world_swap;
+pub use elevated_probes::ElevatedProbeLayer;
 pub use governor::{
     DeliveredReflectionQuality, GovernorSimulationPass, GovernorTransitionReason, PathQualityLevel,
     QualityGovernorTelemetry, REVERB_RUNG_CAPABILITIES, ReflectionQualityLevel,
@@ -463,6 +464,10 @@ impl Default for PathBakeConfig {
 pub struct S3BakeRequest {
     pub mesh: SceneMesh,
     pub probes: ProbeVolume,
+    /// Extra mid-air probe layers merged into the same probe batch as the
+    /// uniform-floor probes. Empty by default, and an empty list produces a
+    /// byte-identical batch to a bake that never knew about layers at all.
+    pub elevated_probe_layers: Vec<ElevatedProbeLayer>,
     pub pathing: PathBakeConfig,
 }
 
@@ -471,6 +476,7 @@ impl Default for S3BakeRequest {
         Self {
             mesh: SceneMesh::controlled_s3_corner(),
             probes: ProbeVolume::default(),
+            elevated_probe_layers: Vec::new(),
             pathing: PathBakeConfig {
                 num_visibility_samples: 1,
                 probe_visibility_radius_m: 1.0,
@@ -564,6 +570,60 @@ impl BakedProbeBatch {
             ));
         }
         Ok(())
+    }
+
+    /// Borrow the batch's probe-influence spheres so a caller can ask which
+    /// positions this bake actually covers.
+    ///
+    /// Parsing walks the serialized probe vector once. Call this off the audio
+    /// callback — control and UI code (probe-coverage overlays, bake QA, "why is
+    /// this elevated source silent?") is the intended consumer. The returned
+    /// view allocates nothing further and borrows the batch's bytes.
+    pub fn probe_coverage(&self) -> Result<ProbeCoverage<'_>, BackendError> {
+        let influences = probe_influence::SerializedProbeInfluences::parse(
+            &self.bytes,
+            self.metadata.probe_count,
+        )
+        .map_err(BackendError::InvalidProbeBatch)?;
+        Ok(ProbeCoverage {
+            bytes: &self.bytes,
+            influences,
+        })
+    }
+}
+
+/// A borrowed, allocation-free view of one baked batch's probe influence spheres.
+///
+/// Obtained from [`BakedProbeBatch::probe_coverage`].
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeCoverage<'batch> {
+    bytes: &'batch [u8],
+    influences: probe_influence::SerializedProbeInfluences,
+}
+
+impl ProbeCoverage<'_> {
+    /// Whether any probe's influence sphere contains `position`.
+    ///
+    /// A position with no influencing probe gets no baked pathing from this
+    /// batch, however much path data the batch holds — that is the failure mode
+    /// a source lifted into mid-air runs into.
+    #[must_use]
+    pub fn contains(&self, position: EnuVector3) -> bool {
+        self.influences.contains(self.bytes, enu_to_steam(position))
+    }
+
+    /// Number of probes in the batch.
+    #[must_use]
+    pub fn probe_count(&self) -> usize {
+        self.influences.probe_count()
+    }
+
+    /// Every probe as `(center, influence_radius_m)` in ENU metres, decoded on
+    /// demand. Useful for drawing coverage rather than point-testing it.
+    pub fn spheres(&self) -> impl Iterator<Item = (EnuVector3, f32)> + '_ {
+        self.influences
+            .spheres(self.bytes)
+            .map(|(center, radius)| (steam_to_enu(center), radius))
     }
 }
 
@@ -935,6 +995,29 @@ pub struct WorldGenerationDiagnostics {
     pub reflection_ir_size: i32,
 }
 
+/// Per-source proof values copied from the latest simulation snapshot.
+///
+/// [`WorldGenerationDiagnostics`] answers "what is this world doing"; this
+/// answers "what is this one source doing", which is what a multi-source session
+/// needs before it can say anything true about a source other than zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SourceAcousticDiagnostics {
+    pub source_index: usize,
+    /// False for a slot the caller has not marked active this frame. The other
+    /// fields still read the snapshot rather than being blanked.
+    pub active: bool,
+    pub distance_attenuation: f32,
+    pub air_absorption: [f32; 3],
+    pub directivity: f32,
+    /// Steam Audio's convention, not an obstruction fraction: `1.0` is fully
+    /// audible and `0.0` is fully blocked.
+    pub occlusion: f32,
+    pub transmission: [f32; 3],
+    pub path_eq: [f32; 3],
+    pub path_sh_energy: f32,
+    pub reflection_ir_size: i32,
+}
+
 /// A fully constructed second world which has not yet been offered to the
 /// callback. It can be primed with simulation updates before adoption.
 pub struct PreparedSteamAudioWorld {
@@ -1137,6 +1220,23 @@ impl SteamAudioSimulationRunner {
         return self.inner.diagnostics();
         #[cfg(not(feature = "linked-sdk"))]
         unreachable!("an SDK-unavailable build cannot own a live session")
+    }
+
+    /// Copies proof values for one source from the control-side snapshot.
+    ///
+    /// `None` for an index at or beyond this generation's source count.
+    /// [`world_diagnostics`](Self::world_diagnostics) reports source zero
+    /// whatever the session holds, so per-source UI must come through here.
+    /// This is a plain snapshot read: no allocation, no SDK call, no lock.
+    #[must_use]
+    pub fn source_diagnostics(&self, source_index: usize) -> Option<SourceAcousticDiagnostics> {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.source_diagnostics(source_index);
+        #[cfg(not(feature = "linked-sdk"))]
+        {
+            let _ = source_index;
+            None
+        }
     }
 }
 
@@ -2316,6 +2416,151 @@ mod tests {
 
     #[cfg(feature = "linked-sdk")]
     #[test]
+    fn public_source_diagnostics_reach_every_configured_source_and_stop_there() {
+        use fightbox_runtime::backend::SimulationRunner as _;
+
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .expect("corner bake must succeed");
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let sources = [
+            MultiSourceDescriptor::at(fightbox_api::EnuVector3::new(2.0, 3.0, 1.5)),
+            MultiSourceDescriptor::at(fightbox_api::EnuVector3::new(5.0, 2.0, 1.5)),
+        ];
+        let (mut runner, _render) = build_multi_source_session(
+            &mesh,
+            &baked,
+            audio,
+            S3SimulationConfig {
+                reflection_rays: 64,
+                diffuse_samples: 8,
+                reflection_bounces: 1,
+                reflection_duration_s: 0.05,
+                reflection_order: 1,
+                pathing_order: 1,
+                ..S3SimulationConfig::default()
+            },
+            &sources,
+        )
+        .expect("two-source session must build");
+
+        let mut update = fightbox_runtime::backend::SimulationUpdate {
+            listener: fightbox_api::ListenerState {
+                pose: pose_at(fightbox_api::EnuVector3::new(4.0, 6.0, 1.5)),
+                linear_velocity_mps: fightbox_api::EnuVector3::default(),
+            },
+            sources: [fightbox_runtime::backend::SourceMotion::default();
+                fightbox_runtime::backend::MAX_ACTIVE_SOURCES],
+        };
+        for (slot, descriptor) in [(0, sources[0]), (1, sources[1])] {
+            update.sources[slot] = fightbox_runtime::backend::SourceMotion {
+                active: true,
+                pose: pose_at(descriptor.initial_position_enu),
+                linear_velocity_mps: fightbox_api::EnuVector3::default(),
+            };
+        }
+        runner.update_inputs(&update);
+        runner.run_direct().expect("direct simulation");
+
+        let zero = runner.source_diagnostics(0).expect("source zero exists");
+        let one = runner.source_diagnostics(1).expect("source one exists");
+        assert_eq!((zero.source_index, one.source_index), (0, 1));
+        assert!(zero.active && one.active);
+        assert_ne!(
+            zero.distance_attenuation.to_bits(),
+            one.distance_attenuation.to_bits(),
+            "the public accessor reported one source twice: {zero:?} {one:?}"
+        );
+        // world_diagnostics reports source zero whatever the session holds.
+        assert_eq!(
+            runner.world_diagnostics().path_eq.map(f32::to_bits),
+            zero.path_eq.map(f32::to_bits)
+        );
+        assert!(runner.source_diagnostics(2).is_none());
+        assert!(
+            runner
+                .source_diagnostics(fightbox_runtime::backend::MAX_ACTIVE_SOURCES)
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "linked-sdk")]
+    fn pose_at(position: fightbox_api::EnuVector3) -> fightbox_api::Pose {
+        fightbox_api::Pose {
+            position,
+            forward: fightbox_api::EnuVector3::new(0.0, 1.0, 0.0),
+            up: fightbox_api::EnuVector3::new(0.0, 0.0, 1.0),
+        }
+    }
+
+    #[cfg(feature = "linked-sdk")]
+    #[test]
+    fn an_empty_elevated_layer_list_bakes_the_same_bytes_as_a_floor_only_request() {
+        let floor_only = bake_s3(&S3BakeRequest::default()).expect("floor-only bake must succeed");
+        let explicitly_empty = bake_s3(&S3BakeRequest {
+            elevated_probe_layers: Vec::new(),
+            ..S3BakeRequest::default()
+        })
+        .expect("explicitly empty layer list must bake");
+        assert_eq!(
+            floor_only.metadata.content_sha256,
+            explicitly_empty.metadata.content_sha256
+        );
+        assert_eq!(floor_only.bytes, explicitly_empty.bytes);
+    }
+
+    #[cfg(feature = "linked-sdk")]
+    #[test]
+    fn an_elevated_layer_adds_probes_that_cover_mid_air_positions_the_floor_layer_misses() {
+        // The unit-test corner's floor probes top out at 1.5 m; nothing reaches
+        // 12 m, which is the whole problem elevated layers exist to solve.
+        let floor_only = bake_s3(&S3BakeRequest::default()).expect("floor-only bake must succeed");
+        let mid_air = EnuVector3::new(-4.0, -4.0, 12.0);
+        assert!(
+            !floor_only
+                .probe_coverage()
+                .expect("floor-only batch must parse")
+                .contains(mid_air)
+        );
+
+        let layered = bake_s3(&S3BakeRequest {
+            probes: ProbeVolume {
+                max_enu_m: EnuVector3::new(7.0, 9.0, 16.0),
+                ..ProbeVolume::default()
+            },
+            elevated_probe_layers: vec![ElevatedProbeLayer {
+                height_enu_m: 12.0,
+                spacing_m: 2.0,
+            }],
+            ..S3BakeRequest::default()
+        })
+        .expect("layered bake must succeed");
+
+        assert!(layered.metadata.probe_count > floor_only.metadata.probe_count);
+        assert!(layered.metadata.path_data_size_bytes > 0);
+        layered.validate().expect("layered bake must validate");
+
+        let coverage = layered.probe_coverage().expect("layered batch must parse");
+        assert_eq!(
+            coverage.probe_count(),
+            layered.metadata.probe_count as usize
+        );
+        assert!(coverage.contains(mid_air));
+        let elevated = coverage
+            .spheres()
+            .filter(|(center, _)| (center.z - 12.0).abs() < 1.0e-3)
+            .count();
+        assert!(elevated > 0, "the elevated layer must reach the batch");
+    }
+
+    #[cfg(feature = "linked-sdk")]
+    #[test]
     fn linked_lifetime_fixture_reloads_simulates_and_renders_separate_stems() {
         let baked = bake_s3(&S3BakeRequest::default())
             .expect("unit-test corner should generate probes and bake pathing");
@@ -3375,6 +3620,7 @@ mod tests {
                 spacing_m: 1.0,
                 height_above_floor_m: 1.5,
             },
+            elevated_probe_layers: Vec::new(),
             pathing,
         }
     }
@@ -3434,6 +3680,7 @@ mod tests {
                 spacing_m,
                 height_above_floor_m: 1.5,
             },
+            elevated_probe_layers: Vec::new(),
             pathing,
         }
     }

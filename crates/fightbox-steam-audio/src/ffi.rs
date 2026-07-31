@@ -818,6 +818,8 @@ unsafe extern "system" {
     fn raw_probe_batch_release(probe_batch: *mut IPLProbeBatch);
     #[link_name = "iplProbeBatchGetNumProbes"]
     fn raw_probe_batch_get_num_probes(probe_batch: IPLProbeBatch) -> c_int;
+    #[link_name = "iplProbeBatchAddProbe"]
+    fn raw_probe_batch_add_probe(probe_batch: IPLProbeBatch, probe: IPLSphere);
     #[link_name = "iplProbeBatchAddProbeArray"]
     fn raw_probe_batch_add_probe_array(probe_batch: IPLProbeBatch, probe_array: IPLProbeArray);
     #[link_name = "iplProbeBatchCommit"]
@@ -1218,6 +1220,10 @@ pub fn probe_batch_release(probe_batch: &mut IPLProbeBatch) {
 
 pub fn probe_batch_get_num_probes(probe_batch: IPLProbeBatch) -> c_int {
     unsafe { raw_probe_batch_get_num_probes(probe_batch) }
+}
+
+pub fn probe_batch_add_probe(probe_batch: IPLProbeBatch, probe: IPLSphere) {
+    unsafe { raw_probe_batch_add_probe(probe_batch, probe) }
 }
 
 pub fn probe_batch_add_probe_array(probe_batch: IPLProbeBatch, probe_array: IPLProbeArray) {

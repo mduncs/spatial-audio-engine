@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use fightbox_api::EnuVector3;
 use fightbox_steam_audio::{
-    AcousticMaterial, BakedProbeBatch, PROBE_BATCH_METADATA_SCHEMA, PathBakeConfig,
-    ProbeBatchMetadata, ProbeVolume, S3BakeRequest, STEAM_AUDIO_UPSTREAM_COMMIT,
+    AcousticMaterial, BakedProbeBatch, ElevatedProbeLayer, PROBE_BATCH_METADATA_SCHEMA,
+    PathBakeConfig, ProbeBatchMetadata, ProbeVolume, S3BakeRequest, STEAM_AUDIO_UPSTREAM_COMMIT,
     STEAM_AUDIO_VERSION, SceneMesh, bake_s3,
 };
 use fightbox_world::{
@@ -488,7 +488,7 @@ fn inspect_text(package: &Path) -> Result<String> {
     Ok(output)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BakeConfig {
     pub path_range_m: f32,
     pub visibility_range_m: f32,
@@ -497,6 +497,10 @@ pub(crate) struct BakeConfig {
     pub probe_spacing_m: f32,
     pub probe_height_above_floor_m: f32,
     pub probe_ceiling_m: f32,
+    /// Absolute ENU altitudes, in metres, of extra mid-air probe layers. Empty
+    /// by default; each entry adds one flat layer over the same horizontal
+    /// footprint at the same spacing as the floor probes.
+    pub elevated_probe_layers_m: Vec<f32>,
     pub bake_threads: i32,
 }
 
@@ -511,6 +515,7 @@ impl Default for BakeConfig {
             probe_spacing_m: PROBE_SPACING_M,
             probe_height_above_floor_m: PROBE_HEIGHT_M,
             probe_ceiling_m: PROBE_CEILING_M,
+            elevated_probe_layers_m: Vec::new(),
             bake_threads: pathing.num_threads,
         }
     }
@@ -525,11 +530,25 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
     let loaded = read_package(package)
         .map_err(|error| CliError::new(format!("cannot load package: {error}")))?;
     let scene = scene_mesh(&loaded)?;
-    let probes = probe_volume(&scene, config)?;
+    let probes = probe_volume(&scene, &config)?;
+    // Claim the destination before the bake, not after. A city-scale path bake
+    // is minutes of work; discovering an unwritable or already-occupied output
+    // at the end of it throws all of that away.
+    let output = validate_output_path(output)?;
+    let directory = AtomicDir::create(output.clone())?;
+
     let defaults = PathBakeConfig::default();
     let baked = bake_s3(&S3BakeRequest {
         mesh: scene,
         probes,
+        elevated_probe_layers: config
+            .elevated_probe_layers_m
+            .iter()
+            .map(|height_enu_m| ElevatedProbeLayer {
+                height_enu_m: *height_enu_m,
+                spacing_m: config.probe_spacing_m,
+            })
+            .collect(),
         pathing: PathBakeConfig {
             num_visibility_samples: config.visibility_samples,
             probe_visibility_radius_m: defaults.probe_visibility_radius_m,
@@ -544,8 +563,6 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
         .validate()
         .map_err(|error| CliError::new(format!("city bake validation failed: {error}")))?;
 
-    let output = validate_output_path(output)?;
-    let directory = AtomicDir::create(output.clone())?;
     let temp = directory.temp_path();
     write_bytes_atomic(&temp.join("probe-batch.bin"), &baked.bytes)?;
     write_json_string_atomic(
@@ -564,9 +581,10 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
     )?;
     directory.commit()?;
     eprintln!(
-        "fightbox: city bake written to {} (probes={}, sha256={})",
+        "fightbox: city bake written to {} (probes={}, elevated_layers_m={:?}, sha256={})",
         output.display(),
         baked.metadata.probe_count,
+        config.elevated_probe_layers_m,
         baked.metadata.content_sha256
     );
     Ok(())
@@ -631,7 +649,7 @@ fn scene_mesh(loaded: &fightbox_world::LoadedPackage) -> Result<SceneMesh> {
     })
 }
 
-fn probe_volume(mesh: &SceneMesh, config: BakeConfig) -> Result<ProbeVolume> {
+fn probe_volume(mesh: &SceneMesh, config: &BakeConfig) -> Result<ProbeVolume> {
     let first = *mesh
         .vertices_enu_m
         .first()
@@ -1181,7 +1199,7 @@ mod tests {
             material_indices: Vec::new(),
             materials: Vec::new(),
         };
-        let probes = probe_volume(&mesh, BakeConfig::default()).unwrap();
+        let probes = probe_volume(&mesh, &BakeConfig::default()).unwrap();
         assert_eq!(
             probes,
             ProbeVolume {
@@ -1191,6 +1209,7 @@ mod tests {
                 height_above_floor_m: 1.5,
             }
         );
+        assert!(BakeConfig::default().elevated_probe_layers_m.is_empty());
     }
 
     #[test]

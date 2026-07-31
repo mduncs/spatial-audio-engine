@@ -355,6 +355,53 @@ fn megablock_source_teleport_pathing_is_order_independent() {
     );
 }
 
+/// Report which mid-air positions the bake under test actually covers.
+///
+/// A source with no influencing probe gets no baked pathing at all, so this is
+/// the first thing to check when an airborne source goes silent behind a
+/// building. Point it at an elevated bake with `FIGHTBOX_DIAG_BAKE`.
+#[test]
+#[ignore = "requires the locally acquired Steam Audio 4.8.1 SDK and megablock bake"]
+fn megablock_probe_coverage_reports_which_heights_are_reachable() {
+    const ARTILLERY_COLUMN: (f32, f32) = (102.5, 102.5);
+    let bake = env_path(
+        "FIGHTBOX_DIAG_BAKE",
+        "/Users/md/fightbox-runs/megablock-seed1/megablock.baked",
+    );
+    let baked = load_baked(&bake);
+    let coverage = baked
+        .probe_coverage()
+        .expect("megablock probe batch exposes its influence spheres");
+
+    let mut by_height: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    for (center, _) in coverage.spheres() {
+        *by_height.entry(center.z.round() as i32).or_default() += 1;
+    }
+    println!(
+        "COVERAGE bake={} probes={} distinct_heights={} probes_at_3m={:?} probes_at_30m={:?}",
+        bake.display(),
+        coverage.probe_count(),
+        by_height.len(),
+        by_height.get(&3),
+        by_height.get(&30),
+    );
+
+    for height_m in [1.5, 15.0, 30.0, 45.0, 63.0] {
+        let position = EnuVector3::new(ARTILLERY_COLUMN.0, ARTILLERY_COLUMN.1, height_m);
+        println!(
+            "COVERAGE column=[{:.1},{:.1}] height_m={height_m:.1} has_influencing_probe={}",
+            ARTILLERY_COLUMN.0,
+            ARTILLERY_COLUMN.1,
+            coverage.contains(position),
+        );
+    }
+
+    assert!(
+        coverage.contains(EnuVector3::new(ARTILLERY_COLUMN.0, ARTILLERY_COLUMN.1, 1.5)),
+        "street level must always be covered"
+    );
+}
+
 #[test]
 #[ignore = "requires the locally acquired Steam Audio 4.8.1 SDK and megablock bake"]
 fn megablock_artillery_direct_and_reflection_diagnostics() {

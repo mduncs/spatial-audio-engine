@@ -41,6 +41,7 @@ fn s6a_desktop_vs_mobile_render_and_tracked_memory() {
     let baked = bake_s3(&S3BakeRequest {
         mesh: mesh.clone(),
         probes,
+        elevated_probe_layers: Vec::new(),
         pathing: PathBakeConfig {
             probe_visibility_radius_m: probes.spacing_m,
             visibility_threshold: 0.1,

@@ -73,7 +73,10 @@ city bake        Bake probes for a city package (requires linked-sdk)\n    \
                   [--visibility-samples <n>] [--visibility-threshold <0..1>]\n    \
                   [--probe-spacing-m <m>] [--probe-height-above-floor-m <m>]\n    \
                   [--probe-ceiling-m <m>] [--bake-threads <n>]\n    \
-                  defaults: 100m, 6m, 1, 0.5, 4m, 1.5m, 3m, 1 thread\n    \
+                  [--elevated-probe-layer-m <m>] (repeatable; adds a flat\n    \
+                  mid-air probe layer at that ENU altitude so airborne\n    \
+                  sources have influencing probes)\n    \
+                  defaults: 100m, 6m, 1, 0.5, 4m, 1.5m, 3m, no layers, 1 thread\n    \
 city render      Render a fixture through a packaged and baked city\n\n\
 city metamorphic Jitter assumed heights, bake, and assert the occlusion percept\n\n\
 SWEEP OUTPUT:\n    <report-directory>/report.json\n    \
@@ -161,6 +164,7 @@ fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, cit
     let mut probe_spacing_m = None;
     let mut probe_height_above_floor_m = None;
     let mut probe_ceiling_m = None;
+    let mut elevated_probe_layers_m: Vec<f32> = Vec::new();
     let mut bake_threads = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -205,6 +209,20 @@ fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, cit
             "--probe-ceiling-m" => {
                 set_once(&mut probe_ceiling_m, parse_positive_f32(value, flag)?, flag)?
             }
+            // Repeatable by design: one flag per layer, so several altitudes can
+            // be requested without inventing a list syntax.
+            "--elevated-probe-layer-m" => {
+                let height = parse_positive_f32(value, flag)?;
+                if elevated_probe_layers_m
+                    .iter()
+                    .any(|existing| *existing == height)
+                {
+                    return Err(error::CliError::new(format!(
+                        "duplicate {flag} altitude {height}"
+                    )));
+                }
+                elevated_probe_layers_m.push(height);
+            }
             "--bake-threads" => {
                 set_once(&mut bake_threads, parse_positive_i32(value, flag)?, flag)?
             }
@@ -228,6 +246,7 @@ fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, cit
             probe_height_above_floor_m: probe_height_above_floor_m
                 .unwrap_or(defaults.probe_height_above_floor_m),
             probe_ceiling_m: probe_ceiling_m.unwrap_or(defaults.probe_ceiling_m),
+            elevated_probe_layers_m,
             bake_threads: bake_threads.unwrap_or(defaults.bake_threads),
         },
     ))
@@ -726,6 +745,10 @@ mod tests {
             "3".into(),
             "--probe-ceiling-m".into(),
             "63".into(),
+            "--elevated-probe-layer-m".into(),
+            "30".into(),
+            "--elevated-probe-layer-m".into(),
+            "80".into(),
             "--bake-threads".into(),
             "10".into(),
         ])
@@ -740,9 +763,26 @@ mod tests {
                 probe_spacing_m: 8.0,
                 probe_height_above_floor_m: 3.0,
                 probe_ceiling_m: 63.0,
+                elevated_probe_layers_m: vec![30.0, 80.0],
                 bake_threads: 10,
             }
         );
+    }
+
+    #[test]
+    fn city_bake_rejects_a_repeated_elevated_layer_altitude() {
+        let error = parse_city_bake_args(&[
+            "--package".into(),
+            "city.fightbox".into(),
+            "--output".into(),
+            "city.baked".into(),
+            "--elevated-probe-layer-m".into(),
+            "30".into(),
+            "--elevated-probe-layer-m".into(),
+            "30".into(),
+        ])
+        .unwrap_err();
+        assert!(error.message().contains("duplicate"));
     }
 
     #[test]

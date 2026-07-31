@@ -5,22 +5,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::elevated_probes;
 use crate::ffi;
 use crate::{
-    AudioConfig, BackendError, BakedProbeBatch, DirectOcclusionMode, DirectSnapshot, EnuVector3,
-    ListenerPose, OwnedStereoPcm, PROBE_BATCH_METADATA_SCHEMA, PathSnapshot, PathValidationSegment,
-    ProbeBatchMetadata, ProbeVolume, ReflectionEffectType, ReflectionSnapshot, S0RenderOutput,
-    S0RenderRequest, S3_BENCHMARK_MAX_DIFFUSE_SAMPLES, S3_BENCHMARK_MAX_OCCLUSION_SAMPLES,
-    S3_BENCHMARK_MAX_RAY_BATCH_SIZE, S3_BENCHMARK_MAX_REFLECTION_BOUNCES,
-    S3_BENCHMARK_MAX_REFLECTION_IR_SAMPLES, S3_BENCHMARK_MAX_REFLECTION_ITERATIONS,
-    S3_BENCHMARK_MAX_REFLECTION_RAYS, S3_BENCHMARK_MAX_SIMULATION_THREADS,
-    S3_BENCHMARK_MAX_STANDARD_ITERATIONS, S3_CONTINUITY_STEP_TO_PEAK_THRESHOLD,
-    S3_CONTINUITY_WINDOW_FRAMES, S3BakeRequest, S3BenchmarkFiniteChecks, S3BenchmarkOutput,
-    S3BenchmarkRequest, S3RenderOutput, S3RenderRequest, S3RetainedSessionStats,
-    S3SimulationConfig, S3SimulationSnapshot, S3StageTimingSamples, S3Stems, S3TrajectoryBlock,
-    S3TrajectoryRenderOutput, S3TrajectoryRenderRequest, STEAM_AUDIO_UPSTREAM_COMMIT,
-    STEAM_AUDIO_VERSION, SceneMesh, SteamVector3, decode_path_direction_enu, enu_to_steam,
-    measure_s3_summed_boundary_continuity, sha256_hex, steam_to_enu, validate_direct_snapshot,
+    AudioConfig, BackendError, BakedProbeBatch, DirectOcclusionMode, DirectSnapshot,
+    ElevatedProbeLayer, EnuVector3, ListenerPose, OwnedStereoPcm, PROBE_BATCH_METADATA_SCHEMA,
+    PathSnapshot, PathValidationSegment, ProbeBatchMetadata, ProbeVolume, ReflectionEffectType,
+    ReflectionSnapshot, S0RenderOutput, S0RenderRequest, S3_BENCHMARK_MAX_DIFFUSE_SAMPLES,
+    S3_BENCHMARK_MAX_OCCLUSION_SAMPLES, S3_BENCHMARK_MAX_RAY_BATCH_SIZE,
+    S3_BENCHMARK_MAX_REFLECTION_BOUNCES, S3_BENCHMARK_MAX_REFLECTION_IR_SAMPLES,
+    S3_BENCHMARK_MAX_REFLECTION_ITERATIONS, S3_BENCHMARK_MAX_REFLECTION_RAYS,
+    S3_BENCHMARK_MAX_SIMULATION_THREADS, S3_BENCHMARK_MAX_STANDARD_ITERATIONS,
+    S3_CONTINUITY_STEP_TO_PEAK_THRESHOLD, S3_CONTINUITY_WINDOW_FRAMES, S3BakeRequest,
+    S3BenchmarkFiniteChecks, S3BenchmarkOutput, S3BenchmarkRequest, S3RenderOutput,
+    S3RenderRequest, S3RetainedSessionStats, S3SimulationConfig, S3SimulationSnapshot,
+    S3StageTimingSamples, S3Stems, S3TrajectoryBlock, S3TrajectoryRenderOutput,
+    S3TrajectoryRenderRequest, STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION, SceneMesh,
+    SteamVector3, decode_path_direction_enu, enu_to_steam, measure_s3_summed_boundary_continuity,
+    sha256_hex, steam_to_enu, validate_direct_snapshot,
 };
 
 #[path = "multi_source.rs"]
@@ -262,6 +264,13 @@ impl MultiSourceSimulation {
 
     pub(crate) fn diagnostics(&self) -> crate::WorldGenerationDiagnostics {
         self.active.diagnostics()
+    }
+
+    pub(crate) fn source_diagnostics(
+        &self,
+        source_index: usize,
+    ) -> Option<crate::SourceAcousticDiagnostics> {
+        self.active.source_diagnostics(source_index)
     }
 }
 
@@ -971,6 +980,44 @@ impl<'context> ProbeBatch<'context> {
         Ok(batch)
     }
 
+    /// Merge manually placed mid-air probes into this batch and return the new
+    /// total probe count.
+    ///
+    /// Steam Audio 4.8.1 bakes pathing against a single batch and the runtime
+    /// loads a single batch, so the elevated probes have to live here rather
+    /// than in a batch of their own. `iplProbeBatchAddProbe` is the only route
+    /// to a probe the uniform-floor generator would never place.
+    fn add_elevated_layers(
+        &self,
+        layers: &[ElevatedProbeLayer],
+        volume: ProbeVolume,
+        mesh: &SceneMesh,
+    ) -> Result<u32, BackendError> {
+        for layer in layers {
+            for center in elevated_probes::layer_probe_centers(volume, *layer, mesh) {
+                let center = enu_to_steam(center);
+                ffi::probe_batch_add_probe(
+                    self.raw(),
+                    ffi::IPLSphere {
+                        center: ffi::IPLVector3 {
+                            x: center.x,
+                            y: center.y,
+                            z: center.z,
+                        },
+                        radius: layer.spacing_m,
+                    },
+                );
+            }
+        }
+        // Adding probes invalidates the ProbeTree built by the earlier commit.
+        ffi::probe_batch_commit(self.raw());
+        let count = self.probe_count();
+        if count <= 0 {
+            return Err(BackendError::ProbeGenerationProducedNoProbes);
+        }
+        Ok(count as u32)
+    }
+
     fn raw(&self) -> ffi::IPLProbeBatch {
         self.raw.as_ptr()
     }
@@ -1275,9 +1322,20 @@ pub fn bake_s3(request: &S3BakeRequest) -> Result<BakedProbeBatch, BackendError>
     })?;
     let scene = Scene::create_default(&context)?;
     let _static_mesh = StaticMesh::create_and_add(&scene, &request.mesh)?;
-    let (probe_array, probe_count) =
+    let (probe_array, floor_probe_count) =
         ProbeArray::generate_uniform_floor(&context, &scene, request.probes)?;
     let probe_batch = ProbeBatch::from_array(&context, &probe_array)?;
+    // An empty layer list must not touch the batch at all, so a request that
+    // predates elevated layers serializes to the same bytes it always did.
+    let probe_count = if request.elevated_probe_layers.is_empty() {
+        floor_probe_count
+    } else {
+        probe_batch.add_elevated_layers(
+            &request.elevated_probe_layers,
+            request.probes,
+            &request.mesh,
+        )?
+    };
 
     let mut bake_params = ffi::IPLPathBakeParams {
         scene: scene.raw(),
@@ -2681,6 +2739,9 @@ fn progress_fraction_millionths(progress: f32) -> u32 {
 fn validate_bake_config(request: &S3BakeRequest) -> Result<(), BackendError> {
     validate_mesh(&request.mesh)?;
     validate_probe_volume(request.probes)?;
+    for layer in &request.elevated_probe_layers {
+        validate_elevated_probe_layer(*layer)?;
+    }
     let config = request.pathing;
     if config.num_visibility_samples <= 0 {
         return Err(BackendError::InvalidInput(
@@ -2977,6 +3038,20 @@ fn validate_probe_volume(volume: ProbeVolume) -> Result<(), BackendError> {
     if !volume.height_above_floor_m.is_finite() || volume.height_above_floor_m <= 0.0 {
         return Err(BackendError::InvalidInput(
             "probe height must be finite and positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_elevated_probe_layer(layer: ElevatedProbeLayer) -> Result<(), BackendError> {
+    if !layer.height_enu_m.is_finite() {
+        return Err(BackendError::InvalidInput(
+            "elevated probe layer height must be finite",
+        ));
+    }
+    if !layer.spacing_m.is_finite() || layer.spacing_m <= 0.0 {
+        return Err(BackendError::InvalidInput(
+            "elevated probe layer spacing must be finite and positive",
         ));
     }
     Ok(())
