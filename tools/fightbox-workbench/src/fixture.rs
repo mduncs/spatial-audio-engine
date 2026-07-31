@@ -339,7 +339,7 @@ mod tests {
         );
         assert_eq!(fixture.sources.len(), 4);
         assert!(fixture.sources[0].default_enabled);
-        assert_eq!(fixture.sources[0].reference_level.db_spl, 85.0);
+        assert_eq!(fixture.sources[0].reference_level.db_spl, 105.0);
         assert_eq!(fixture.sources[1].asset_id, "artillery-impact");
         assert_eq!(fixture.sources[1].reference_level.db_spl, 155.0);
         assert!(!fixture.sources[1].default_enabled);
@@ -359,7 +359,7 @@ mod tests {
             8.0
         );
         assert_eq!(fixture.sources[3].asset_id, "church-bells");
-        assert_eq!(fixture.sources[3].reference_level.db_spl, 105.0);
+        assert_eq!(fixture.sources[3].reference_level.db_spl, 115.0);
         assert!(!fixture.sources[3].default_enabled);
         assert_eq!(
             fixture.sources[3].initial_position().unwrap(),

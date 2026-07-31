@@ -38,6 +38,9 @@ const DEFAULT_AUTOPILOT_SPEED_MPS: f32 = 6.0;
 const METER_WINDOW_SECONDS: f32 = 0.5;
 const FIRST_PERSON_VERTICAL_FOV_RADIANS: f32 = 70.0_f32.to_radians();
 const FIRST_PERSON_NEAR_M: f32 = 0.1;
+const ARTILLERY_ASSET_ID: &str = "artillery-impact";
+const ARTILLERY_RETRIGGER_SECONDS: u32 = 3;
+const PICTURE_IN_PICTURE_MARGIN: f32 = 14.0;
 
 pub struct Workbench {
     mesh: AcousticMesh,
@@ -420,6 +423,10 @@ impl Workbench {
             audio_block_writer,
             Some(capture_tap),
         );
+        let playback = source_views
+            .iter()
+            .map(|source| SourcePlayback::for_asset(&source.asset_id, SAMPLE_RATE))
+            .collect();
         let signals = prepared_sources
             .into_iter()
             .map(|(_, samples)| samples)
@@ -429,6 +436,7 @@ impl Workbench {
             processor,
             engine_config,
             signals,
+            playback,
             source_mix_reader,
             args.device.as_deref(),
         );
@@ -536,6 +544,7 @@ impl Workbench {
     }
 
     fn draw_scene(&self, painter: &egui::Painter, rect: Rect) {
+        let painter = painter.with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(13, 18, 24));
         for edge in &self.edges {
             let a = self.mesh.vertices_enu_m[edge[0]];
@@ -573,6 +582,7 @@ impl Workbench {
     }
 
     fn draw_first_person(&self, painter: &egui::Painter, rect: Rect) {
+        let painter = painter.with_clip_rect(rect);
         painter.rect_filled(rect, 3.0, Color32::from_rgb(8, 12, 17));
         painter.rect_stroke(
             rect,
@@ -891,6 +901,9 @@ impl Workbench {
                         source_mix_changed = true;
                     }
                     ui.monospace(&source.id);
+                    if source.asset_id == ARTILLERY_ASSET_ID {
+                        ui.small(format!("{ARTILLERY_RETRIGGER_SECONDS} s retrigger"));
+                    }
                 });
             });
         }
@@ -1008,16 +1021,22 @@ impl eframe::App for Workbench {
                 if response.dragged_by(egui::PointerButton::Primary) {
                     drag_delta_x = ui.input(|input| input.pointer.delta().x);
                 }
-                self.draw_scene(&painter, response.rect);
-                let pip_size = egui::vec2(
-                    (response.rect.width() * 0.32).max(260.0),
-                    (response.rect.height() * 0.30).max(170.0),
+                self.draw_first_person(&painter, response.rect);
+                let pip_rect = picture_in_picture_rect(response.rect);
+                self.draw_scene(&painter, pip_rect);
+                painter.rect_stroke(
+                    pip_rect,
+                    3.0,
+                    Stroke::new(1.0, Color32::from_rgb(105, 136, 153)),
+                    egui::StrokeKind::Inside,
                 );
-                let pip_rect = Rect::from_min_size(
-                    response.rect.right_bottom() - pip_size - egui::vec2(14.0, 14.0),
-                    pip_size,
+                painter.text(
+                    pip_rect.left_top() + egui::vec2(8.0, 7.0),
+                    egui::Align2::LEFT_TOP,
+                    "MAP VIEW",
+                    egui::FontId::monospace(10.0),
+                    Color32::from_rgb(142, 173, 188),
                 );
-                self.draw_first_person(&painter, pip_rect);
             });
         self.update_control(ctx, drag_delta_x);
         ctx.request_repaint();
@@ -1266,28 +1285,86 @@ fn amplitude_dbfs(amplitude: f32) -> f32 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackMode {
+    Looping,
+    PeriodicOneShot { interval_frames: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourcePlayback {
+    mode: PlaybackMode,
+    cursor: usize,
+    was_enabled: bool,
+}
+
+impl SourcePlayback {
+    fn for_asset(asset_id: &str, sample_rate: u32) -> Self {
+        let mode = if asset_id == ARTILLERY_ASSET_ID {
+            PlaybackMode::PeriodicOneShot {
+                interval_frames: artillery_retrigger_frames(sample_rate),
+            }
+        } else {
+            PlaybackMode::Looping
+        };
+        Self {
+            mode,
+            cursor: 0,
+            was_enabled: false,
+        }
+    }
+
+    fn next_sample(&mut self, signal: &[f32], enabled: bool) -> f32 {
+        debug_assert!(!signal.is_empty());
+        match self.mode {
+            PlaybackMode::Looping => {
+                let sample = signal[self.cursor];
+                self.cursor = (self.cursor + 1) % signal.len();
+                sample
+            }
+            PlaybackMode::PeriodicOneShot { interval_frames } => {
+                if !enabled {
+                    self.cursor = 0;
+                    self.was_enabled = false;
+                    return 0.0;
+                }
+                if !self.was_enabled {
+                    self.cursor = 0;
+                    self.was_enabled = true;
+                }
+                let sample = signal.get(self.cursor).copied().unwrap_or(0.0);
+                self.cursor = (self.cursor + 1) % interval_frames;
+                sample
+            }
+        }
+    }
+}
+
+fn artillery_retrigger_frames(sample_rate: u32) -> usize {
+    sample_rate as usize * ARTILLERY_RETRIGGER_SECONDS as usize
+}
+
 #[cfg(feature = "live-output")]
-struct LoopingInput {
+struct WorkbenchInput {
     signals: Vec<Vec<f32>>,
-    offsets: Vec<usize>,
+    playback: Vec<SourcePlayback>,
     source_mix_reader: SnapshotReader<SourceMix>,
 }
 
 #[cfg(feature = "live-output")]
-impl fightbox_runtime::live::LiveInputProvider for LoopingInput {
+impl fightbox_runtime::live::LiveInputProvider for WorkbenchInput {
     fn fill_block(&mut self, sources: &mut fightbox_runtime::live::LiveSourceBuffer) {
-        let gains = self.source_mix_reader.read().gains(self.signals.len());
+        let mix = self.source_mix_reader.read();
+        let gains = mix.gains(self.signals.len());
         for index in 0..self.signals.len() {
             let Some(output) = sources.add_source(index) else {
                 return;
             };
             let signal = &self.signals[index];
-            let mut offset = self.offsets[index];
             for sample in output {
-                *sample = signal[offset] * gains[index];
-                offset = (offset + 1) % signal.len();
+                *sample =
+                    self.playback[index].next_sample(signal, mix.enabled[index]) * gains[index];
             }
-            self.offsets[index] = offset;
         }
     }
 }
@@ -1297,12 +1374,13 @@ fn start_audio<P: BlockProcessor + Send + 'static>(
     processor: P,
     config: EngineConfig,
     signals: Vec<Vec<f32>>,
+    playback: Vec<SourcePlayback>,
     source_mix_reader: SnapshotReader<SourceMix>,
     device: Option<&str>,
 ) -> AudioState {
-    let input = Box::new(LoopingInput {
-        offsets: vec![0; signals.len()],
+    let input = Box::new(WorkbenchInput {
         signals,
+        playback,
         source_mix_reader,
     });
     let output = match device {
@@ -1327,6 +1405,7 @@ fn start_audio<P: BlockProcessor + Send + 'static>(
     _processor: P,
     _config: EngineConfig,
     _signals: Vec<Vec<f32>>,
+    _playback: Vec<SourcePlayback>,
     _source_mix_reader: SnapshotReader<SourceMix>,
     _device: Option<&str>,
 ) -> AudioState {
@@ -1350,6 +1429,22 @@ fn mesh_edges(mesh: &AcousticMesh) -> Vec<[usize; 2]> {
         }
     }
     edges.into_iter().collect()
+}
+
+fn picture_in_picture_rect(container: Rect) -> Rect {
+    let available_width = (container.width() - PICTURE_IN_PICTURE_MARGIN * 2.0).max(1.0);
+    let available_height = (container.height() - PICTURE_IN_PICTURE_MARGIN * 2.0).max(1.0);
+    let size = egui::vec2(
+        (container.width() * 0.32).max(260.0).min(available_width),
+        (container.height() * 0.30).max(170.0).min(available_height),
+    );
+    Rect::from_min_size(
+        Pos2::new(
+            container.right() - PICTURE_IN_PICTURE_MARGIN - size.x,
+            container.top() + PICTURE_IN_PICTURE_MARGIN,
+        ),
+        size,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2072,5 +2167,45 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn picture_in_picture_is_top_right_and_bounded_by_the_main_view() {
+        let main = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(1010.0, 620.0));
+        let pip = picture_in_picture_rect(main);
+        assert_eq!(pip.right(), main.right() - PICTURE_IN_PICTURE_MARGIN);
+        assert_eq!(pip.top(), main.top() + PICTURE_IN_PICTURE_MARGIN);
+        assert!(main.contains_rect(pip));
+
+        let small_main = Rect::from_min_max(Pos2::ZERO, Pos2::new(200.0, 100.0));
+        assert!(small_main.contains_rect(picture_in_picture_rect(small_main)));
+    }
+
+    #[test]
+    fn artillery_one_shot_retriggers_on_sample_clock_and_rearms_after_disable() {
+        assert_eq!(artillery_retrigger_frames(48_000), 144_000);
+        let configured = SourcePlayback::for_asset(ARTILLERY_ASSET_ID, 48_000);
+        assert_eq!(
+            configured.mode,
+            PlaybackMode::PeriodicOneShot {
+                interval_frames: 144_000
+            }
+        );
+        assert_eq!(
+            SourcePlayback::for_asset("toms-diner", 48_000).mode,
+            PlaybackMode::Looping
+        );
+        let mut playback = SourcePlayback {
+            mode: PlaybackMode::PeriodicOneShot { interval_frames: 4 },
+            cursor: 0,
+            was_enabled: false,
+        };
+        let signal = [1.0, 0.5];
+        let enabled = (0..6)
+            .map(|_| playback.next_sample(&signal, true))
+            .collect::<Vec<_>>();
+        assert_eq!(enabled, vec![1.0, 0.5, 0.0, 0.0, 1.0, 0.5]);
+        assert_eq!(playback.next_sample(&signal, false), 0.0);
+        assert_eq!(playback.next_sample(&signal, true), 1.0);
     }
 }
