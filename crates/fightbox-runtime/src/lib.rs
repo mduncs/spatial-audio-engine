@@ -13,6 +13,7 @@ mod delay;
 #[cfg(feature = "live-output")]
 pub mod live;
 mod render;
+mod safety;
 mod snapshot;
 mod soak;
 mod workers;
@@ -23,6 +24,11 @@ pub use render::{
     ProcessBlock, PropagationSnapshot, RUN_TIMING_HISTOGRAM_BUCKETS, RenderError,
     RunTimingHistogram, RuntimeGraph, SourceBlock, SourcePropagation, Telemetry, TimingHistory,
     run_timing_bucket_upper_bound_ns,
+};
+pub use safety::{
+    OutputSafetyController, OutputSafetyPublication, OutputSafetyReader, SafetyTelemetry,
+    TRUE_PEAK_LIMITER_CEILING_DBTP, TRUE_PEAK_LIMITER_LOOKAHEAD_SAMPLES,
+    TRUE_PEAK_LIMITER_RELEASE_SECONDS, proximity_ceiling_gain_db, soft_knee_ceiling_output_db,
 };
 pub use snapshot::{SnapshotPublication, SnapshotReader, SnapshotWriter};
 pub use soak::{

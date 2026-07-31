@@ -197,6 +197,69 @@ impl Default for SceneCalibration {
     }
 }
 
+/// Control-rate configuration for the digital output-safety chain.
+///
+/// The scene-SPL ceiling operates only on sources declared with
+/// [`ReferenceLevel::SplAtOneMeter`]. It never claims an SPL at the output
+/// device or listener's ear.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputSafetyConfig {
+    pub scene_spl_ceiling_db: f32,
+    pub scene_spl_knee_width_db: f32,
+    pub default_source_radius_m: f32,
+    pub monitor_gain_db: f32,
+}
+
+impl OutputSafetyConfig {
+    pub const DEFAULT_SCENE_SPL_CEILING_DB: f32 = 100.0;
+    pub const DEFAULT_SCENE_SPL_KNEE_WIDTH_DB: f32 = 12.0;
+    pub const DEFAULT_SOURCE_RADIUS_M: f32 = ONE_METER;
+    pub const DEFAULT_MONITOR_GAIN_DB: f32 = 0.0;
+
+    pub fn validate(self) -> Result<(), OutputSafetyConfigError> {
+        if !self.scene_spl_ceiling_db.is_finite() {
+            return Err(OutputSafetyConfigError::InvalidSceneSplCeiling);
+        }
+        if !self.scene_spl_knee_width_db.is_finite() || self.scene_spl_knee_width_db <= 0.0 {
+            return Err(OutputSafetyConfigError::InvalidSceneSplKneeWidth);
+        }
+        if !(self.scene_spl_ceiling_db - self.scene_spl_knee_width_db).is_finite() {
+            return Err(OutputSafetyConfigError::InvalidSceneSplKneeWidth);
+        }
+        if !self.default_source_radius_m.is_finite() || self.default_source_radius_m <= 0.0 {
+            return Err(OutputSafetyConfigError::InvalidSourceRadius);
+        }
+        let monitor_gain = 10.0_f32.powf(self.monitor_gain_db / 20.0);
+        if !self.monitor_gain_db.is_finite() || !monitor_gain.is_finite() || monitor_gain <= 0.0 {
+            return Err(OutputSafetyConfigError::InvalidMonitorGain);
+        }
+        Ok(())
+    }
+}
+
+impl Default for OutputSafetyConfig {
+    fn default() -> Self {
+        Self {
+            scene_spl_ceiling_db: Self::DEFAULT_SCENE_SPL_CEILING_DB,
+            scene_spl_knee_width_db: Self::DEFAULT_SCENE_SPL_KNEE_WIDTH_DB,
+            default_source_radius_m: Self::DEFAULT_SOURCE_RADIUS_M,
+            monitor_gain_db: Self::DEFAULT_MONITOR_GAIN_DB,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSafetyConfigError {
+    InvalidSceneSplCeiling,
+    InvalidSceneSplKneeWidth,
+    InvalidSourceRadius,
+    InvalidMonitorGain,
+    InvalidPosition,
+    InvalidSourceIndex,
+    InvalidSourceProfile,
+    SourceNotConfigured,
+}
+
 /// Caller-owned identity for the method that produced an [`AssetAnalysis`].
 ///
 /// The identifier must name the full-program RMS window/channel aggregation

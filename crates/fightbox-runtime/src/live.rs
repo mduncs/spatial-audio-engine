@@ -2,13 +2,13 @@
 
 use crate::{
     BlockProcessor, FaultCounters, MAX_ACTIVE_SOURCES, MAX_TIMING_RECORDS, ProcessBlock,
-    RunTimingHistogram, SoakReport, SourceBlock, TimingHistory, TimingPercentiles,
+    RunTimingHistogram, SafetyTelemetry, SoakReport, SourceBlock, TimingHistory, TimingPercentiles,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, SampleFormat, SampleRate, Stream, StreamConfig, SupportedBufferSize};
 use fightbox_api::EngineConfig;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +74,10 @@ struct AtomicLiveTelemetry {
     snapshot_stale: AtomicU64,
     graph_deadline_miss: AtomicU64,
     backend_render_error: AtomicU64,
+    proximity_ceiling_engagements: AtomicU64,
+    limiter_engagements: AtomicU64,
+    pre_limiter_peak: AtomicU32,
+    post_limiter_peak: AtomicU32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -89,6 +93,7 @@ pub struct LiveOutputTelemetry {
     pub processing_errors: u64,
     pub stream_errors: u64,
     pub faults: FaultCounters,
+    pub safety: SafetyTelemetry,
 }
 
 /// A stereo f32 device stream whose callback owns the block processor.
@@ -317,6 +322,19 @@ impl LiveOutput {
                 deadline_miss: self.telemetry.graph_deadline_miss.load(Ordering::Acquire),
                 backend_render_error: self.telemetry.backend_render_error.load(Ordering::Acquire),
             },
+            safety: SafetyTelemetry {
+                proximity_ceiling_engagements: self
+                    .telemetry
+                    .proximity_ceiling_engagements
+                    .load(Ordering::Acquire),
+                limiter_engagements: self.telemetry.limiter_engagements.load(Ordering::Acquire),
+                pre_limiter_peak: f32::from_bits(
+                    self.telemetry.pre_limiter_peak.load(Ordering::Acquire),
+                ),
+                post_limiter_peak: f32::from_bits(
+                    self.telemetry.post_limiter_peak.load(Ordering::Acquire),
+                ),
+            },
         }
     }
 }
@@ -423,6 +441,19 @@ impl<P: BlockProcessor> CallbackState<P> {
                 telemetry
                     .backend_render_error
                     .store(faults.backend_render_error, Ordering::Relaxed);
+                let safety = self.processor.safety_telemetry();
+                telemetry
+                    .proximity_ceiling_engagements
+                    .store(safety.proximity_ceiling_engagements, Ordering::Relaxed);
+                telemetry
+                    .limiter_engagements
+                    .store(safety.limiter_engagements, Ordering::Relaxed);
+                telemetry
+                    .pre_limiter_peak
+                    .store(safety.pre_limiter_peak.to_bits(), Ordering::Relaxed);
+                telemetry
+                    .post_limiter_peak
+                    .store(safety.post_limiter_peak.to_bits(), Ordering::Relaxed);
             }
             frame[0] = self.ring_left[self.ring_read];
             frame[1] = self.ring_right[self.ring_read];
@@ -450,6 +481,7 @@ pub fn run_live_soak<P: BlockProcessor + Send + 'static>(
         run_callback_timings: telemetry.run_callback_timings,
         deadline_misses: telemetry.deadline_misses,
         faults: telemetry.faults,
+        safety: telemetry.safety,
     })
 }
 
@@ -470,6 +502,7 @@ pub fn run_live_soak_with_input<P: BlockProcessor + Send + 'static>(
         run_callback_timings: telemetry.run_callback_timings,
         deadline_misses: telemetry.deadline_misses,
         faults: telemetry.faults,
+        safety: telemetry.safety,
     })
 }
 
@@ -512,6 +545,7 @@ where
         run_callback_timings: telemetry.run_callback_timings,
         deadline_misses: telemetry.deadline_misses,
         faults: telemetry.faults,
+        safety: telemetry.safety,
     })
 }
 

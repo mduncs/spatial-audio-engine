@@ -1,7 +1,8 @@
 //! Bounded offline/live soak reporting.
 
 use crate::{
-    BlockProcessor, FaultCounters, ProcessBlock, RunTimingHistogram, SourceBlock, TimingHistory,
+    BlockProcessor, FaultCounters, ProcessBlock, RunTimingHistogram, SafetyTelemetry, SourceBlock,
+    TimingHistory,
 };
 use std::time::Instant;
 
@@ -46,6 +47,7 @@ pub struct SoakReport {
     pub run_callback_timings: TimingPercentiles,
     pub deadline_misses: u64,
     pub faults: FaultCounters,
+    pub safety: SafetyTelemetry,
 }
 
 /// Runs the exact block processor used by live output for the requested
@@ -106,12 +108,14 @@ where
     }
 
     let faults = processor.fault_counters();
+    let safety = processor.safety_telemetry();
     Ok(SoakReport {
         rendered_blocks: blocks,
         window_callback_timings: TimingPercentiles::from_history(&timings),
         run_callback_timings: TimingPercentiles::from_histogram(&run_timings),
         deadline_misses: callback_deadline_misses.max(faults.deadline_miss),
         faults,
+        safety,
     })
 }
 
