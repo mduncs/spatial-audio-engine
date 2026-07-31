@@ -4,12 +4,13 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
 use fightbox_api::{
-    EngineConfig, EnuVector3, ExtentDescriptor, ListenerState, Pose, ReferenceLevel,
-    SceneCalibration, SourceId, SourceProfile,
+    EngineConfig, EnuVector3, ExtentDescriptor, ListenerState, OutputSafetyConfig, Pose,
+    ReferenceLevel, SceneCalibration, SourceId, SourceProfile,
 };
 use fightbox_runtime::backend::{SimulationUpdate, SourceMotion};
 use fightbox_runtime::{
-    BlockProcessor, ProcessBlock, PropagationSnapshot, RenderError, RuntimeGraph,
+    BlockProcessor, OutputSafetyController, OutputSafetyPublication, OutputSafetyReader,
+    ProcessBlock, PropagationSnapshot, RenderError, RuntimeGraph, SafetyTelemetry,
     SimulationCadences, SimulationWorker, SnapshotPublication, SnapshotReader, SnapshotWriter,
     SourcePropagation,
 };
@@ -33,7 +34,6 @@ use crate::pose::{ListenerControl, PoseMailbox};
 const BLOCK_SIZE: u32 = 128;
 const SAMPLE_RATE: u32 = 48_000;
 const YAW_RADIANS_PER_POINT: f32 = 0.008;
-const DEFAULT_LISTEN_GAIN_DB: f32 = 50.0;
 const DEFAULT_AUTOPILOT_SPEED_MPS: f32 = 6.0;
 const METER_WINDOW_SECONDS: f32 = 0.5;
 const FIRST_PERSON_VERTICAL_FOV_RADIANS: f32 = 70.0_f32.to_radians();
@@ -49,8 +49,8 @@ pub struct Workbench {
     source_motion: [SourceMotion; fightbox_runtime::MAX_ACTIVE_SOURCES],
     audio: AudioState,
     camera: Camera,
-    listen_gain_db: f32,
-    listen_gain_writer: SnapshotWriter<f32>,
+    monitor_gain_db: f32,
+    output_safety_controller: OutputSafetyController,
     meter_reader: SnapshotReader<MeterReading>,
     source_mix_writer: SnapshotWriter<SourceMix>,
     stage_mix: StageMix,
@@ -73,6 +73,7 @@ struct SourceView {
     id: String,
     asset_id: String,
     position: EnuVector3,
+    declared_spl_at_one_meter_db: f32,
     enabled: bool,
     muted: bool,
     soloed: bool,
@@ -172,6 +173,23 @@ enum AudioState {
     #[cfg(feature = "live-output")]
     Live(fightbox_runtime::live::LiveOutput),
     Unavailable(String),
+}
+
+fn configure_output_safety(
+    listener_position: EnuVector3,
+    profiles: &[SourceProfile],
+) -> Result<(OutputSafetyController, OutputSafetyReader), String> {
+    let (mut controller, reader) = OutputSafetyPublication::new(OutputSafetyConfig::default())
+        .map_err(|error| format!("cannot create output-safety publication: {error:?}"))?;
+    controller
+        .set_listener_position(listener_position)
+        .map_err(|error| format!("cannot configure output-safety listener: {error:?}"))?;
+    for (index, profile) in profiles.iter().enumerate() {
+        controller
+            .set_source(index, profile, None)
+            .map_err(|error| format!("cannot configure output-safety source {index}: {error:?}"))?;
+    }
+    Ok((controller, reader))
 }
 
 impl Workbench {
@@ -295,6 +313,7 @@ impl Workbench {
                 id: source.id.clone(),
                 asset_id: source.asset_id.clone(),
                 position,
+                declared_spl_at_one_meter_db: source.reference_level.db_spl as f32,
                 enabled: source.default_enabled,
                 muted: false,
                 soloed: false,
@@ -359,8 +378,20 @@ impl Workbench {
             max_active_sources: prepared_sources.len() as u8,
             ..EngineConfig::default()
         };
-        let mut graph = RuntimeGraph::new_with_backend(engine_config, reader, Box::new(backend))
-            .map_err(|error| format!("cannot create runtime graph: {error:?}"))?;
+        let (output_safety_controller, output_safety_reader) = configure_output_safety(
+            initial_listener.pose.position,
+            &prepared_sources
+                .iter()
+                .map(|(profile, _)| profile.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let mut graph = RuntimeGraph::new_with_backend_and_output_safety(
+            engine_config,
+            reader,
+            output_safety_reader,
+            Box::new(backend),
+        )
+        .map_err(|error| format!("cannot create runtime graph: {error:?}"))?;
         graph.set_listener_state(initial_listener);
         for (index, (profile, _)) in prepared_sources.iter().enumerate() {
             graph
@@ -371,8 +402,6 @@ impl Workbench {
             "[startup] runtime graph configuration: {} ms",
             phase_started.elapsed().as_millis()
         );
-        let (listen_gain_writer, listen_gain_reader) =
-            SnapshotPublication::new(DEFAULT_LISTEN_GAIN_DB);
         let (meter_writer, meter_reader) = SnapshotPublication::new(MeterReading::SILENT);
         let initial_source_mix = SourceMix::from_sources(&source_views);
         let (source_mix_writer, source_mix_reader) = SnapshotPublication::new(initial_source_mix);
@@ -386,7 +415,6 @@ impl Workbench {
         let processor = LateBoundProcessor::new(
             graph,
             pose_reader,
-            listen_gain_reader,
             meter_writer,
             MeterAccumulator::new(SAMPLE_RATE, BLOCK_SIZE, METER_WINDOW_SECONDS),
             audio_block_writer,
@@ -426,8 +454,8 @@ impl Workbench {
             source_motion,
             audio,
             camera,
-            listen_gain_db: DEFAULT_LISTEN_GAIN_DB,
-            listen_gain_writer,
+            monitor_gain_db: OutputSafetyConfig::DEFAULT_MONITOR_GAIN_DB,
+            output_safety_controller,
             meter_reader,
             source_mix_writer,
             stage_mix: StageMix::ALL_ENABLED,
@@ -459,6 +487,9 @@ impl Workbench {
             self.source_motion[index].pose.forward = sample.direction;
             self.source_motion[index].linear_velocity_mps =
                 scale(sample.direction, trajectory.speed_mps);
+            self.output_safety_controller
+                .set_source_position(index, sample.position)
+                .expect("validated source trajectories remain finite");
         }
     }
 
@@ -494,6 +525,9 @@ impl Workbench {
             self.listener.walk(forward, right, sprinting, delta_seconds)
         };
         let listener = self.listener.listener_state(velocity);
+        self.output_safety_controller
+            .set_listener_position(listener.pose.position)
+            .expect("workbench listener controls remain finite");
         self.pose_mailbox.publish(listener);
         self.simulation.publish_update(SimulationUpdate {
             listener,
@@ -604,7 +638,7 @@ impl Workbench {
                 .collect(),
             stages: self.stage_mix.into(),
             quality: self.capture_static.quality.clone(),
-            listen_gain_db: self.listen_gain_db,
+            listen_gain_db: self.monitor_gain_db,
             engine_config: self.capture_static.engine_config,
         }
     }
@@ -782,22 +816,51 @@ impl Workbench {
             self.listener.yaw_radians.to_degrees()
         ));
         ui.separator();
-        ui.heading("Listen");
+        ui.heading("Output safety");
         let mix_controls_enabled = matches!(self.capture_state, CaptureUiState::Idle);
         if ui
             .add_enabled(
                 mix_controls_enabled,
-                egui::Slider::new(&mut self.listen_gain_db, 0.0..=70.0)
+                egui::Slider::new(&mut self.monitor_gain_db, -20.0..=40.0)
                     .suffix(" dB")
-                    .text("makeup"),
+                    .text("monitor"),
             )
             .changed()
         {
-            self.listen_gain_writer.publish(self.listen_gain_db);
+            self.output_safety_controller
+                .set_monitor_gain_db(self.monitor_gain_db)
+                .expect("the monitor-gain slider publishes only finite values");
         }
+        ui.small("Monitor gain is applied inside the guarded digital output chain.");
+        ui.label("Simulated scene SPL at listener");
+        for source in &self.sources {
+            let predicted_db = predicted_scene_spl_at_listener_db(
+                source.declared_spl_at_one_meter_db,
+                source.position,
+                self.listener.position,
+                OutputSafetyConfig::DEFAULT_SOURCE_RADIUS_M,
+            );
+            ui.monospace(format!("{:<20} {:6.1} dB SPL", source.id, predicted_db));
+        }
+        ui.small("Scene-domain prediction only; this is not absolute SPL at the ear.");
         let meter = self.meter_reader.read();
+        ui.label("Digital output level · post-chain");
         ui.monospace(format!("peak  {:7.1} dBFS", meter.peak_dbfs));
         ui.monospace(format!("RMS   {:7.1} dBFS", meter.rms_dbfs));
+        match audio_safety_telemetry(&self.audio) {
+            Some(telemetry) => {
+                engagement_row(
+                    ui,
+                    "proximity ceiling",
+                    telemetry.proximity_ceiling_engagements,
+                );
+                engagement_row(ui, "true-peak limiter", telemetry.limiter_engagements);
+            }
+            None => {
+                ui.monospace("proximity ceiling  telemetry unavailable");
+                ui.monospace("true-peak limiter   telemetry unavailable");
+            }
+        }
         ui.separator();
         ui.heading("Sources");
         let mut source_mix_changed = false;
@@ -979,6 +1042,37 @@ impl eframe::App for Workbench {
     }
 }
 
+fn audio_safety_telemetry(audio: &AudioState) -> Option<SafetyTelemetry> {
+    match audio {
+        #[cfg(feature = "live-output")]
+        AudioState::Live(output) => Some(output.telemetry().safety),
+        AudioState::Unavailable(_) => None,
+    }
+}
+
+fn engagement_row(ui: &mut egui::Ui, label: &str, engagements: u64) {
+    let (color, state) = if engagements == 0 {
+        (Color32::from_rgb(112, 180, 155), "idle")
+    } else {
+        (Color32::from_rgb(255, 172, 90), "engaged this run")
+    };
+    ui.colored_label(
+        color,
+        egui::RichText::new(format!("{label:<20} {state} · {engagements}"))
+            .family(egui::FontFamily::Monospace),
+    );
+}
+
+fn predicted_scene_spl_at_listener_db(
+    declared_spl_at_one_meter_db: f32,
+    source_position: EnuVector3,
+    listener_position: EnuVector3,
+    source_radius_m: f32,
+) -> f32 {
+    let distance_m = vector_length(subtract(source_position, listener_position));
+    declared_spl_at_one_meter_db - 20.0 * distance_m.max(source_radius_m).log10()
+}
+
 #[cfg(feature = "live-output")]
 fn fault_rows(ui: &mut egui::Ui, faults: fightbox_runtime::FaultCounters) {
     ui.monospace(format!("snapshot stale {}", faults.snapshot_stale));
@@ -1003,7 +1097,6 @@ impl ListenerStateSink for RuntimeGraph {
 struct LateBoundProcessor<P> {
     processor: P,
     pose_reader: SnapshotReader<ListenerState>,
-    listen_gain_reader: SnapshotReader<f32>,
     meter_writer: SnapshotWriter<MeterReading>,
     meter: MeterAccumulator,
     audio_block_writer: SnapshotWriter<u64>,
@@ -1015,7 +1108,6 @@ impl<P> LateBoundProcessor<P> {
     fn new(
         processor: P,
         pose_reader: SnapshotReader<ListenerState>,
-        listen_gain_reader: SnapshotReader<f32>,
         meter_writer: SnapshotWriter<MeterReading>,
         meter: MeterAccumulator,
         audio_block_writer: SnapshotWriter<u64>,
@@ -1024,7 +1116,6 @@ impl<P> LateBoundProcessor<P> {
         Self {
             processor,
             pose_reader,
-            listen_gain_reader,
             meter_writer,
             meter,
             audio_block_writer,
@@ -1054,8 +1145,6 @@ impl<P: BlockProcessor + ListenerStateSink> BlockProcessor for LateBoundProcesso
             output_left: &mut *output_left,
             output_right: &mut *output_right,
         })?;
-        let gain = db_to_linear(self.listen_gain_reader.read());
-        apply_output_gain(output_left, output_right, gain);
         let reading = self.meter.observe(output_left, output_right);
         self.meter_writer.publish(reading);
         if let Some(capture_tap) = &self.capture_tap {
@@ -1069,15 +1158,9 @@ impl<P: BlockProcessor + ListenerStateSink> BlockProcessor for LateBoundProcesso
     fn fault_counters(&self) -> fightbox_runtime::FaultCounters {
         self.processor.fault_counters()
     }
-}
 
-fn db_to_linear(db: f32) -> f32 {
-    10.0_f32.powf(db / 20.0)
-}
-
-fn apply_output_gain(left: &mut [f32], right: &mut [f32], gain: f32) {
-    for sample in left.iter_mut().chain(right) {
-        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    fn safety_telemetry(&self) -> SafetyTelemetry {
+        self.processor.safety_telemetry()
     }
 }
 
@@ -1640,6 +1723,7 @@ mod tests {
     struct RecordingProcessor {
         listener: ListenerState,
         observed: Arc<Mutex<Vec<ListenerState>>>,
+        safety: SafetyTelemetry,
     }
 
     impl ListenerStateSink for RecordingProcessor {
@@ -1658,6 +1742,10 @@ mod tests {
             block.output_left[0] = 0.0;
             block.output_right[0] = 0.0;
             Ok(())
+        }
+
+        fn safety_telemetry(&self) -> SafetyTelemetry {
+            self.safety
         }
     }
 
@@ -1678,14 +1766,18 @@ mod tests {
         let processor = RecordingProcessor {
             listener: north,
             observed: Arc::clone(&observed),
+            safety: SafetyTelemetry {
+                proximity_ceiling_engagements: 3,
+                limiter_engagements: 2,
+                pre_limiter_peak: 1.2,
+                post_limiter_peak: 0.8,
+            },
         };
-        let (_gain_writer, gain_reader) = SnapshotPublication::new(0.0);
         let (meter_writer, _meter_reader) = SnapshotPublication::new(MeterReading::SILENT);
         let (audio_block_writer, _audio_block_reader) = SnapshotPublication::new(0_u64);
         let mut late = LateBoundProcessor::new(
             processor,
             reader,
-            gain_reader,
             meter_writer,
             MeterAccumulator::new(48_000, 1, 0.5),
             audio_block_writer,
@@ -1707,6 +1799,15 @@ mod tests {
         mailbox.publish(east);
         render(&mut late);
         assert_eq!(*observed.lock().unwrap(), vec![north, east]);
+        assert_eq!(
+            late.safety_telemetry(),
+            SafetyTelemetry {
+                proximity_ceiling_engagements: 3,
+                limiter_engagements: 2,
+                pre_limiter_peak: 1.2,
+                post_limiter_peak: 0.8,
+            }
+        );
     }
 
     #[test]
@@ -1725,14 +1826,90 @@ mod tests {
     }
 
     #[test]
-    fn listen_gain_converts_db_and_hard_clamps_output() {
-        assert!((db_to_linear(0.0) - 1.0).abs() < 1.0e-6);
-        assert!((db_to_linear(20.0) - 10.0).abs() < 1.0e-5);
-        let mut left = [0.02, -0.02, 0.0];
-        let mut right = [0.5, -0.5, 0.001];
-        apply_output_gain(&mut left, &mut right, db_to_linear(40.0));
-        assert_eq!(left, [1.0, -1.0, 0.0]);
-        assert_eq!(right, [1.0, -1.0, 0.1]);
+    fn predicted_scene_spl_uses_current_distance_and_bounds_the_source_radius() {
+        let source = EnuVector3::new(0.0, 0.0, 0.0);
+        assert_eq!(
+            predicted_scene_spl_at_listener_db(120.0, source, EnuVector3::new(1.0, 0.0, 0.0), 1.0,),
+            120.0
+        );
+        assert!(
+            (predicted_scene_spl_at_listener_db(
+                120.0,
+                source,
+                EnuVector3::new(10.0, 0.0, 0.0),
+                1.0,
+            ) - 100.0)
+                .abs()
+                < 1.0e-5
+        );
+        assert_eq!(
+            predicted_scene_spl_at_listener_db(120.0, source, EnuVector3::new(0.1, 0.0, 0.0), 1.0,),
+            120.0
+        );
+    }
+
+    #[test]
+    fn workbench_output_safety_setup_publishes_source_and_listener_geometry() {
+        let profile = SourceProfile {
+            id: SourceId::new("hot-source"),
+            pose: Pose {
+                position: EnuVector3::new(0.0, 0.0, 0.0),
+                forward: EnuVector3::new(0.0, 1.0, 0.0),
+                up: EnuVector3::new(0.0, 0.0, 1.0),
+            },
+            reference_level: ReferenceLevel::SplAtOneMeter { db_spl: 155.0 },
+            asset_analysis: fightbox_api::AssetAnalysis::new(
+                -24.0,
+                -12.0,
+                fightbox_api::AssetMeasurementProvenance::new("workbench-safety-test/v1").unwrap(),
+            )
+            .unwrap(),
+            extent: ExtentDescriptor::Point,
+            max_speed_mps: 0.0,
+        };
+        let listener_position = EnuVector3::new(1.0, 0.0, 0.0);
+        let (mut safety_controller, safety_reader) =
+            configure_output_safety(listener_position, std::slice::from_ref(&profile)).unwrap();
+        safety_controller.set_monitor_gain_db(-6.0).unwrap();
+
+        let propagation = PropagationSnapshot {
+            sequence: 1,
+            simulated_at_ns: 0,
+            sources: std::array::from_fn(|index| SourcePropagation {
+                active: index == 0,
+                target_delay_samples: 0.0,
+                left_gain: 1.0,
+                right_gain: 1.0,
+            }),
+        };
+        let (_writer, propagation_reader) = SnapshotPublication::new(propagation);
+        let config = EngineConfig {
+            block_size_frames: 64,
+            max_active_sources: 1,
+            ..EngineConfig::default()
+        };
+        let mut graph =
+            RuntimeGraph::new_with_output_safety(config, propagation_reader, safety_reader)
+                .unwrap();
+        graph
+            .set_source(0, &profile, SceneCalibration::default())
+            .unwrap();
+        let input = [0.001_f32; 64];
+        let source_blocks = [fightbox_runtime::SourceBlock {
+            source_index: 0,
+            decoded_mono: &input,
+        }];
+        let mut left = [0.0_f32; 64];
+        let mut right = [0.0_f32; 64];
+        graph
+            .process_block(ProcessBlock {
+                now_ns: 0,
+                sources: &source_blocks,
+                output_left: &mut left,
+                output_right: &mut right,
+            })
+            .unwrap();
+        assert_eq!(graph.safety_telemetry().proximity_ceiling_engagements, 1);
     }
 
     #[test]

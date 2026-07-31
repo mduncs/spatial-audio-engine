@@ -32,7 +32,7 @@
       "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
-        "db_spl": 120
+        "db_spl": 155
       },
       "position_m": [
         7.5,
@@ -46,7 +46,7 @@
       "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
-        "db_spl": 85
+        "db_spl": 118
       },
       "trajectory": {
         "waypoints_m": [
@@ -65,7 +65,7 @@
       "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
-        "db_spl": 85
+        "db_spl": 105
       },
       "position_m": [
         482.5,
