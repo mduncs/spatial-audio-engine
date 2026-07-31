@@ -69,6 +69,11 @@ city synth       Generate a deterministic Manhattan-style GeoJSON city\n    \
 city inspect     Print a package manifest summary and assumptions\n    \
 city export-obj  Export a package mesh as deterministic triangulated OBJ\n    \
 city bake        Bake probes for a city package (requires linked-sdk)\n    \
+                  [--path-range-m <m>] [--visibility-range-m <m>]\n    \
+                  [--visibility-samples <n>] [--visibility-threshold <0..1>]\n    \
+                  [--probe-spacing-m <m>] [--probe-height-above-floor-m <m>]\n    \
+                  [--probe-ceiling-m <m>] [--bake-threads <n>]\n    \
+                  defaults: 100m, 6m, 1, 0.5, 4m, 1.5m, 3m, 1 thread\n    \
 city render      Render a fixture through a packaged and baked city\n\n\
 city metamorphic Jitter assumed heights, bake, and assert the occlusion percept\n\n\
 SWEEP OUTPUT:\n    <report-directory>/report.json\n    \
@@ -123,8 +128,8 @@ fn dispatch_city(args: &[String]) -> error::Result<()> {
             city::export_package_obj(&values[0], &values[1])
         }
         Some("bake") => {
-            let values = parse_named_paths(&args[1..], &["--package", "--output"])?;
-            city::bake(&values[0], &values[1])
+            let (package, output, config) = parse_city_bake_args(&args[1..])?;
+            city::bake_with_config(&package, &output, config)
         }
         Some("render") => {
             let values = parse_named_paths(
@@ -144,6 +149,120 @@ fn dispatch_city(args: &[String]) -> error::Result<()> {
             "city requires a subcommand\n\n{HELP}"
         ))),
     }
+}
+
+fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, city::BakeConfig)> {
+    let mut package = None;
+    let mut output = None;
+    let mut path_range_m = None;
+    let mut visibility_range_m = None;
+    let mut visibility_samples = None;
+    let mut visibility_threshold = None;
+    let mut probe_spacing_m = None;
+    let mut probe_height_above_floor_m = None;
+    let mut probe_ceiling_m = None;
+    let mut bake_threads = None;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        let value = iter
+            .next()
+            .ok_or_else(|| error::CliError::new(format!("{flag} requires a value")))?;
+        match flag.as_str() {
+            "--package" => set_once(&mut package, PathBuf::from(value), flag)?,
+            "--output" => set_once(&mut output, PathBuf::from(value), flag)?,
+            "--path-range-m" => {
+                set_once(&mut path_range_m, parse_positive_f32(value, flag)?, flag)?
+            }
+            "--visibility-range-m" => set_once(
+                &mut visibility_range_m,
+                parse_positive_f32(value, flag)?,
+                flag,
+            )?,
+            "--visibility-samples" => set_once(
+                &mut visibility_samples,
+                parse_positive_i32(value, flag)?,
+                flag,
+            )?,
+            "--visibility-threshold" => {
+                let threshold = value.parse::<f32>().map_err(|_| {
+                    error::CliError::new(format!("{flag} requires a number between 0 and 1"))
+                })?;
+                if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                    return Err(error::CliError::new(format!(
+                        "{flag} requires a finite number between 0 and 1"
+                    )));
+                }
+                set_once(&mut visibility_threshold, threshold, flag)?;
+            }
+            "--probe-spacing-m" => {
+                set_once(&mut probe_spacing_m, parse_positive_f32(value, flag)?, flag)?
+            }
+            "--probe-height-above-floor-m" => set_once(
+                &mut probe_height_above_floor_m,
+                parse_positive_f32(value, flag)?,
+                flag,
+            )?,
+            "--probe-ceiling-m" => {
+                set_once(&mut probe_ceiling_m, parse_positive_f32(value, flag)?, flag)?
+            }
+            "--bake-threads" => {
+                set_once(&mut bake_threads, parse_positive_i32(value, flag)?, flag)?
+            }
+            other => {
+                return Err(error::CliError::new(format!(
+                    "unknown city bake argument {other:?}"
+                )));
+            }
+        }
+    }
+    let defaults = city::BakeConfig::default();
+    Ok((
+        package.ok_or_else(|| error::CliError::new("missing required --package <path>"))?,
+        output.ok_or_else(|| error::CliError::new("missing required --output <path>"))?,
+        city::BakeConfig {
+            path_range_m: path_range_m.unwrap_or(defaults.path_range_m),
+            visibility_range_m: visibility_range_m.unwrap_or(defaults.visibility_range_m),
+            visibility_samples: visibility_samples.unwrap_or(defaults.visibility_samples),
+            visibility_threshold: visibility_threshold.unwrap_or(defaults.visibility_threshold),
+            probe_spacing_m: probe_spacing_m.unwrap_or(defaults.probe_spacing_m),
+            probe_height_above_floor_m: probe_height_above_floor_m
+                .unwrap_or(defaults.probe_height_above_floor_m),
+            probe_ceiling_m: probe_ceiling_m.unwrap_or(defaults.probe_ceiling_m),
+            bake_threads: bake_threads.unwrap_or(defaults.bake_threads),
+        },
+    ))
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> error::Result<()> {
+    if slot.replace(value).is_some() {
+        Err(error::CliError::new(format!("duplicate argument {flag}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_positive_f32(value: &str, flag: &str) -> error::Result<f32> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|_| error::CliError::new(format!("{flag} requires a positive number")))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(error::CliError::new(format!(
+            "{flag} requires a finite positive number"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_positive_i32(value: &str, flag: &str) -> error::Result<i32> {
+    let value = value
+        .parse::<i32>()
+        .map_err(|_| error::CliError::new(format!("{flag} requires a positive integer")))?;
+    if value <= 0 {
+        return Err(error::CliError::new(format!(
+            "{flag} requires a positive integer"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_city_synth_args(args: &[String]) -> error::Result<(u64, (u32, u32), PathBuf)> {
@@ -573,6 +692,88 @@ mod tests {
         assert_eq!(output, PathBuf::from("city.geojson"));
         assert!(parse_city_synth_args(&["--blocks".into(), "6".into()]).is_err());
         assert!(parse_city_synth_args(&["--blocks".into(), "0x6".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_city_bake_defaults_and_tuning() {
+        let (package, output, defaults) = parse_city_bake_args(&[
+            "--package".into(),
+            "city.fightbox".into(),
+            "--output".into(),
+            "city.baked".into(),
+        ])
+        .unwrap();
+        assert_eq!(package, PathBuf::from("city.fightbox"));
+        assert_eq!(output, PathBuf::from("city.baked"));
+        assert_eq!(defaults, city::BakeConfig::default());
+
+        let (_, _, tuned) = parse_city_bake_args(&[
+            "--package".into(),
+            "city.fightbox".into(),
+            "--output".into(),
+            "city.baked".into(),
+            "--path-range-m".into(),
+            "600".into(),
+            "--visibility-range-m".into(),
+            "20".into(),
+            "--visibility-samples".into(),
+            "4".into(),
+            "--visibility-threshold".into(),
+            "0.25".into(),
+            "--probe-spacing-m".into(),
+            "8".into(),
+            "--probe-height-above-floor-m".into(),
+            "3".into(),
+            "--probe-ceiling-m".into(),
+            "63".into(),
+            "--bake-threads".into(),
+            "10".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            tuned,
+            city::BakeConfig {
+                path_range_m: 600.0,
+                visibility_range_m: 20.0,
+                visibility_samples: 4,
+                visibility_threshold: 0.25,
+                probe_spacing_m: 8.0,
+                probe_height_above_floor_m: 3.0,
+                probe_ceiling_m: 63.0,
+                bake_threads: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_city_bake_tuning() {
+        let required = [
+            "--package".to_string(),
+            "city.fightbox".to_string(),
+            "--output".to_string(),
+            "city.baked".to_string(),
+        ];
+        for (flag, value) in [
+            ("--path-range-m", "0"),
+            ("--visibility-range-m", "NaN"),
+            ("--visibility-samples", "-1"),
+            ("--visibility-threshold", "1.1"),
+            ("--probe-spacing-m", "inf"),
+            ("--probe-height-above-floor-m", "0"),
+            ("--probe-ceiling-m", "-3"),
+            ("--bake-threads", "0"),
+        ] {
+            let mut args = required.to_vec();
+            args.extend([flag.to_string(), value.to_string()]);
+            assert!(
+                parse_city_bake_args(&args).is_err(),
+                "{flag}={value} should be rejected"
+            );
+        }
+        let mut duplicate = required.to_vec();
+        duplicate.extend(["--path-range-m".into(), "100".into()]);
+        duplicate.extend(["--path-range-m".into(), "200".into()]);
+        assert!(parse_city_bake_args(&duplicate).is_err());
     }
 
     #[test]

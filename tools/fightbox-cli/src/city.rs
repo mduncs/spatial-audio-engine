@@ -26,6 +26,7 @@ use crate::error::{CliError, Result};
 const DEFAULT_HEIGHT_M: f32 = 4.0;
 const PROBE_SPACING_M: f32 = 4.0;
 const PROBE_HEIGHT_M: f32 = 1.5;
+const PROBE_CEILING_M: f32 = 3.0;
 const EARTH_RADIUS_M: f64 = 6_371_008.8;
 const JITTER_M: f32 = 3.2;
 const MIN_ASSUMED_HEIGHT_M: f32 = 3.0;
@@ -487,16 +488,56 @@ fn inspect_text(package: &Path) -> Result<String> {
     Ok(output)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BakeConfig {
+    pub path_range_m: f32,
+    pub visibility_range_m: f32,
+    pub visibility_samples: i32,
+    pub visibility_threshold: f32,
+    pub probe_spacing_m: f32,
+    pub probe_height_above_floor_m: f32,
+    pub probe_ceiling_m: f32,
+    pub bake_threads: i32,
+}
+
+impl Default for BakeConfig {
+    fn default() -> Self {
+        let pathing = PathBakeConfig::default();
+        Self {
+            path_range_m: pathing.path_range_m,
+            visibility_range_m: pathing.visibility_range_m,
+            visibility_samples: pathing.num_visibility_samples,
+            visibility_threshold: pathing.visibility_threshold,
+            probe_spacing_m: PROBE_SPACING_M,
+            probe_height_above_floor_m: PROBE_HEIGHT_M,
+            probe_ceiling_m: PROBE_CEILING_M,
+            bake_threads: pathing.num_threads,
+        }
+    }
+}
+
 pub fn bake(package: &Path, output: &Path) -> Result<()> {
+    bake_with_config(package, output, BakeConfig::default())
+}
+
+pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig) -> Result<()> {
     require_linked("city bake")?;
     let loaded = read_package(package)
         .map_err(|error| CliError::new(format!("cannot load package: {error}")))?;
     let scene = scene_mesh(&loaded)?;
-    let probes = probe_volume(&scene)?;
+    let probes = probe_volume(&scene, config)?;
+    let defaults = PathBakeConfig::default();
     let baked = bake_s3(&S3BakeRequest {
         mesh: scene,
         probes,
-        pathing: PathBakeConfig::default(),
+        pathing: PathBakeConfig {
+            num_visibility_samples: config.visibility_samples,
+            probe_visibility_radius_m: defaults.probe_visibility_radius_m,
+            visibility_threshold: config.visibility_threshold,
+            visibility_range_m: config.visibility_range_m,
+            path_range_m: config.path_range_m,
+            num_threads: config.bake_threads,
+        },
     })
     .map_err(|error| CliError::new(format!("city bake failed: {error}")))?;
     baked
@@ -590,7 +631,7 @@ fn scene_mesh(loaded: &fightbox_world::LoadedPackage) -> Result<SceneMesh> {
     })
 }
 
-fn probe_volume(mesh: &SceneMesh) -> Result<ProbeVolume> {
+fn probe_volume(mesh: &SceneMesh, config: BakeConfig) -> Result<ProbeVolume> {
     let first = *mesh
         .vertices_enu_m
         .first()
@@ -604,12 +645,12 @@ fn probe_volume(mesh: &SceneMesh) -> Result<ProbeVolume> {
         max.y = max.y.max(vertex.y);
     }
     min.z = 0.0;
-    max.z = 3.0;
+    max.z = config.probe_ceiling_m;
     Ok(ProbeVolume {
         min_enu_m: min,
         max_enu_m: max,
-        spacing_m: PROBE_SPACING_M,
-        height_above_floor_m: PROBE_HEIGHT_M,
+        spacing_m: config.probe_spacing_m,
+        height_above_floor_m: config.probe_height_above_floor_m,
     })
 }
 
@@ -1127,6 +1168,29 @@ mod tests {
     fn assumed_height_jitter_clamps_to_walkable_story() {
         assert_eq!(jitter_heights(4.0), [3.0, 4.0, 7.2]);
         assert_eq!(jitter_heights(3.0), [3.0, 3.0, 6.2]);
+    }
+
+    #[test]
+    fn default_bake_config_preserves_the_legacy_probe_volume() {
+        let mesh = SceneMesh {
+            vertices_enu_m: vec![
+                fightbox_steam_audio::EnuVector3::new(-2.0, -3.0, 0.0),
+                fightbox_steam_audio::EnuVector3::new(4.0, 5.0, 60.0),
+            ],
+            triangles: Vec::new(),
+            material_indices: Vec::new(),
+            materials: Vec::new(),
+        };
+        let probes = probe_volume(&mesh, BakeConfig::default()).unwrap();
+        assert_eq!(
+            probes,
+            ProbeVolume {
+                min_enu_m: fightbox_steam_audio::EnuVector3::new(-2.0, -3.0, 0.0),
+                max_enu_m: fightbox_steam_audio::EnuVector3::new(4.0, 5.0, 3.0),
+                spacing_m: 4.0,
+                height_above_floor_m: 1.5,
+            }
+        );
     }
 
     #[test]
