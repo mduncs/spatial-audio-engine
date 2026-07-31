@@ -18,6 +18,8 @@ mod governor;
 #[cfg(any(feature = "linked-sdk", test))]
 mod motion_smoothing;
 mod probe_influence;
+#[cfg(any(feature = "linked-sdk", test))]
+mod propagation_delay;
 mod status;
 #[allow(unsafe_code)]
 mod world_swap;

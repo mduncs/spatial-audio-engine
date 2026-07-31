@@ -21,13 +21,14 @@ use crate::motion_smoothing::{
     propagation_delay_samples,
 };
 use crate::probe_influence::SerializedProbeInfluences;
+use crate::propagation_delay::PropagationDelayLine;
 use crate::{MemoryTrackingStatus, QualityTier, SessionMemoryTelemetry};
 use fightbox_api::{EnuVector3 as ApiEnuVector3, Pose};
+use fightbox_runtime::SnapshotPublication;
 use fightbox_runtime::backend::{
     BackendRenderError, BackendSourceBlock, ListenerOrientation, MAX_ACTIVE_SOURCES,
     PropagationRenderBlock, SimulationError, SimulationUpdate,
 };
-use fightbox_runtime::{FractionalDelayLine, SnapshotPublication};
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
@@ -712,9 +713,7 @@ struct SourceRenderState {
     path_stereo: OwnedAudioBuffer,
     reflection_scratch: OwnedAudioBuffer,
     propagation_smoother: SourcePropagationSmoother,
-    propagation_delay: FractionalDelayLine,
-    applied_delay_samples: f32,
-    delay_initialized: bool,
+    propagation_delay: PropagationDelayLine,
     rendered_since_reset: bool,
     guard_reactivation_history: bool,
     reactivation_epoch_samples: usize,
@@ -801,7 +800,7 @@ impl MultiSourceRenderGraph {
                 if state.rendered_since_reset {
                     state.guard_reactivation_history = true;
                 }
-                state.delay_initialized = false;
+                state.propagation_delay.invalidate();
                 state.reactivation_epoch_samples = 0;
             }
         }
@@ -832,6 +831,34 @@ impl MultiSourceRenderGraph {
         Ok(())
     }
 
+    /// Renders one source's direct, baked-path, and reflection sends.
+    ///
+    /// # Stage alignment under propagation delay
+    ///
+    /// The dry stem is delayed once, before Steam Audio sees it, so all three
+    /// stages share the same source-distance time of flight. That is exactly
+    /// right for the direct stage and an accepted approximation for the other
+    /// two, on the following basis.
+    ///
+    /// *Reflections.* Measured against a standalone `IPLReflectionEffect` fed
+    /// an impulse (see `linked_reflection_ir_does_not_encode_source_distance`),
+    /// a simulated reflection IR responds within the first block regardless of
+    /// how far the source is from the listener: Steam Audio's IR is referenced
+    /// to the listener, with the source-to-listener flight time already
+    /// removed. Reflections therefore need this delay added, and adding it
+    /// keeps them behind the direct arrival rather than ahead of it, which is
+    /// the audible ordering that matters. What the shared delay does *not*
+    /// model is that each reflected path is longer than the direct path by its
+    /// own amount; those differences live inside the IR's own envelope, so the
+    /// error is a constant offset of the whole reflected field rather than a
+    /// reordering within it.
+    ///
+    /// *Baked pathing.* A path around a corner is longer than the straight
+    /// line, so the true delay exceeds the direct one. Baked paths carry no
+    /// per-path length, so the source-distance delay is used as a lower bound.
+    /// The consequence is that around-corner energy arrives slightly early;
+    /// the alternative, leaving it undelayed, would make it arrive before the
+    /// source was audible at all.
     fn render_source(
         &mut self,
         source_block: &BackendSourceBlock<'_>,
@@ -868,30 +895,21 @@ impl MultiSourceRenderGraph {
                 self.propagation_block_retention,
             )
             .endpoint();
+        // Time of flight is geometry, so its target comes from the simulated
+        // endpoints rather than from the 80 ms acoustic smoother above. The
+        // smoother exists to keep gain and occlusion from zippering; running
+        // the delay through it too would erase the distinction between motion
+        // and a teleport, which is exactly what the delay line must be able to
+        // tell apart. `PropagationDelayLine` does its own bounded slewing.
         let delay_target_samples = propagation_delay_samples(
-            smoothed.source_position,
-            smoothed.listener_position,
+            propagation.source_position,
+            listener_position,
             self.audio.sample_rate_hz,
         );
-        if !state.delay_initialized {
-            // First observation and reactivation adopt the complete target
-            // immediately. This avoids an artificial zero-delay attack ramp;
-            // normal motion is linearly traversed over each subsequent block.
-            state.applied_delay_samples = delay_target_samples;
-            state.delay_initialized = true;
-        }
-        let delay_step =
-            (delay_target_samples - state.applied_delay_samples) / self.audio.frame_size as f32;
-        let mut delay_samples = state.applied_delay_samples;
+        state
+            .propagation_delay
+            .observe_block_target(delay_target_samples);
         for (frame, input) in source_block.input_mono.iter().copied().enumerate() {
-            if frame + 1 == source_block.input_mono.len() {
-                delay_samples = delay_target_samples;
-            } else {
-                delay_samples += delay_step;
-            }
-            state
-                .propagation_delay
-                .set_target_delay_samples(delay_samples);
             let delayed = state.propagation_delay.process_sample(input);
             if state.guard_reactivation_history {
                 state.reactivation_epoch_samples =
@@ -908,8 +926,10 @@ impl MultiSourceRenderGraph {
                 self.mono_work[frame] = delayed;
             }
         }
-        state.applied_delay_samples = delay_target_samples;
         state.rendered_since_reset = true;
+        // Every downstream stage reads `mono_work`, so the direct, baked-path,
+        // and reflection sends all inherit this one source-distance delay.
+        // See the stage-alignment note on `render_source`.
         state.input.write_mono(&mut self.mono_work);
 
         let mut input = state.input.raw();
@@ -1823,16 +1843,16 @@ fn create_source_render_state(
             audio_settings.frameSize,
         )?,
         propagation_smoother: SourcePropagationSmoother::default(),
-        // The 2,048 m physical cap is converted at the graph's sample rate.
-        // Setting the per-sample bound to the full capacity lets the backend
-        // prescribe an exact intra-block ramp without reconstructing the line.
-        propagation_delay: FractionalDelayLine::new(
-            maximum_delay_samples,
-            initial_delay_samples,
-            maximum_delay_samples as f32,
-        ),
-        applied_delay_samples: initial_delay_samples,
-        delay_initialized: false,
+        // The 2,048 m physical cap converted at the graph's sample rate: the
+        // whole ring is allocated here so the render callback never does.
+        propagation_delay: {
+            let mut delay =
+                PropagationDelayLine::new(maximum_delay_samples, audio_settings.samplingRate);
+            // A source is audible at its real distance from its first block
+            // rather than swept in from zero delay.
+            delay.reset_to(initial_delay_samples);
+            delay
+        },
         rendered_since_reset: false,
         guard_reactivation_history: false,
         reactivation_epoch_samples: 0,
@@ -2282,6 +2302,240 @@ mod tests {
         assert!(
             render.mono_work.iter().all(|sample| sample.to_bits() == 0),
             "reactivation leaked pre-deactivation delay history"
+        );
+    }
+
+    /// A large reflective ground plane. A source and listener both 2 m above
+    /// it get one clean specular bounce whose path length is known exactly.
+    fn reflective_ground_mesh() -> SceneMesh {
+        SceneMesh {
+            vertices_enu_m: vec![
+                EnuVector3::new(-80.0, -80.0, 0.0),
+                EnuVector3::new(80.0, -80.0, 0.0),
+                EnuVector3::new(80.0, 80.0, 0.0),
+                EnuVector3::new(-80.0, 80.0, 0.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 3], [2, 1, 0], [3, 2, 0]],
+            material_indices: vec![0; 4],
+            materials: vec![AcousticMaterial::MASONRY],
+        }
+    }
+
+    /// Onset of a simulated reflection IR, measured through a standalone
+    /// effect so the render graph's propagation delay is not in the path.
+    fn reflection_ir_onset(source_distance_m: f32) -> usize {
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        // Denser than `test_config`: this measurement needs an IR with a
+        // clearly located first arrival, not merely a nonzero one.
+        let config = S3SimulationConfig {
+            reflection_rays: 4_096,
+            diffuse_samples: 32,
+            reflection_bounces: 2,
+            reflection_duration_s: 0.15,
+            reflection_order: 1,
+            ..S3SimulationConfig::default()
+        };
+        let listener_position = ApiEnuVector3::new(0.0, 0.0, 2.0);
+        let source_position = ApiEnuVector3::new(source_distance_m, 0.0, 2.0);
+        let descriptor = [crate::MultiSourceDescriptor::at(source_position)];
+        let (mut simulation, render) = build_multi_source_generation(
+            &reflective_ground_mesh(),
+            None,
+            audio,
+            config,
+            &descriptor,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        // The governor starts conservative; without earning full quality first
+        // the simulator returns a first-order stub IR carrying no geometry.
+        for _ in 0..20_000 {
+            simulation.observe_render_timing(100_000);
+        }
+        simulation.update_inputs(&one_source_update(true, source_position, listener_position));
+        for _ in 0..4 {
+            simulation.run_reflections().unwrap();
+        }
+        let reflection = simulation.snapshot.sources[0].reflections;
+        assert!(reflection.ir != 0, "reflection simulation produced no IR");
+
+        let context: ffi::IPLContext = handle(render.world.context);
+        let mut audio_settings = raw_audio_settings(audio);
+        // The governor, not the config, decides the order and duration the
+        // simulator actually produced. An effect built to any other shape
+        // reads the IR wrongly and returns near-silence.
+        let mut settings = ffi::IPLReflectionEffectSettings {
+            type_: reflection_effect_ffi_type(config.reflection_effect.effect_type).unwrap(),
+            irSize: reflection.ir_size,
+            numChannels: reflection.num_channels,
+        };
+        let mut effect = core::ptr::null_mut();
+        assert_eq!(
+            ffi::reflection_effect_create(context, &mut audio_settings, &mut settings, &mut effect),
+            ffi::IPL_STATUS_SUCCESS
+        );
+        let mut input = OwnedAudioBuffer::allocate(context, 1, audio.frame_size).unwrap();
+        let mut output =
+            OwnedAudioBuffer::allocate(context, settings.numChannels, audio.frame_size).unwrap();
+        let mut interleaved = vec![0.0; (settings.numChannels * audio.frame_size) as usize];
+        // Capture the whole response first, then locate its onset relative to
+        // its own peak: absolute thresholds cannot be shared across two
+        // source distances whose reflected levels differ by 20 dB or more.
+        let blocks = (2.0 * audio.sample_rate_hz as f32 / audio.frame_size as f32).ceil() as usize;
+        let mut response = Vec::with_capacity(blocks * audio.frame_size as usize);
+        for block in 0..blocks {
+            let mut samples = vec![0.0; audio.frame_size as usize];
+            if block == 0 {
+                samples[0] = 1.0;
+            }
+            input.write_mono(&mut samples);
+            let mut input_raw = input.raw();
+            let mut output_raw = output.raw();
+            let mut params = reflection_effect_params(reflection, config);
+            ffi::reflection_effect_apply(effect, &mut params, &mut input_raw, &mut output_raw);
+            output.read_interleaved(&mut interleaved);
+            response.extend(
+                interleaved
+                    .chunks_exact(settings.numChannels as usize)
+                    .map(|frame| frame.iter().fold(0.0_f32, |peak, s| peak.max(s.abs()))),
+            );
+        }
+        ffi::reflection_effect_release(&mut effect);
+
+        let peak = response.iter().copied().fold(0.0_f32, f32::max);
+        assert!(peak > 0.0, "reflection effect produced no output at all");
+        let onset = response
+            .iter()
+            .position(|sample| *sample > peak * 1.0e-3)
+            .expect("a nonzero response must have an onset");
+        println!(
+            "reflection IR probe: source {source_position:?} irSize {} channels {} \
+             peak {peak:e} onset {onset}",
+            reflection.ir_size, reflection.num_channels
+        );
+        onset
+    }
+
+    /// Establishes which side of the seam owns source-distance time of flight.
+    ///
+    /// If Steam Audio's simulated IR already carried the source-to-listener
+    /// flight time, delaying the reflection send as well would double it. The
+    /// geometry here separates the two possibilities cleanly. Source and
+    /// listener sit 2 m above a reflective plane, so the specular path is
+    /// `sqrt(d^2 + 16)` against a direct path of `d`:
+    ///
+    /// | source distance | path length | if IR starts at emission | measured onset |
+    /// |---|---|---|---|
+    /// | 2 m   | 4.47 m  | 626 samples   | 1 sample |
+    /// | 40 m  | 40.20 m | 5,626 samples | 1 sample |
+    ///
+    /// Both IRs begin immediately, 5,000 samples apart from what an
+    /// emission-referenced IR would give, while their peaks differ by 29 dB in
+    /// the direction distance attenuation predicts — so the IRs are real and
+    /// simply carry no absolute flight time. Steam Audio references them to
+    /// the listener; the render graph owns the source-distance delay.
+    #[test]
+    fn linked_reflection_ir_does_not_encode_source_distance() {
+        let near_onset = reflection_ir_onset(2.0);
+        let far_onset = reflection_ir_onset(40.0);
+
+        // Emission-referenced would put the far onset ~5,000 samples later.
+        assert!(
+            far_onset < near_onset + 1_000,
+            "the far source's reflection IR started {far_onset} samples in \
+             against {near_onset} near, which tracks absolute source distance: \
+             Steam Audio would already be encoding time of flight and the \
+             render graph would be double-delaying the reflection send"
+        );
+    }
+
+    #[test]
+    fn linked_source_teleport_crossfades_instead_of_sweeping_pitch() {
+        const TONE_HZ: f32 = 1_000.0;
+        const WARMUP_BLOCKS: usize = 150;
+        const TOTAL_BLOCKS: usize = 500;
+        const SETTLE_BLOCKS: usize = 200;
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let descriptor = [crate::MultiSourceDescriptor::at(ApiEnuVector3::new(
+            5.0, 0.0, 0.0,
+        ))];
+        let (mut simulation, mut render) =
+            build_multi_source_session(&mesh, &baked, audio, test_config(), &descriptor).unwrap();
+
+        let frames = audio.frame_size as usize;
+        let mut global_frame = 0_usize;
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for block in 0..TOTAL_BLOCKS {
+            if block == WARMUP_BLOCKS {
+                // 5 m to 60 m in one update: 7,700 samples of delay, far past
+                // the 50 ms discontinuity threshold.
+                let mut snapshot = simulation.snapshot;
+                snapshot.sequence = snapshot.sequence.wrapping_add(1);
+                snapshot.sources[0].source_position = SteamVector3::new(60.0, 0.0, 0.0);
+                simulation.publication.publish(snapshot);
+            }
+            let input = (0..frames)
+                .map(|_| {
+                    let sample =
+                        (TAU * TONE_HZ * global_frame as f32 / audio.sample_rate_hz as f32).sin();
+                    global_frame += 1;
+                    sample
+                })
+                .collect::<Vec<_>>();
+            render_one_source_block(&mut render, &input);
+            if (100..WARMUP_BLOCKS).contains(&block) {
+                before.extend_from_slice(&render.mono_work);
+            } else if block >= SETTLE_BLOCKS {
+                after.extend_from_slice(&render.mono_work);
+            }
+        }
+
+        // The 50 ms crossfade is 19 blocks; by block 200 it is long finished.
+        assert!(
+            !render.sources[0].propagation_delay.is_crossfading(),
+            "teleport crossfade did not complete within its window"
+        );
+        let expected_delay = 60.0 * 48_000.0 / 343.0;
+        assert!(
+            (render.sources[0].propagation_delay.current_delay_samples() - expected_delay).abs()
+                < 1.0,
+            "delay did not land on the post-teleport distance"
+        );
+
+        // A slewed teleport would transpose the tone for the whole glide. Both
+        // windows must instead carry the undisplaced source frequency.
+        let crossings = |samples: &[f32]| {
+            samples
+                .windows(2)
+                .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+                .count() as f32
+                * audio.sample_rate_hz as f32
+                / samples.len() as f32
+        };
+        let before_hz = crossings(&before);
+        let after_hz = crossings(&after);
+        assert!(
+            (before_hz - TONE_HZ).abs() < 3.0,
+            "pre-teleport tone measured {before_hz} Hz"
+        );
+        assert!(
+            (after_hz - TONE_HZ).abs() < 3.0,
+            "post-teleport tone measured {after_hz} Hz, so the jump was \
+             gliding rather than crossfading"
         );
     }
 
