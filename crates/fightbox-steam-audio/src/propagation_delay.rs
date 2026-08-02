@@ -10,31 +10,29 @@
 //! * **Onset latency.** A source 343 m away is heard a full second after it
 //!   sounds. This is what makes distant events read as distant even before the
 //!   listener has any reverberant cue.
-//! * **Doppler.** Nothing computes a pitch ratio here. When the distance
-//!   changes continuously the read head glides, and resampling a signal with a
-//!   drifting read head *is* a pitch shift. Doppler falls out of the geometry
-//!   rather than being applied on top of it.
+//! * **Doppler.** Published source and listener velocities drive the read
+//!   head's rate between position observations. Resampling with that moving
+//!   head produces the exact reception-time pitch ratio without applying a
+//!   second pitch effect on top of the physical delay.
 //!
 //! # Which Doppler ratio this produces, exactly
 //!
-//! The delay applied to the sample leaving at time `n` is derived from the
-//! distance *at that same time* — the only distance the simulation has
-//! published. The output is therefore `input(n - d(n)/c)`, and differentiating
-//! the read index gives a frequency ratio of `1 - v_radial/c`.
+//! For radial velocity `v` (positive when source and listener separate), the
+//! requested pitch ratio is `r = 1 / (1 + v/c)`. The corresponding delay-head
+//! rate is `1 - r`, and the reception-time delay anchored by a position
+//! observation is `(distance/c) * r`, equivalently `distance/(c + v)`.
+//! Between observations both that anchor and an integrated target advance at
+//! `1 - r`; any drift between them is removed by the same smooth one-pole used
+//! for ordinary delay motion. Position updates therefore remain authoritative
+//! without introducing a delay step.
 //!
-//! Textbook Doppler is `1 / (1 + v_radial/c)`, which differs because it
-//! evaluates the distance at *emission* time: sound arriving now left when the
-//! source was somewhere else. The two agree to first order and diverge by
-//! `(v/c)^2`. At 20 m/s, a fast vehicle, that is 0.3% — under six cents, below
-//! the threshold of pitch discrimination. At 34.3 m/s it reaches 1%.
-//!
-//! Closing that gap exactly requires the source's radial velocity (the exact
-//! delay is `d/(c + v_radial)`, not `d/c`), which the propagation snapshot does
-//! not currently carry. Estimating the velocity instead, by differencing the
-//! block-rate target, would be the wrong trade: the target arrives as a 60 Hz
-//! staircase sampled at block rate, so the estimate is zero on most blocks and
-//! large on the rest, and any error in it lands directly on the delay as
-//! audible warble. A stable 1% pitch error beats an unstable exact one.
+//! Velocity is never inferred by differencing block-rate positions. Published
+//! finite source and listener velocities are projected onto the source-listener
+//! axis. If that velocity is absent, zero, non-finite, or the positions are
+//! coincident, the line deliberately falls back to the position-only model:
+//! `input(n - d(n)/c)`, whose pitch ratio is `1 - v_radial/c`. Its `(v/c)^2`
+//! deviation from the exact ratio is therefore conditional on callers leaving
+//! velocity at its default zero value.
 //!
 //! # Why the delay is slewed rather than set
 //!
@@ -76,14 +74,19 @@
 //! delay. See the stage-alignment note in `render_source` for the empirical
 //! basis and the approximation it accepts.
 
-use crate::motion_smoothing::PROPAGATION_SLEW_TIME_SECONDS;
+use crate::motion_smoothing::{PROPAGATION_SLEW_TIME_SECONDS, SPEED_OF_SOUND_METERS_PER_SECOND};
+
+/// Requested Doppler ratios outside this interval are saturated before they
+/// drive the delay target.
+const MIN_DOPPLER_PITCH_RATIO: f32 = 2.0 / 3.0;
+const MAX_DOPPLER_PITCH_RATIO: f32 = 2.0;
 
 /// Hard bound on how fast the read head may move, in samples per sample.
 ///
-/// `0.5` corresponds to `|v_radial| <= 171.5 m/s` and a pitch ratio within
-/// `[2/3, 2]`. The one-pole normally keeps the slew far below this; the bound
-/// exists so that no distance discontinuity smaller than the teleport
-/// threshold can still transpose far enough to alias.
+/// The velocity drive separately clamps its requested ratio to `[2/3, 2]`.
+/// This independent bound also covers positional drift correction and any
+/// distance discontinuity just below the teleport threshold, preventing the
+/// primary head from moving more than half a sample per output sample.
 pub(crate) const MAX_DELAY_SLEW_SAMPLES_PER_SAMPLE: f32 = 0.5;
 
 /// Target step, in seconds of delay, that is treated as a discontinuity
@@ -111,6 +114,11 @@ pub(crate) struct PropagationDelayLine {
     applied_delay_samples: f32,
     /// Endpoint the primary head slews toward.
     target_delay_samples: f32,
+    /// Position-derived reception-time anchor for velocity-guided motion.
+    position_anchor_samples: f32,
+    /// Per-sample advance that realizes the requested Doppler pitch ratio.
+    target_rate_samples_per_sample: f32,
+    velocity_guided: bool,
     /// Previous block's raw target, used to separate motion from teleports.
     previous_raw_target_samples: f32,
     /// Frozen delay of the outgoing head while a crossfade runs.
@@ -136,6 +144,9 @@ impl PropagationDelayLine {
             maximum_delay_samples: maximum_delay_samples as f32,
             applied_delay_samples: 0.0,
             target_delay_samples: 0.0,
+            position_anchor_samples: 0.0,
+            target_rate_samples_per_sample: 0.0,
+            velocity_guided: false,
             previous_raw_target_samples: 0.0,
             outgoing_delay_samples: 0.0,
             crossfade_remaining: 0,
@@ -171,6 +182,9 @@ impl PropagationDelayLine {
         let delay = self.clamp_delay(delay_samples);
         self.applied_delay_samples = delay;
         self.target_delay_samples = delay;
+        self.position_anchor_samples = delay;
+        self.target_rate_samples_per_sample = 0.0;
+        self.velocity_guided = false;
         self.previous_raw_target_samples = delay;
         self.outgoing_delay_samples = delay;
         self.crossfade_remaining = 0;
@@ -183,33 +197,76 @@ impl PropagationDelayLine {
     /// acoustic smoother: the smoother would already have turned a teleport
     /// into the very glide this detector exists to prevent.
     pub(crate) fn observe_block_target(&mut self, raw_target_samples: f32) {
+        self.observe_block_target_inner(raw_target_samples, None);
+    }
+
+    /// Supplies a position anchor plus the published relative radial velocity.
+    ///
+    /// A finite non-zero velocity drives the exact reception-time delay rate.
+    /// Zero and non-finite values intentionally select the legacy
+    /// position-only behavior, so default-initialized callers remain safe.
+    pub(crate) fn observe_block_target_with_velocity(
+        &mut self,
+        raw_target_samples: f32,
+        radial_velocity_mps: f32,
+    ) {
+        let guidance = self.velocity_guidance(raw_target_samples, radial_velocity_mps);
+        self.observe_block_target_inner(raw_target_samples, guidance);
+    }
+
+    fn observe_block_target_inner(
+        &mut self,
+        raw_target_samples: f32,
+        guidance: Option<VelocityGuidance>,
+    ) {
         let raw = self.clamp_delay(raw_target_samples);
         if !self.initialized {
             self.reset_to(raw);
-            return;
-        }
-        if (raw - self.previous_raw_target_samples).abs() > self.teleport_threshold_samples {
+        } else if (raw - self.previous_raw_target_samples).abs() > self.teleport_threshold_samples {
             // A crossfade already in flight is abandoned rather than layered:
             // its incoming head becomes the new outgoing head, so at most two
             // taps are ever mixed no matter how fast teleports arrive.
             self.outgoing_delay_samples = self.applied_delay_samples;
             self.applied_delay_samples = raw;
+            self.target_delay_samples = raw;
             self.crossfade_remaining = self.crossfade_frames;
         }
         self.previous_raw_target_samples = raw;
-        self.target_delay_samples = raw;
+        if let Some(guidance) = guidance {
+            self.position_anchor_samples = guidance.position_anchor_samples;
+            self.target_rate_samples_per_sample = guidance.target_rate_samples_per_sample;
+            self.velocity_guided = true;
+        } else {
+            self.target_delay_samples = raw;
+            self.position_anchor_samples = raw;
+            self.target_rate_samples_per_sample = 0.0;
+            self.velocity_guided = false;
+        }
     }
 
     /// Processes one sample. Allocation-, lock-, and syscall-free.
     #[must_use]
     pub(crate) fn process_sample(&mut self, input: f32) -> f32 {
-        let one_pole = self.target_delay_samples
-            + (self.applied_delay_samples - self.target_delay_samples) * self.slew_retention;
-        let step = (one_pole - self.applied_delay_samples).clamp(
-            -MAX_DELAY_SLEW_SAMPLES_PER_SAMPLE,
-            MAX_DELAY_SLEW_SAMPLES_PER_SAMPLE,
-        );
-        self.applied_delay_samples = self.clamp_delay(self.applied_delay_samples + step);
+        if self.crossfade_remaining == 0 {
+            if self.velocity_guided {
+                self.position_anchor_samples = self.clamp_delay(
+                    self.position_anchor_samples + self.target_rate_samples_per_sample,
+                );
+                let integrated_target = self
+                    .clamp_delay(self.target_delay_samples + self.target_rate_samples_per_sample);
+                self.target_delay_samples = self.clamp_delay(
+                    self.position_anchor_samples
+                        + (integrated_target - self.position_anchor_samples) * self.slew_retention,
+                );
+            }
+            let one_pole = self.target_delay_samples
+                + (self.applied_delay_samples - self.target_delay_samples) * self.slew_retention;
+            let step = (one_pole - self.applied_delay_samples).clamp(
+                -MAX_DELAY_SLEW_SAMPLES_PER_SAMPLE,
+                MAX_DELAY_SLEW_SAMPLES_PER_SAMPLE,
+            );
+            self.applied_delay_samples = self.clamp_delay(self.applied_delay_samples + step);
+        }
 
         self.ring[self.write_index] = input;
         let primary = self.read_at(self.applied_delay_samples);
@@ -237,6 +294,32 @@ impl PropagationDelayLine {
         } else {
             0.0
         }
+    }
+
+    fn velocity_guidance(
+        &self,
+        raw_target_samples: f32,
+        radial_velocity_mps: f32,
+    ) -> Option<VelocityGuidance> {
+        if !radial_velocity_mps.is_finite() || radial_velocity_mps == 0.0 {
+            return None;
+        }
+        let denominator = 1.0 + radial_velocity_mps / SPEED_OF_SOUND_METERS_PER_SECOND;
+        let unbounded_pitch_ratio = if denominator > 0.0 {
+            denominator.recip()
+        } else {
+            MAX_DOPPLER_PITCH_RATIO
+        };
+        let pitch_ratio =
+            unbounded_pitch_ratio.clamp(MIN_DOPPLER_PITCH_RATIO, MAX_DOPPLER_PITCH_RATIO);
+        let target_rate_samples_per_sample = (1.0 - pitch_ratio).clamp(
+            -MAX_DELAY_SLEW_SAMPLES_PER_SAMPLE,
+            MAX_DELAY_SLEW_SAMPLES_PER_SAMPLE,
+        );
+        Some(VelocityGuidance {
+            position_anchor_samples: self.clamp_delay(raw_target_samples * pitch_ratio),
+            target_rate_samples_per_sample,
+        })
     }
 
     /// Reads the ring at a fractional delay behind the current write position.
@@ -271,6 +354,12 @@ impl PropagationDelayLine {
             + self.ring[center] * (-(x_plus_2 * x_plus_1 * x_minus_1) * 0.5)
             + self.ring[next] * ((x_plus_2 * x_plus_1 * x) / 6.0)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VelocityGuidance {
+    position_anchor_samples: f32,
+    target_rate_samples_per_sample: f32,
 }
 
 #[cfg(test)]
@@ -403,7 +492,10 @@ mod tests {
 
         for block in 0..(WARMUP_BLOCKS + CAPTURE_BLOCKS) {
             let distance = start_m + speed_mps * block as f32 * block_seconds;
-            delay.observe_block_target(distance * SAMPLE_RATE as f32 / 343.0);
+            delay.observe_block_target_with_velocity(
+                distance * SAMPLE_RATE as f32 / SPEED_OF_SOUND_METERS_PER_SECOND,
+                speed_mps,
+            );
             for _ in 0..128 {
                 let output = delay.process_sample(tone(frame, HERTZ));
                 frame += 1;
@@ -423,9 +515,8 @@ mod tests {
     #[test]
     fn city_speed_motion_matches_the_textbook_doppler_ratio() {
         // 10 m/s is the fast end of what a vehicle or a running listener
-        // reaches in the city fixture. At this speed the reception-time model
-        // this delay line implements and the emission-time textbook ratio
-        // agree to well under a cent.
+        // reaches in the city fixture. Published velocity now makes the delay
+        // line realize the reception-time textbook ratio directly.
         const HERTZ: f32 = 1_000.0;
         const SPEED_MPS: f32 = 10.0;
 
@@ -434,12 +525,12 @@ mod tests {
 
         let textbook = |speed: f32| HERTZ / (1.0 + speed / 343.0);
         assert!(
-            (receding - textbook(SPEED_MPS)).abs() < 1.5,
+            (receding - textbook(SPEED_MPS)).abs() < 0.75,
             "recession measured {receding} Hz against textbook {} Hz",
             textbook(SPEED_MPS)
         );
         assert!(
-            (approaching - textbook(-SPEED_MPS)).abs() < 1.5,
+            (approaching - textbook(-SPEED_MPS)).abs() < 0.75,
             "approach measured {approaching} Hz against textbook {} Hz",
             textbook(-SPEED_MPS)
         );
@@ -450,8 +541,8 @@ mod tests {
         );
     }
 
-    /// Pins the exact model so the documented second-order deviation from
-    /// textbook Doppler cannot drift silently.
+    /// Pins the exact model at the speed where position-only indexing used to
+    /// have its largest documented error.
     #[test]
     fn extreme_speed_follows_the_reception_time_model_within_its_stated_error() {
         const HERTZ: f32 = 1_000.0;
@@ -459,20 +550,75 @@ mod tests {
 
         let measured = doppler_hz(SPEED_MPS, 50.0);
 
-        let model = HERTZ * (1.0 - SPEED_MPS / 343.0);
         let textbook = HERTZ / (1.0 + SPEED_MPS / 343.0);
         assert!(
-            (measured - model).abs() < 1.5,
-            "measured {measured} Hz against the model's {model} Hz"
+            (measured - textbook).abs() < 0.75,
+            "measured {measured} Hz against the exact model's {textbook} Hz"
         );
-        // The whole point of the module note: at c/10 the deviation is ~1%,
-        // and it is second order, so it shrinks quadratically below that.
         let deviation = (measured - textbook).abs() / textbook;
         assert!(
-            (0.005..0.015).contains(&deviation),
-            "deviation from textbook Doppler was {deviation}, outside the \
-             documented second-order band"
+            deviation < 0.001,
+            "deviation from exact Doppler was {deviation}, above 0.1%"
         );
+    }
+
+    #[test]
+    fn published_velocity_retires_the_position_only_second_order_error() {
+        const HERTZ: f32 = 1_000.0;
+        for (speed_mps, start_m) in [(20.0, 50.0), (34.3, 50.0)] {
+            let measured = doppler_hz(speed_mps, start_m);
+            let exact = HERTZ / (1.0 + speed_mps / SPEED_OF_SOUND_METERS_PER_SECOND);
+            let relative_error = (measured - exact).abs() / exact;
+            assert!(
+                relative_error < 0.001,
+                "{speed_mps} m/s measured {measured} Hz against {exact} Hz \
+                 ({relative_error:.6} relative error)"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_velocity_is_bit_exact_with_position_only_behavior() {
+        let mut position_only = PropagationDelayLine::new(300_000, SAMPLE_RATE);
+        let mut zero_velocity = PropagationDelayLine::new(300_000, SAMPLE_RATE);
+
+        for block in 0..300 {
+            let target = 4_800.0 + block as f32 * 0.25;
+            position_only.observe_block_target(target);
+            zero_velocity.observe_block_target_with_velocity(target, 0.0);
+            for frame in 0..128 {
+                let input = tone(block * 128 + frame, 440.0);
+                assert_eq!(
+                    position_only.process_sample(input).to_bits(),
+                    zero_velocity.process_sample(input).to_bits()
+                );
+            }
+            assert_eq!(
+                position_only.current_delay_samples().to_bits(),
+                zero_velocity.current_delay_samples().to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_velocity_is_ignored_safely() {
+        let mut position_only = PropagationDelayLine::new(300_000, SAMPLE_RATE);
+        let mut invalid_velocity = PropagationDelayLine::new(300_000, SAMPLE_RATE);
+        let velocities = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+        for block in 0..300 {
+            let target = 4_800.0 + block as f32 * 0.25;
+            position_only.observe_block_target(target);
+            invalid_velocity
+                .observe_block_target_with_velocity(target, velocities[block % velocities.len()]);
+            for frame in 0..128 {
+                let input = tone(block * 128 + frame, 440.0);
+                let expected = position_only.process_sample(input);
+                let actual = invalid_velocity.process_sample(input);
+                assert!(actual.is_finite());
+                assert_eq!(expected.to_bits(), actual.to_bits());
+            }
+        }
     }
 
     #[test]

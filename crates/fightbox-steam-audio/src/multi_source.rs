@@ -59,7 +59,9 @@ impl SteamPose {
 #[derive(Clone, Copy)]
 struct SimulationFrame {
     listener: SteamPose,
+    listener_linear_velocity_mps: SteamVector3,
     sources: [SteamPose; MAX_ACTIVE_SOURCES],
+    source_linear_velocities_mps: [SteamVector3; MAX_ACTIVE_SOURCES],
     active: [bool; MAX_ACTIVE_SOURCES],
 }
 
@@ -287,6 +289,7 @@ impl MultiSourceSimulation {
             return;
         }
         let mut sources = self.frame.sources;
+        let mut source_linear_velocities_mps = self.frame.source_linear_velocities_mps;
         let mut active = [false; MAX_ACTIVE_SOURCES];
         for index in 0..self.world.source_count {
             let motion = update.sources[index];
@@ -299,11 +302,14 @@ impl MultiSourceSimulation {
                 return;
             };
             sources[index] = pose;
+            source_linear_velocities_mps[index] = api_enu_to_steam(motion.linear_velocity_mps);
             active[index] = motion.active;
         }
         self.frame = SimulationFrame {
             listener,
+            listener_linear_velocity_mps: api_enu_to_steam(update.listener.linear_velocity_mps),
             sources,
+            source_linear_velocities_mps,
             active,
         };
         self.valid_update = true;
@@ -412,6 +418,7 @@ impl MultiSourceSimulation {
         self.snapshot.simulated_at_ns =
             self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         self.snapshot.listener_position = self.frame.listener.position;
+        self.snapshot.listener_linear_velocity_mps = self.frame.listener_linear_velocity_mps;
         let listener_has_probe = flag == ffi::IPL_SIMULATIONFLAGS_PATHING
             && self
                 .world
@@ -421,6 +428,7 @@ impl MultiSourceSimulation {
             let source_snapshot = &mut self.snapshot.sources[index];
             source_snapshot.active = self.frame.active[index];
             source_snapshot.source_position = self.frame.sources[index].position;
+            source_snapshot.linear_velocity_mps = self.frame.source_linear_velocities_mps[index];
             let mut outputs = ffi::IPLSimulationOutputs::zeroed();
             ffi::source_get_outputs(self.world.source(index), flag, &mut outputs);
             match flag {
@@ -539,6 +547,34 @@ fn same_position(left: SteamVector3, right: SteamVector3) -> bool {
     left.x.to_bits() == right.x.to_bits()
         && left.y.to_bits() == right.y.to_bits()
         && left.z.to_bits() == right.z.to_bits()
+}
+
+fn radial_velocity_mps(
+    source_position: SteamVector3,
+    source_velocity_mps: SteamVector3,
+    listener_position: SteamVector3,
+    listener_velocity_mps: SteamVector3,
+) -> f32 {
+    let offset = SteamVector3::new(
+        source_position.x - listener_position.x,
+        source_position.y - listener_position.y,
+        source_position.z - listener_position.z,
+    );
+    let distance_squared = offset.x * offset.x + offset.y * offset.y + offset.z * offset.z;
+    if !distance_squared.is_finite() || distance_squared <= 1.0e-12 {
+        return 0.0;
+    }
+    let inverse_distance = distance_squared.sqrt().recip();
+    let relative_velocity = SteamVector3::new(
+        source_velocity_mps.x - listener_velocity_mps.x,
+        source_velocity_mps.y - listener_velocity_mps.y,
+        source_velocity_mps.z - listener_velocity_mps.z,
+    );
+    let radial = (relative_velocity.x * offset.x
+        + relative_velocity.y * offset.y
+        + relative_velocity.z * offset.z)
+        * inverse_distance;
+    if radial.is_finite() { radial } else { 0.0 }
 }
 
 fn direct_is_finite(direct: SteamDirectParams) -> bool {
@@ -714,6 +750,7 @@ struct SourceRenderState {
     reflection_scratch: OwnedAudioBuffer,
     propagation_smoother: SourcePropagationSmoother,
     propagation_delay: PropagationDelayLine,
+    last_propagation_observation: Option<(u64, u32, u32)>,
     rendered_since_reset: bool,
     guard_reactivation_history: bool,
     reactivation_epoch_samples: usize,
@@ -801,6 +838,7 @@ impl MultiSourceRenderGraph {
                     state.guard_reactivation_history = true;
                 }
                 state.propagation_delay.invalidate();
+                state.last_propagation_observation = None;
                 state.reactivation_epoch_samples = 0;
             }
         }
@@ -815,6 +853,8 @@ impl MultiSourceRenderGraph {
                 propagation,
                 listener,
                 snapshot.listener_position,
+                snapshot.listener_linear_velocity_mps,
+                snapshot.sequence,
                 block.output_left,
                 block.output_right,
                 stage_output_gains,
@@ -839,6 +879,16 @@ impl MultiSourceRenderGraph {
     /// stages share the same source-distance time of flight. That is exactly
     /// right for the direct stage and an accepted approximation for the other
     /// two, on the following basis.
+    ///
+    /// Published source and listener velocities refine the delay-head rate
+    /// between position snapshots. Their relative velocity is projected onto
+    /// the raw source-listener axis, producing the exact reception-time pitch
+    /// ratio `1 / (1 + v_radial / 343)`. Raw positions remain the absolute
+    /// anchor and the sole teleport signal; any velocity-integrated drift back
+    /// to that anchor is corrected through the delay line's one-pole rather
+    /// than by stepping a read head. A default zero velocity deliberately
+    /// retains the wave-6 position-only behavior and its conditional
+    /// `1 - v_radial / 343` approximation.
     ///
     /// *Reflections.* Measured against a standalone `IPLReflectionEffect` fed
     /// an impulse (see `linked_reflection_ir_does_not_encode_source_distance`),
@@ -865,6 +915,8 @@ impl MultiSourceRenderGraph {
         propagation: SteamSourcePropagation,
         listener: SteamPose,
         listener_position: SteamVector3,
+        listener_linear_velocity_mps: SteamVector3,
+        propagation_sequence: u64,
         output_left: &mut [f32],
         output_right: &mut [f32],
         stage_output_gains: StageOutputGains,
@@ -895,20 +947,41 @@ impl MultiSourceRenderGraph {
                 self.propagation_block_retention,
             )
             .endpoint();
-        // Time of flight is geometry, so its target comes from the simulated
-        // endpoints rather than from the 80 ms acoustic smoother above. The
-        // smoother exists to keep gain and occlusion from zippering; running
-        // the delay through it too would erase the distinction between motion
-        // and a teleport, which is exactly what the delay line must be able to
-        // tell apart. `PropagationDelayLine` does its own bounded slewing.
+        // Time of flight is anchored by the simulated endpoints rather than by
+        // the 80 ms acoustic smoother above. The smoother exists to keep gain
+        // and occlusion from zippering; running the raw delay through it too
+        // would erase the distinction between motion and a teleport, which is
+        // exactly what the delay line must be able to tell apart. Published
+        // velocity supplies the between-snapshot rate, while the delay line
+        // corrects integrated drift and ordinary positional motion smoothly.
         let delay_target_samples = propagation_delay_samples(
             propagation.source_position,
             listener_position,
             self.audio.sample_rate_hz,
         );
-        state
-            .propagation_delay
-            .observe_block_target(delay_target_samples);
+        let radial_velocity_mps = radial_velocity_mps(
+            propagation.source_position,
+            propagation.linear_velocity_mps,
+            listener_position,
+            listener_linear_velocity_mps,
+        );
+        let observation = (
+            propagation_sequence,
+            delay_target_samples.to_bits(),
+            radial_velocity_mps.to_bits(),
+        );
+        if state.last_propagation_observation != Some(observation) {
+            if radial_velocity_mps == 0.0 {
+                state
+                    .propagation_delay
+                    .observe_block_target(delay_target_samples);
+            } else {
+                state
+                    .propagation_delay
+                    .observe_block_target_with_velocity(delay_target_samples, radial_velocity_mps);
+            }
+            state.last_propagation_observation = Some(observation);
+        }
         for (frame, input) in source_block.input_mono.iter().copied().enumerate() {
             let delayed = state.propagation_delay.process_sample(input);
             if state.guard_reactivation_history {
@@ -1309,7 +1382,9 @@ pub(crate) fn build_multi_source_generation(
         config,
         frame: SimulationFrame {
             listener,
+            listener_linear_velocity_mps: SteamVector3::default(),
             sources: source_poses,
+            source_linear_velocities_mps: [SteamVector3::default(); MAX_ACTIVE_SOURCES],
             active,
         },
         valid_update: true,
@@ -1853,6 +1928,7 @@ fn create_source_render_state(
             delay.reset_to(initial_delay_samples);
             delay
         },
+        last_propagation_observation: None,
         rendered_since_reset: false,
         guard_reactivation_history: false,
         reactivation_epoch_samples: 0,
@@ -2125,6 +2201,62 @@ mod tests {
             }
         }
         ((energy / measured as f64).sqrt() as f32, direct)
+    }
+
+    #[test]
+    fn snapshot_publishes_validated_source_and_listener_velocities() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let source_position = ApiEnuVector3::new(10.0, 0.0, 1.5);
+        let listener_position = ApiEnuVector3::new(0.0, 0.0, 1.5);
+        let descriptor = [crate::MultiSourceDescriptor::at(source_position)];
+        let (mut simulation, _render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptor,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        let source_velocity = ApiEnuVector3::new(20.0, 3.0, -4.0);
+        let listener_velocity = ApiEnuVector3::new(5.0, -2.0, 1.0);
+        let mut update = one_source_update(true, source_position, listener_position);
+        update.sources[0].linear_velocity_mps = source_velocity;
+        update.listener.linear_velocity_mps = listener_velocity;
+
+        simulation.update_inputs(&update);
+        simulation.run_direct().unwrap();
+
+        assert_eq!(
+            simulation.snapshot.sources[0].linear_velocity_mps,
+            api_enu_to_steam(source_velocity)
+        );
+        assert_eq!(
+            simulation.snapshot.listener_linear_velocity_mps,
+            api_enu_to_steam(listener_velocity)
+        );
+        assert_eq!(
+            radial_velocity_mps(
+                simulation.snapshot.sources[0].source_position,
+                simulation.snapshot.sources[0].linear_velocity_mps,
+                simulation.snapshot.listener_position,
+                simulation.snapshot.listener_linear_velocity_mps,
+            )
+            .to_bits(),
+            15.0_f32.to_bits()
+        );
+
+        update.sources[0].linear_velocity_mps.east_m = f32::NAN;
+        simulation.update_inputs(&update);
+        assert!(matches!(
+            simulation.run_direct(),
+            Err(SimulationError::InvalidUpdate)
+        ));
     }
 
     #[test]

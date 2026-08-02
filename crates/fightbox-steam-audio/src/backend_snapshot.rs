@@ -29,6 +29,7 @@ pub(crate) struct SteamReflectionParams {
 pub(crate) struct SteamSourcePropagation {
     pub(crate) active: bool,
     pub(crate) source_position: SteamVector3,
+    pub(crate) linear_velocity_mps: SteamVector3,
     pub(crate) direct: SteamDirectParams,
     pub(crate) path_eq: [f32; 3],
     pub(crate) path_sh: [f32; MAX_PATH_SH_COEFFS],
@@ -41,6 +42,7 @@ impl Default for SteamSourcePropagation {
         Self {
             active: false,
             source_position: SteamVector3::default(),
+            linear_velocity_mps: SteamVector3::default(),
             direct: SteamDirectParams {
                 distance_attenuation: 1.0,
                 air_absorption: [1.0; 3],
@@ -62,6 +64,7 @@ pub(crate) struct SteamPropagationSnapshot {
     pub(crate) sequence: u64,
     pub(crate) simulated_at_ns: u64,
     pub(crate) listener_position: SteamVector3,
+    pub(crate) listener_linear_velocity_mps: SteamVector3,
     pub(crate) sources: [SteamSourcePropagation; MAX_ACTIVE_SOURCES],
 }
 
@@ -72,6 +75,7 @@ impl Default for SteamPropagationSnapshot {
             sequence: 0,
             simulated_at_ns: 0,
             listener_position: SteamVector3::default(),
+            listener_linear_velocity_mps: SteamVector3::default(),
             sources: [SteamSourcePropagation::default(); MAX_ACTIVE_SOURCES],
         }
     }
