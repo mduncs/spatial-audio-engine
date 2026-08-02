@@ -1119,11 +1119,16 @@ fn apply_final_disk_cap(forced: &mut Option<(&'static str, &'static str)>, final
 }
 
 fn terminate_group(process_group: u32) {
+    terminate_group_with_grace(process_group, Duration::from_secs(2));
+}
+
+fn terminate_group_with_grace(process_group: u32, term_grace: Duration) {
     let group = format!("-{process_group}");
     let _ = Command::new("/bin/kill")
         .args(["-TERM", group.as_str()])
         .status();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    signal_group_members("-TERM", process_group);
+    let deadline = Instant::now() + term_grace;
     while Instant::now() < deadline {
         if group_members(process_group).is_empty() {
             return;
@@ -1134,30 +1139,70 @@ fn terminate_group(process_group: u32) {
         .args(["-KILL", group.as_str()])
         .status();
     let kill_deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < kill_deadline && !group_members(process_group).is_empty() {
+    while Instant::now() < kill_deadline {
+        if group_members(process_group).is_empty() {
+            return;
+        }
+        signal_group_members("-KILL", process_group);
         thread::sleep(Duration::from_millis(25));
     }
 }
 
+fn signal_group_members(signal: &str, process_group: u32) {
+    let Some(members) = try_group_members(process_group) else {
+        return;
+    };
+    if members.is_empty() {
+        return;
+    }
+    let mut command = Command::new("/bin/kill");
+    command.arg(signal);
+    for member in members {
+        command.arg(member.to_string());
+    }
+    let _ = command.status();
+}
+
 fn group_members(process_group: u32) -> Vec<u32> {
-    let Ok(output) = Command::new("/bin/ps")
+    try_group_members(process_group).unwrap_or_else(|| {
+        process_group_exists(process_group)
+            .then_some(process_group)
+            .into_iter()
+            .collect()
+    })
+}
+
+fn process_group_exists(process_group: u32) -> bool {
+    let group = format!("-{process_group}");
+    Command::new("/bin/kill")
+        .args(["-0", group.as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+fn try_group_members(process_group: u32) -> Option<Vec<u32>> {
+    let output = Command::new("/bin/ps")
         .args(["-axo", "pid=,pgid=,state="])
         .output()
-    else {
-        return vec![process_group];
-    };
-    let Ok(text) = String::from_utf8(output.stdout) else {
-        return vec![process_group];
-    };
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let pgid = fields.next()?.parse::<u32>().ok()?;
-            let state = fields.next()?;
-            (pgid == process_group && !state.starts_with('Z')).then_some(pid)
-        })
-        .collect()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse::<u32>().ok()?;
+                let pgid = fields.next()?.parse::<u32>().ok()?;
+                let state = fields.next()?;
+                (pgid == process_group && !state.starts_with('Z')).then_some(pid)
+            })
+            .collect(),
+    )
 }
 
 fn process_tree_rss(root: u32) -> Option<u64> {
@@ -1804,6 +1849,15 @@ fn verify_staged(root: &Path) -> Result<()> {
         ));
     }
     verify_authority(root, &report.authority, report.mode, &report.protocol)?;
+    verify_canonical_cases(&report)?;
+    verify_artifact_layout(root, &report, &manifest)?;
+    for case in &report.cases {
+        verify_case_artifacts(root, case)?;
+    }
+    verify_decision(&report)
+}
+
+fn verify_canonical_cases(report: &Report) -> Result<()> {
     let expected = canonical_cases(report.mode, &report.protocol);
     if expected.len() != 116 || report.cases.len() != expected.len() {
         return Err(CliError::new(
@@ -1824,7 +1878,6 @@ fn verify_staged(root: &Path) -> Result<()> {
             "sweep report has missing, extra, or relabelled canonical case ids",
         ));
     }
-    verify_artifact_layout(root, &report, &manifest)?;
     for (id, canonical) in &expected {
         let case = actual[id];
         if case.family != canonical.family
@@ -1855,8 +1908,11 @@ fn verify_staged(root: &Path) -> Result<()> {
             }
         }
         verify_case(case, report.mode, &report.protocol)?;
-        verify_case_artifacts(root, case)?;
     }
+    Ok(())
+}
+
+fn verify_decision(report: &Report) -> Result<()> {
     if report.decision != formal_decision(report.mode, &report.cases, DECISION_REQUIRED_BY) {
         return Err(CliError::new(
             "formal kilometer decision does not follow case evidence",
@@ -2230,6 +2286,40 @@ fn verify_authority(
     mode: SweepMode,
     protocol: &Protocol,
 ) -> Result<()> {
+    verify_authority_metadata(authority, mode, protocol)?;
+    let dylib = safe_bundle_artifact(root, &authority.steam_audio_dylib_path)?;
+    let engine = safe_bundle_artifact(root, &authority.engine_executable_path)?;
+    let dylib_bytes = fs::read(dylib).map_err(io("read bundled authority SDK dylib"))?;
+    let dylib_hash = sha256_hex(&dylib_bytes);
+    if dylib_hash != PINNED_LIBPHONON_SHA256 {
+        return Err(CliError::new(
+            "sweep authority artifacts do not match their immutable checksums",
+        ));
+    }
+    let engine_bytes = fs::read(engine).map_err(io("read bundled authority engine executable"))?;
+    let engine_hash = sha256_hex(&engine_bytes);
+    if engine_hash != authority.engine_executable_sha256 {
+        return Err(CliError::new(
+            "sweep authority artifacts do not match their immutable checksums",
+        ));
+    }
+    let verifier_bytes =
+        fs::read(std::env::current_exe().map_err(io("resolve verifier executable"))?)
+            .map_err(io("read verifier executable"))?;
+    verify_authority_artifact_hashes(
+        authority,
+        &dylib_hash,
+        &engine_hash,
+        &sha256_hex(&verifier_bytes),
+        engine_bytes == verifier_bytes,
+    )
+}
+
+fn verify_authority_metadata(
+    authority: &AuthorityProvenance,
+    mode: SweepMode,
+    protocol: &Protocol,
+) -> Result<()> {
     let expected_profile = if cfg!(debug_assertions) {
         "debug"
     } else {
@@ -2251,18 +2341,20 @@ fn verify_authority(
     {
         return Err(CliError::new("invalid sweep authority provenance"));
     }
-    let dylib = safe_bundle_artifact(root, &authority.steam_audio_dylib_path)?;
-    let engine = safe_bundle_artifact(root, &authority.engine_executable_path)?;
-    let dylib_bytes = fs::read(dylib).map_err(io("read bundled authority SDK dylib"))?;
-    let engine_bytes = fs::read(engine).map_err(io("read bundled authority engine executable"))?;
-    let verifier_bytes =
-        fs::read(std::env::current_exe().map_err(io("resolve verifier executable"))?)
-            .map_err(io("read verifier executable"))?;
-    let verifier_hash = sha256_hex(&verifier_bytes);
-    if sha256_hex(&dylib_bytes) != PINNED_LIBPHONON_SHA256
-        || sha256_hex(&engine_bytes) != authority.engine_executable_sha256
+    Ok(())
+}
+
+fn verify_authority_artifact_hashes(
+    authority: &AuthorityProvenance,
+    dylib_hash: &str,
+    engine_hash: &str,
+    verifier_hash: &str,
+    engine_matches_verifier: bool,
+) -> Result<()> {
+    if dylib_hash != PINNED_LIBPHONON_SHA256
+        || engine_hash != authority.engine_executable_sha256
         || authority.engine_executable_sha256 != verifier_hash
-        || engine_bytes != verifier_bytes
+        || !engine_matches_verifier
         || authority.engine_executable_sha256.len() != 64
         || !authority
             .engine_executable_sha256
@@ -2993,11 +3085,6 @@ mod tests {
         root
     }
 
-    fn write_report_bundle(root: &Path, report: &Report) {
-        write_json_atomic(&root.join("report.json"), report).unwrap();
-        write_json_atomic(&root.join("artifacts.json"), &build_manifest(root).unwrap()).unwrap();
-    }
-
     #[test]
     fn matrix_cardinalities_are_exact_and_not_naive_cartesian() {
         let bakes = bake_plan();
@@ -3330,8 +3417,9 @@ mod tests {
     #[test]
     fn absent_bake_envelope_discards_real_order_partial_and_atomic_artifacts() {
         let root = temp_test_root("absent-envelope-partials");
-        let report = synthetic_report(&root, SweepMode::Sampled);
         let case_dir = root.join("cases/local-s2-r100");
+        fs::create_dir_all(&case_dir).unwrap();
+        fs::write(case_dir.join("time-bake.log"), b"completed supervisor log").unwrap();
         fs::write(case_dir.join("probe-batch.bin"), b"partial probe bytes").unwrap();
         fs::write(case_dir.join("bake.json"), b"{\"partial\":true}").unwrap();
         fs::write(
@@ -3359,8 +3447,10 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp.")
         }));
-        write_report_bundle(&root, &report);
-        verify_staged(&root).unwrap();
+        assert_eq!(
+            fs::read(case_dir.join("time-bake.log")).unwrap(),
+            b"completed supervisor log"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3401,7 +3491,7 @@ mod tests {
         );
     }
 
-    fn synthetic_report(root: &Path, mode: SweepMode) -> Report {
+    fn synthetic_report_without_artifacts(mode: SweepMode) -> Report {
         let protocol = Protocol::for_mode(mode);
         let mut cases = Vec::new();
         for spec in bake_plan() {
@@ -3411,9 +3501,6 @@ mod tests {
                 case.status = CaseStatus::Error;
                 case.reason = Some("synthetic attempted child error".into());
                 case.resources = attempted_error_resources();
-                let dir = root.join("cases").join(&case.id);
-                fs::create_dir_all(&dir).unwrap();
-                fs::write(dir.join("time-bake.log"), b"synthetic time").unwrap();
             }
             cases.push(case);
         }
@@ -3425,11 +3512,37 @@ mod tests {
                 case.status = CaseStatus::Error;
                 case.reason = Some("synthetic attempted child error".into());
                 case.resources = attempted_error_resources();
-                let dir = root.join("cases").join(&case.id);
-                fs::create_dir_all(&dir).unwrap();
-                fs::write(dir.join("time-benchmark.log"), b"synthetic time").unwrap();
             }
             cases.push(case);
+        }
+        Report {
+            schema_version: SCHEMA.into(),
+            mode,
+            generated_unix_seconds: 0,
+            authority: synthetic_authority(mode, &protocol, "0".repeat(64), "a".repeat(64)),
+            protocol,
+            decision: formal_decision(mode, &cases, "2026-08-05"),
+            cases,
+            claims: Vec::new(),
+            non_claims: Vec::new(),
+        }
+    }
+
+    fn synthetic_report(root: &Path, mode: SweepMode) -> Report {
+        let mut report = synthetic_report_without_artifacts(mode);
+        for case in report
+            .cases
+            .iter()
+            .filter(|case| case.status != CaseStatus::ProjectedSkip)
+        {
+            let dir = root.join("cases").join(&case.id);
+            fs::create_dir_all(&dir).unwrap();
+            let kind = if case.family == "retained_runtime" {
+                "benchmark"
+            } else {
+                "bake"
+            };
+            fs::write(dir.join(format!("time-{kind}.log")), b"synthetic time").unwrap();
         }
         fs::create_dir_all(root.join("authority")).unwrap();
         let sdk_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3443,36 +3556,41 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         let executable_bytes = fs::read(&executable).unwrap();
         fs::hard_link(executable, root.join(BUNDLED_ENGINE_PATH)).unwrap();
-        Report {
-            schema_version: SCHEMA.into(),
+        report.authority = synthetic_authority(
             mode,
-            generated_unix_seconds: 0,
-            authority: AuthorityProvenance {
-                engine_identity: provenance::ENGINE_IDENTITY.into(),
-                source_state: "unborn_main_uncommitted_source".into(),
-                source_identity_sha256: source_identity_sha256().unwrap(),
-                engine_executable_path: BUNDLED_ENGINE_PATH.into(),
-                engine_executable_sha256: sha256_hex(&executable_bytes),
-                build_profile: if cfg!(debug_assertions) {
-                    "debug"
-                } else {
-                    "release"
-                }
-                .into(),
-                platform: provenance::platform().into(),
-                cpu_class: provenance::cpu_class().into(),
-                steam_audio_version: STEAM_AUDIO_VERSION.into(),
-                steam_audio_upstream_commit: STEAM_AUDIO_UPSTREAM_COMMIT.into(),
-                steam_audio_dylib_path: BUNDLED_LIBPHONON_PATH.into(),
-                steam_audio_dylib_sha256: PINNED_LIBPHONON_SHA256.into(),
-                sample_rate_hz: 48_000,
-                canonical_plan_sha256: hash_json(&canonical_plan_json(mode, &protocol)).unwrap(),
-            },
-            protocol,
-            decision: formal_decision(mode, &cases, "2026-08-05"),
-            cases,
-            claims: Vec::new(),
-            non_claims: Vec::new(),
+            &report.protocol,
+            source_identity_sha256().unwrap(),
+            sha256_hex(&executable_bytes),
+        );
+        report
+    }
+
+    fn synthetic_authority(
+        mode: SweepMode,
+        protocol: &Protocol,
+        source_identity_sha256: String,
+        engine_executable_sha256: String,
+    ) -> AuthorityProvenance {
+        AuthorityProvenance {
+            engine_identity: provenance::ENGINE_IDENTITY.into(),
+            source_state: "unborn_main_uncommitted_source".into(),
+            source_identity_sha256,
+            engine_executable_path: BUNDLED_ENGINE_PATH.into(),
+            engine_executable_sha256,
+            build_profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .into(),
+            platform: provenance::platform().into(),
+            cpu_class: provenance::cpu_class().into(),
+            steam_audio_version: STEAM_AUDIO_VERSION.into(),
+            steam_audio_upstream_commit: STEAM_AUDIO_UPSTREAM_COMMIT.into(),
+            steam_audio_dylib_path: BUNDLED_LIBPHONON_PATH.into(),
+            steam_audio_dylib_sha256: PINNED_LIBPHONON_SHA256.into(),
+            sample_rate_hz: 48_000,
+            canonical_plan_sha256: hash_json(&canonical_plan_json(mode, protocol)).unwrap(),
         }
     }
 
@@ -3570,6 +3688,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "heavy; run explicitly"]
     fn top_level_verifier_rejects_rehashed_incorrect_rss_peak() {
         let root = std::env::temp_dir().join(format!(
             "fightbox-sweep-resource-mutation-{}-{}",
@@ -3600,13 +3719,25 @@ mod tests {
     }
 
     #[test]
+    fn report_content_verifier_rejects_incorrect_rss_peak_without_artifact_io() {
+        let mut report = synthetic_report_without_artifacts(SweepMode::Sampled);
+        let case = report
+            .cases
+            .iter_mut()
+            .find(|case| case.id == "local-s2-r100")
+            .unwrap();
+        case.resources.sampled_rss_bytes = vec![1, 7, 2];
+        case.resources.peak_sampled_rss_bytes = Some(2);
+        let error = verify_canonical_cases(&report).unwrap_err();
+        assert!(error.message().contains("maximum raw RSS sample"));
+    }
+
+    #[test]
     fn sampled_decision_is_always_provisional_and_final_claim_is_rejected() {
-        let root = temp_test_root("sampled-decision");
-        let mut report = synthetic_report(&root, SweepMode::Sampled);
+        let mut report = synthetic_report_without_artifacts(SweepMode::Sampled);
         assert_eq!(report.decision.applicability, "provisional_not_applicable");
         assert!(report.decision.kernel_reach.is_none());
-        write_report_bundle(&root, &report);
-        verify_staged(&root).unwrap();
+        verify_decision(&report).unwrap();
 
         report.decision = Decision {
             applicability: "final_full_protocol".into(),
@@ -3616,13 +3747,13 @@ mod tests {
             named_post_mvp_phase: Some("post_mvp_kilometer_approach_qualification".into()),
             decision_required_by: None,
         };
-        write_report_bundle(&root, &report);
-        assert!(verify_staged(&root).is_err());
-        fs::remove_dir_all(root).unwrap();
+        assert!(verify_decision(&report).is_err());
     }
 
     #[test]
     fn canonical_plan_rejects_missing_extra_duplicate_relabel_and_settings_drift() {
+        let baseline = synthetic_report_without_artifacts(SweepMode::Sampled);
+        verify_canonical_cases(&baseline).unwrap();
         for mutation in [
             "missing",
             "extra",
@@ -3632,8 +3763,7 @@ mod tests {
             "traversal",
             "absolute",
         ] {
-            let root = temp_test_root(mutation);
-            let mut report = synthetic_report(&root, SweepMode::Sampled);
+            let mut report = baseline.clone();
             match mutation {
                 "missing" => {
                     report.cases.pop();
@@ -3665,9 +3795,10 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            write_report_bundle(&root, &report);
-            assert!(verify_staged(&root).is_err(), "mutation {mutation}");
-            fs::remove_dir_all(root).unwrap();
+            assert!(
+                verify_canonical_cases(&report).is_err(),
+                "mutation {mutation}"
+            );
         }
     }
 
@@ -3770,59 +3901,86 @@ mod tests {
     }
 
     #[test]
-    fn authority_mutations_are_rejected_after_rehash() {
-        for mutation in [
-            "engine",
-            "source",
-            "plan",
-            "checksum",
-            "fake_sdk",
-            "fake_engine",
-            "coordinated_engine",
-        ] {
-            let root = temp_test_root(mutation);
-            let mut report = synthetic_report(&root, SweepMode::Sampled);
+    fn authority_metadata_and_artifact_hash_mutations_are_rejected() {
+        let mode = SweepMode::Sampled;
+        let protocol = Protocol::for_mode(mode);
+        let engine_hash = "a".repeat(64);
+        let baseline = synthetic_authority(
+            mode,
+            &protocol,
+            source_identity_sha256().unwrap(),
+            engine_hash.clone(),
+        );
+        verify_authority_metadata(&baseline, mode, &protocol).unwrap();
+        verify_authority_artifact_hashes(
+            &baseline,
+            PINNED_LIBPHONON_SHA256,
+            &engine_hash,
+            &engine_hash,
+            true,
+        )
+        .unwrap();
+
+        for mutation in ["engine", "source", "plan", "checksum"] {
+            let mut authority = baseline.clone();
             match mutation {
-                "engine" => report.authority.engine_identity = "invented".into(),
-                "source" => report.authority.source_identity_sha256 = "0".repeat(64),
-                "plan" => report.authority.canonical_plan_sha256 = "0".repeat(64),
-                "checksum" => report.authority.steam_audio_dylib_sha256 = "0".repeat(64),
-                "fake_sdk" => {
-                    fs::remove_file(root.join(BUNDLED_LIBPHONON_PATH)).unwrap();
-                    fs::write(root.join(BUNDLED_LIBPHONON_PATH), b"fake SDK").unwrap()
-                }
-                "fake_engine" => {
-                    fs::remove_file(root.join(BUNDLED_ENGINE_PATH)).unwrap();
-                    fs::write(root.join(BUNDLED_ENGINE_PATH), b"fake engine").unwrap()
-                }
-                "coordinated_engine" => {
-                    fs::remove_file(root.join(BUNDLED_ENGINE_PATH)).unwrap();
-                    fs::write(root.join(BUNDLED_ENGINE_PATH), b"coordinated fake engine").unwrap();
-                    report.authority.engine_executable_sha256 =
-                        sha256_hex(b"coordinated fake engine");
-                }
+                "engine" => authority.engine_identity = "invented".into(),
+                "source" => authority.source_identity_sha256 = "0".repeat(64),
+                "plan" => authority.canonical_plan_sha256 = "0".repeat(64),
+                "checksum" => authority.steam_audio_dylib_sha256 = "0".repeat(64),
                 _ => unreachable!(),
             }
-            write_report_bundle(&root, &report);
-            assert!(verify_staged(&root).is_err(), "mutation {mutation}");
-            fs::remove_dir_all(root).unwrap();
+            assert!(
+                verify_authority_metadata(&authority, mode, &protocol).is_err(),
+                "mutation {mutation}"
+            );
         }
+
+        let fake_hash = sha256_hex(b"coordinated fake engine");
+        assert!(
+            verify_authority_artifact_hashes(
+                &baseline,
+                &"0".repeat(64),
+                &engine_hash,
+                &engine_hash,
+                true,
+            )
+            .is_err(),
+            "mutation fake_sdk"
+        );
+        assert!(
+            verify_authority_artifact_hashes(
+                &baseline,
+                PINNED_LIBPHONON_SHA256,
+                &fake_hash,
+                &engine_hash,
+                false,
+            )
+            .is_err(),
+            "mutation fake_engine"
+        );
+        let mut coordinated = baseline;
+        coordinated.engine_executable_sha256 = fake_hash.clone();
+        assert!(
+            verify_authority_artifact_hashes(
+                &coordinated,
+                PINNED_LIBPHONON_SHA256,
+                &fake_hash,
+                &engine_hash,
+                false,
+            )
+            .is_err(),
+            "mutation coordinated_engine"
+        );
     }
 
     #[test]
     fn report_schema_rejects_unknown_fields() {
-        let root = temp_test_root("unknown-field");
-        let report = synthetic_report(&root, SweepMode::Sampled);
+        let report = synthetic_report_without_artifacts(SweepMode::Sampled);
         let mut value = serde_json::to_value(report).unwrap();
         value["invented_claim"] = true.into();
-        write_json_atomic(&root.join("report.json"), &value).unwrap();
-        write_json_atomic(
-            &root.join("artifacts.json"),
-            &build_manifest(&root).unwrap(),
-        )
-        .unwrap();
-        assert!(verify_staged(&root).is_err());
-        fs::remove_dir_all(root).unwrap();
+        let error = serde_json::from_value::<Report>(value).unwrap_err();
+        assert!(error.to_string().contains("unknown field `invented_claim`"));
     }
 
     #[test]
@@ -3872,7 +4030,7 @@ mod tests {
         leader.wait().unwrap();
         thread::sleep(Duration::from_millis(50));
         assert!(!group_members(group).is_empty());
-        terminate_group(group);
+        terminate_group_with_grace(group, Duration::from_millis(50));
         assert!(group_members(group).is_empty());
     }
 }

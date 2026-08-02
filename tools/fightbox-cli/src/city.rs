@@ -1389,7 +1389,7 @@ mod tests {
 
     #[cfg(feature = "linked-sdk")]
     #[test]
-    fn artifact_estimator_bounds_a_small_real_bake_in_a_tempdir() {
+    fn synthetic_default_bake_matches_expectation_and_estimator_bounds() {
         let root = bake_temp("artifact-estimate-real-bake");
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/city/synthetic/block.geojson");
@@ -1406,6 +1406,16 @@ mod tests {
         let output = root.join("block.baked");
         bake_with_config(&package, &output, config).unwrap();
         let baked = load_baked(&output).unwrap();
+        let expected = crate::bake_expectations::expectation("synthetic-block-default");
+        assert_eq!(
+            (
+                baked.metadata.content_sha256.as_str(),
+                baked.metadata.probe_count
+            ),
+            (expected.artifact_sha256, expected.probe_count),
+            "synthetic city bake differs from the checked-in expectation: either you changed \
+             bake behavior intentionally (update bake_expectations.rs) or you broke determinism"
+        );
         let actual_artifact_bytes: u64 = output
             .read_dir()
             .unwrap()

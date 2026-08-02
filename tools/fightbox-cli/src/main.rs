@@ -21,6 +21,8 @@ use fightbox_steam_audio::{CapabilityStatus, runtime_status, steam_audio_provena
 
 mod asset;
 mod atomicio;
+#[cfg(test)]
+mod bake_expectations;
 mod bake_reservation;
 mod bundle;
 mod calibrate;
