@@ -82,6 +82,39 @@
       ]
     }
   ],
+  "events": [
+    {
+      "id": "megablock-supersonic-shot",
+      "kind": "ballistic_shot",
+      "trigger_key": "space",
+      "event_sources": {
+        "crack": {
+          "id": "megablock-shot-crack",
+          "default_active": false
+        },
+        "blast": {
+          "id": "megablock-shot-blast",
+          "default_active": false
+        }
+      },
+      "muzzle_m": [
+        137.5,
+        262.5,
+        1.5
+      ],
+      "direction_enu": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "mach": 2.5,
+      "asset_id": "artillery-impact",
+      "levels": {
+        "blast_spl_at_one_meter_db": 155.0,
+        "crack_over_blast_db_at_30_m": 3.0
+      }
+    }
+  ],
   "listener": {
     "trajectory": {
       "waypoints_m": [

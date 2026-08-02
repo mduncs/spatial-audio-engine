@@ -19,6 +19,13 @@
         "$ref": "#/$defs/source"
       }
     },
+    "events": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "$ref": "#/$defs/ballistic_shot_event"
+      }
+    },
     "listener": {
       "$ref": "#/$defs/listener"
     },
@@ -205,6 +212,101 @@
           "required": ["trajectory"]
         }
       ]
+    },
+    "event_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "default_active"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "default_active": {
+          "const": false
+        }
+      }
+    },
+    "ballistic_event_sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["crack", "blast"],
+      "properties": {
+        "crack": {
+          "$ref": "#/$defs/event_source"
+        },
+        "blast": {
+          "$ref": "#/$defs/event_source"
+        }
+      }
+    },
+    "ballistic_event_levels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "blast_spl_at_one_meter_db",
+        "crack_over_blast_db_at_30_m"
+      ],
+      "properties": {
+        "blast_spl_at_one_meter_db": {
+          "type": "number",
+          "minimum": -3.4028234663852886e+38,
+          "maximum": 3.4028234663852886e+38
+        },
+        "crack_over_blast_db_at_30_m": {
+          "type": "number",
+          "minimum": -3.4028234663852886e+38,
+          "maximum": 3.4028234663852886e+38
+        }
+      }
+    },
+    "ballistic_shot_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "trigger_key",
+        "event_sources",
+        "muzzle_m",
+        "direction_enu",
+        "mach",
+        "asset_id",
+        "levels"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "const": "ballistic_shot"
+        },
+        "trigger_key": {
+          "const": "space"
+        },
+        "event_sources": {
+          "$ref": "#/$defs/ballistic_event_sources"
+        },
+        "muzzle_m": {
+          "$ref": "#/$defs/vec3"
+        },
+        "direction_enu": {
+          "$ref": "#/$defs/vec3"
+        },
+        "mach": {
+          "type": "number",
+          "exclusiveMinimum": 1,
+          "maximum": 3.4028234663852886e+38
+        },
+        "asset_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "levels": {
+          "$ref": "#/$defs/ballistic_event_levels"
+        }
+      }
     },
     "listener": {
       "type": "object",

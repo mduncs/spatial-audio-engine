@@ -375,6 +375,19 @@ impl MultiSourceSimulation {
             let source_teleported =
                 endpoint_teleported(self.frame.sources[index].position, sources[index].position);
             let activation_changed = self.frame.active[index] != active[index];
+            if !self.frame.active[index]
+                && active[index]
+                && self.governor.telemetry().sources[index].priority_class
+                    == crate::SourcePriorityClass::TransientEvent
+            {
+                // `begin_source_transient` rejects ordinary steady slots, so
+                // only descriptors pre-classified as transient may reach this
+                // path. Re-assert the class at the activation seam, beside the
+                // coherent pose/active update, then arm its existing window.
+                self.governor
+                    .set_source_priority(index, crate::SourcePriorityClass::TransientEvent);
+                self.governor.begin_source_transient(index);
+            }
             if listener_teleported || source_teleported || activation_changed {
                 self.path_gates[index].invalidate(&mut self.snapshot.sources[index]);
                 path_invalidated = true;
@@ -889,6 +902,7 @@ struct SourceRenderState {
     reflection_scratch: OwnedAudioBuffer,
     propagation_smoother: SourcePropagationSmoother,
     impulse_shaper: Option<ImpulseShaper>,
+    reflection_send_enabled: bool,
     propagation_delay: PropagationDelayLine,
     last_propagation_observation: Option<(u64, u32, u32)>,
     rendered_since_reset: bool,
@@ -1088,6 +1102,9 @@ impl MultiSourceRenderGraph {
         let mut targets = source_quality_targets(source_quality, listener_centric_reflection);
         if !self.world.has_baked_pathing {
             targets[1] = 0.0;
+        }
+        if !state.reflection_send_enabled {
+            targets[2] = 0.0;
         }
         let quality_ramps: [GainRamp; 3] = std::array::from_fn(|index| {
             GainRamp::new(
@@ -1628,8 +1645,8 @@ pub(crate) fn build_multi_source_generation(
         source_occlusion_modes[index] =
             crate::direct_occlusion_for_extent(config, descriptor.extent);
         source_extents[index] = descriptor.extent;
-        active[index] = true;
-        initial.sources[index].active = true;
+        active[index] = descriptor.initially_active;
+        initial.sources[index].active = descriptor.initially_active;
         initial.sources[index].source_position = source_poses[index].position;
         initial.sources[index].source_forward = source_poses[index].forward;
         initial.sources[index].source_up = source_poses[index].up;
@@ -1640,8 +1657,11 @@ pub(crate) fn build_multi_source_generation(
     let (writer, reader) = SnapshotPublication::new(initial);
     let (stage_output_gain_writer, stage_output_gains) =
         SnapshotPublication::new(StageOutputGains::UNITY);
-    let (governor, governor_quality) =
+    let (mut governor, governor_quality) =
         QualityGovernor::new(audio, config, descriptors, quality_tier, memory);
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        governor.set_source_priority(index, descriptor.priority_class);
+    }
     let render = create_render_graph(
         Arc::clone(&world),
         audio,
@@ -2077,7 +2097,7 @@ fn create_render_graph(
             initial_snapshot.listener_position,
             audio.sample_rate_hz,
         );
-        source_states.push(create_source_render_state(
+        let mut state = create_source_render_state(
             context,
             &mut audio_settings,
             hrtf,
@@ -2088,7 +2108,17 @@ fn create_render_graph(
             initial_delay_samples,
             descriptors[index].extent,
             descriptors[index].impulse_class,
-        )?);
+            descriptors[index].reflection_send_enabled,
+        )?;
+        if !initial_snapshot.sources[index].active {
+            // A pre-declared inactive event can trigger before the callback has
+            // ever rendered an inactive block. Do not retain the constructor's
+            // default-listener delay in that case: first activation must adopt
+            // its teleported trigger-time distance whole, exactly as a later
+            // inactive render would arrange through `invalidate`.
+            state.propagation_delay.invalidate();
+        }
+        source_states.push(state);
     }
     let applied_governor_quality = governor_quality.read();
     for (index, state) in source_states.iter_mut().enumerate() {
@@ -2101,6 +2131,9 @@ fn create_render_graph(
         );
         if !world.has_baked_pathing {
             state.quality_gains[1] = 0.0;
+        }
+        if !state.reflection_send_enabled {
+            state.quality_gains[2] = 0.0;
         }
     }
     let has_line_width = descriptors
@@ -2184,6 +2217,7 @@ fn create_source_render_state(
     initial_delay_samples: f32,
     extent: ExtentDescriptor,
     impulse_class: fightbox_api::ImpulseClass,
+    reflection_send_enabled: bool,
 ) -> Result<SourceRenderState, BackendError> {
     let line_length_m = match extent {
         ExtentDescriptor::LineSegment { length_m } => Some(length_m),
@@ -2286,6 +2320,7 @@ fn create_source_render_state(
         )?,
         propagation_smoother: SourcePropagationSmoother::default(),
         impulse_shaper: ImpulseShaper::new(impulse_class, audio_settings.samplingRate),
+        reflection_send_enabled,
         // The 2,048 m physical cap converted at the graph's sample rate: the
         // whole ring is allocated here so the render callback never does.
         propagation_delay: {
@@ -2335,6 +2370,10 @@ mod impulse_strip_prototype;
 mod tests {
     use super::*;
     use crate::AcousticMaterial;
+    use crate::{
+        BallisticEventLevels, BallisticShot, BallisticShotPlan, plan_ballistic_shot,
+        synthesize_crack_stem,
+    };
     use fightbox_runtime::backend::{BackendSourceBlock, SourceMotion};
     use std::f32::consts::TAU;
 
@@ -2415,6 +2454,143 @@ mod tests {
         (left, right)
     }
 
+    fn signed_ballistic_plan(listener: ApiEnuVector3) -> BallisticShotPlan {
+        plan_ballistic_shot(
+            BallisticShot {
+                muzzle_position_enu: ApiEnuVector3::default(),
+                direction_enu: ApiEnuVector3::new(0.0, 1.0, 0.0),
+                mach: 2.5,
+                levels: BallisticEventLevels {
+                    blast_spl_at_one_meter_db: 155.0,
+                    crack_over_blast_db_at_reference: 3.0,
+                },
+            },
+            listener,
+        )
+        .unwrap()
+    }
+
+    fn ballistic_descriptors(plan: BallisticShotPlan) -> [crate::MultiSourceDescriptor; 2] {
+        let crack = plan.crack.unwrap_or(plan.blast);
+        [
+            crate::MultiSourceDescriptor::at(crack.position_enu)
+                .with_reference_level(fightbox_api::ReferenceLevel::SplAtOneMeter {
+                    db_spl: crack.spl_at_one_meter_db as f32,
+                })
+                .with_initially_active(false)
+                .with_source_priority(crate::SourcePriorityClass::TransientEvent)
+                .with_reflection_send(false),
+            crate::MultiSourceDescriptor::at(plan.blast.position_enu)
+                .with_reference_level(fightbox_api::ReferenceLevel::SplAtOneMeter {
+                    db_spl: plan.blast.spl_at_one_meter_db as f32,
+                })
+                .with_impulse_class(fightbox_api::ImpulseClass::ArtilleryThunder)
+                .with_initially_active(false)
+                .with_source_priority(crate::SourcePriorityClass::TransientEvent),
+        ]
+    }
+
+    fn ballistic_update(plan: BallisticShotPlan, listener: ApiEnuVector3) -> SimulationUpdate {
+        let mut sources = [SourceMotion::default(); MAX_ACTIVE_SOURCES];
+        if let Some(crack) = plan.crack {
+            sources[0] = SourceMotion {
+                active: true,
+                pose: default_api_pose(crack.position_enu),
+                linear_velocity_mps: ApiEnuVector3::default(),
+            };
+        }
+        sources[1] = SourceMotion {
+            active: true,
+            pose: default_api_pose(plan.blast.position_enu),
+            linear_velocity_mps: ApiEnuVector3::default(),
+        };
+        SimulationUpdate {
+            listener: fightbox_api::ListenerState {
+                pose: default_api_pose(listener),
+                linear_velocity_mps: ApiEnuVector3::default(),
+            },
+            sources,
+        }
+    }
+
+    fn render_ballistic_program(
+        render: &mut MultiSourceRenderGraph,
+        crack: &[f32],
+        blast: &[f32],
+    ) -> Vec<f32> {
+        assert_eq!(crack.len(), blast.len());
+        assert_eq!(crack.len() % render.audio.frame_size as usize, 0);
+        let mut interleaved = Vec::with_capacity(crack.len() * 2);
+        for (crack_block, blast_block) in crack
+            .chunks_exact(render.audio.frame_size as usize)
+            .zip(blast.chunks_exact(render.audio.frame_size as usize))
+        {
+            let sources = [
+                BackendSourceBlock {
+                    source_index: 0,
+                    input_mono: crack_block,
+                },
+                BackendSourceBlock {
+                    source_index: 1,
+                    input_mono: blast_block,
+                },
+            ];
+            let mut left = vec![0.0; render.audio.frame_size as usize];
+            let mut right = vec![0.0; render.audio.frame_size as usize];
+            render
+                .render_block(PropagationRenderBlock {
+                    listener_orientation: ListenerOrientation {
+                        forward: ApiEnuVector3::new(0.0, 1.0, 0.0),
+                        up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+                    },
+                    sources: &sources,
+                    output_left: &mut left,
+                    output_right: &mut right,
+                })
+                .unwrap();
+            interleaved.extend(
+                left.into_iter()
+                    .zip(right)
+                    .flat_map(|(left, right)| [left, right]),
+            );
+        }
+        interleaved
+    }
+
+    fn isolated_onset_near(stereo: &[f32], expected_s: f64, sample_rate_hz: usize) -> usize {
+        let expected = (expected_s * sample_rate_hz as f64).round() as usize;
+        let probe_radius = sample_rate_hz / 100;
+        let start = expected.saturating_sub(probe_radius);
+        let end = (expected + probe_radius + 1).min(stereo.len() / 2);
+        let peak = (start..end)
+            .map(|frame| stereo[frame * 2].abs().max(stereo[frame * 2 + 1].abs()))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            peak > 0.0,
+            "isolated onset probe is silent near {expected_s}s"
+        );
+        let threshold = peak * 1.0e-3;
+        let onset = (start..end)
+            .find(|frame| stereo[*frame * 2].abs().max(stereo[*frame * 2 + 1].abs()) >= threshold)
+            .expect("isolated onset near ballistic oracle");
+        eprintln!(
+            "ballistic_onset_probe expected_frame={expected} start={start} end={end} peak={peak:.9e} threshold={threshold:.9e} start_amp={:.9e} onset={onset}",
+            stereo[start * 2].abs().max(stereo[start * 2 + 1].abs()),
+        );
+        onset
+    }
+
+    fn direct_only(render: &mut MultiSourceRenderGraph) {
+        render
+            .take_stage_output_gain_writer()
+            .unwrap()
+            .publish(StageOutputGains {
+                direct: 1.0,
+                pathing: 0.0,
+                reflections: 0.0,
+            });
+    }
+
     fn path_terms(seed: f32) -> ([f32; 3], [f32; crate::backend_snapshot::MAX_PATH_SH_COEFFS]) {
         (
             [seed, seed + 0.125, seed + 0.25],
@@ -2477,6 +2653,253 @@ mod tests {
         eprintln!(
             "path_gate miss_1=hold miss_2=hold miss_3=fade resolve_reset_misses={}",
             gate.consecutive_misses
+        );
+    }
+
+    #[test]
+    fn ballistic_pair_is_atomic_timed_prioritized_and_reuses_its_slots() {
+        let listener = ApiEnuVector3::new(0.0, 60.0, 30.0);
+        let plan = signed_ballistic_plan(listener);
+        let descriptors = ballistic_descriptors(plan);
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let mesh = ballistic_free_field_mesh();
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        assert_eq!(simulation.source_count(), 2);
+        assert!(!simulation.snapshot.sources[0].active);
+        assert!(!simulation.snapshot.sources[1].active);
+        assert!(!render.sources[0].reflection_send_enabled);
+        assert!(render.sources[1].reflection_send_enabled);
+
+        let update = ballistic_update(plan, listener);
+        simulation.update_inputs(&update);
+        // Activation invalidates paths but republishes the old inactive frame;
+        // there is no default-occlusion audible snapshot between trigger and
+        // the direct tick.
+        assert!(!simulation.snapshot.sources[0].active);
+        assert!(!simulation.snapshot.sources[1].active);
+        simulation.run_direct().unwrap();
+        let first_activation_sequence = simulation.snapshot.sequence;
+        assert!(simulation.snapshot.sources[0].active);
+        assert!(simulation.snapshot.sources[1].active);
+        let telemetry = simulation.quality_governor_telemetry();
+        for source in &telemetry.sources[..2] {
+            assert_eq!(
+                source.priority_class,
+                crate::SourcePriorityClass::TransientEvent
+            );
+            assert!(source.transient_protection_remaining_blocks > 0);
+        }
+
+        direct_only(&mut render);
+        // The signed strip measures the later blast on an isolated component
+        // probe so the crack's long, low-level HRTF/filter residue cannot be
+        // mistaken for a second onset. Keep an equivalent triggered pair with
+        // a silent crack stem for that measurement.
+        let (mut blast_probe_simulation, mut blast_probe_render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            2,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        blast_probe_simulation.update_inputs(&update);
+        blast_probe_simulation.run_direct().unwrap();
+        direct_only(&mut blast_probe_render);
+        let program_frames = 48_000;
+        let (crack, _) = synthesize_crack_stem(&plan, 48_000, program_frames).unwrap();
+        let mut blast = vec![0.0; program_frames];
+        blast[0] = 1.0;
+        let silent_crack = vec![0.0; program_frames];
+        let first_blast_probe =
+            render_ballistic_program(&mut blast_probe_render, &silent_crack, &blast);
+        let first = render_ballistic_program(&mut render, &crack, &blast);
+        assert_eq!(
+            render.sources[0].quality_gains[2].to_bits(),
+            0.0_f32.to_bits()
+        );
+        let crack_frame = isolated_onset_near(
+            &first,
+            plan.crack.unwrap().arrival_time_s,
+            audio.sample_rate_hz as usize,
+        );
+        let blast_frame = isolated_onset_near(
+            &first_blast_probe,
+            plan.blast.arrival_time_s,
+            audio.sample_rate_hz as usize,
+        );
+        let crack_measured_ms = crack_frame as f64 * 1_000.0 / 48_000.0;
+        let blast_measured_ms = blast_frame as f64 * 1_000.0 / 48_000.0;
+        let crack_delta_ms = crack_measured_ms - plan.crack.unwrap().arrival_time_s * 1_000.0;
+        let blast_delta_ms = blast_measured_ms - plan.blast.arrival_time_s * 1_000.0;
+        assert!(
+            crack_delta_ms.abs() <= 2.0,
+            "crack delta {crack_delta_ms:+.4} ms"
+        );
+        assert!(
+            blast_delta_ms.abs() <= 2.0,
+            "blast delta {blast_delta_ms:+.4} ms"
+        );
+
+        // Retire and reactivate the same two stable indices. The inactive
+        // direct publication resets retained delay history; no source or SDK
+        // object is created for the second shot.
+        let mut inactive = update;
+        inactive.sources[0].active = false;
+        inactive.sources[1].active = false;
+        simulation.update_inputs(&inactive);
+        simulation.run_direct().unwrap();
+        blast_probe_simulation.update_inputs(&inactive);
+        blast_probe_simulation.run_direct().unwrap();
+        let zeros = vec![0.0; 128];
+        render_ballistic_program(&mut render, &zeros, &zeros);
+        render_ballistic_program(&mut blast_probe_render, &zeros, &zeros);
+        simulation.update_inputs(&update);
+        simulation.run_direct().unwrap();
+        blast_probe_simulation.update_inputs(&update);
+        blast_probe_simulation.run_direct().unwrap();
+        let second_activation_sequence = simulation.snapshot.sequence;
+        assert!(second_activation_sequence > first_activation_sequence);
+        assert_eq!(simulation.source_count(), 2);
+        let second_blast_probe =
+            render_ballistic_program(&mut blast_probe_render, &silent_crack, &blast);
+        let second = render_ballistic_program(&mut render, &crack, &blast);
+        let second_crack = isolated_onset_near(
+            &second,
+            plan.crack.unwrap().arrival_time_s,
+            audio.sample_rate_hz as usize,
+        );
+        let second_blast = isolated_onset_near(
+            &second_blast_probe,
+            plan.blast.arrival_time_s,
+            audio.sample_rate_hz as usize,
+        );
+        let second_crack_delta_ms =
+            second_crack as f64 * 1_000.0 / 48_000.0 - plan.crack.unwrap().arrival_time_s * 1_000.0;
+        let second_blast_delta_ms =
+            second_blast as f64 * 1_000.0 / 48_000.0 - plan.blast.arrival_time_s * 1_000.0;
+        assert!(second_crack_delta_ms.abs() <= 2.0);
+        assert!(second_blast_delta_ms.abs() <= 2.0);
+        eprintln!(
+            "ballistic_timing crack={crack_measured_ms:.4}ms delta={crack_delta_ms:+.4}ms blast={blast_measured_ms:.4}ms delta={blast_delta_ms:+.4}ms second_crack_delta={second_crack_delta_ms:+.4}ms second_blast_delta={second_blast_delta_ms:+.4}ms activation_sequences={first_activation_sequence}/{second_activation_sequence} slots={}",
+            simulation.source_count(),
+        );
+    }
+
+    #[test]
+    fn ballistic_out_of_cone_is_blast_only_with_ballistic_timing() {
+        let listener = ApiEnuVector3::new(0.0, -30.0, 30.0);
+        let plan = signed_ballistic_plan(listener);
+        assert!(plan.crack.is_none());
+        let descriptors = ballistic_descriptors(plan);
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let mesh = ballistic_free_field_mesh();
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        simulation.update_inputs(&ballistic_update(plan, listener));
+        simulation.run_direct().unwrap();
+        assert!(!simulation.snapshot.sources[0].active);
+        assert!(simulation.snapshot.sources[1].active);
+        direct_only(&mut render);
+        let crack = vec![0.0; 48_000];
+        let mut blast = vec![0.0; 48_000];
+        blast[0] = 1.0;
+        let output = render_ballistic_program(&mut render, &crack, &blast);
+        let onset = isolated_onset_near(
+            &output,
+            plan.blast.arrival_time_s,
+            audio.sample_rate_hz as usize,
+        );
+        let measured_ms = onset as f64 * 1_000.0 / 48_000.0;
+        let delta_ms = measured_ms - plan.blast.arrival_time_s * 1_000.0;
+        assert!(delta_ms.abs() <= 2.0, "blast-only delta {delta_ms:+.4} ms");
+        eprintln!(
+            "ballistic_out_of_cone blast={measured_ms:.4}ms delta={delta_ms:+.4}ms crack_active=false"
+        );
+    }
+
+    #[test]
+    fn ballistic_cold_start_occlusion_has_no_unoccluded_onset_block() {
+        let mesh = wall_mesh(AcousticMaterial::MASONRY);
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let source = ApiEnuVector3::new(0.0, -1.0, 1.5);
+        let listener = ApiEnuVector3::new(0.0, 1.0, 1.5);
+        let descriptors = [crate::MultiSourceDescriptor::at(source)
+            .with_initially_active(false)
+            .with_source_priority(crate::SourcePriorityClass::TransientEvent)
+            .with_reflection_send(false)];
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        direct_only(&mut render);
+        let update = one_source_update(true, source, listener);
+        simulation.update_inputs(&update);
+        let mut onset_block = vec![0.0; 128];
+        onset_block[0] = 1.0;
+        let (pre_tick_left, pre_tick_right) = render_one_source_block(&mut render, &onset_block);
+        assert!(
+            pre_tick_left
+                .iter()
+                .chain(&pre_tick_right)
+                .all(|sample| sample.to_bits() == 0.0_f32.to_bits())
+        );
+
+        simulation.run_direct().unwrap();
+        assert!(simulation.snapshot.sources[0].active);
+        assert!(simulation.snapshot.sources[0].direct.occlusion <= 1.0e-4);
+        let mut stem = vec![0.0; 24_064];
+        stem[960] = 1.0; // 20 ms direct-simulation window before emission.
+        let mut peak = 0.0_f32;
+        for block in stem.chunks_exact(128) {
+            let (left, right) = render_one_source_block(&mut render, block);
+            peak = left
+                .into_iter()
+                .chain(right)
+                .map(f32::abs)
+                .fold(peak, f32::max);
+        }
+        assert!(
+            peak <= 1.0e-8,
+            "occluded cold-start onset leaked at {peak:.9e}"
+        );
+        eprintln!(
+            "ballistic_cold_start occlusion={:.9} onset_peak={peak:.9e}",
+            simulation.snapshot.sources[0].direct.occlusion,
         );
     }
 
@@ -2675,6 +3098,20 @@ mod tests {
             ],
             material_indices: vec![0, 0, 0, 0, 1, 1, 1, 1],
             materials: vec![wall, AcousticMaterial::GROUND],
+        }
+    }
+
+    fn ballistic_free_field_mesh() -> SceneMesh {
+        SceneMesh {
+            vertices_enu_m: vec![
+                EnuVector3::new(-200.0, -200.0, -100.0),
+                EnuVector3::new(200.0, -200.0, -100.0),
+                EnuVector3::new(200.0, 200.0, -100.0),
+                EnuVector3::new(-200.0, 200.0, -100.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 3], [2, 1, 0], [3, 2, 0]],
+            material_indices: vec![0; 4],
+            materials: vec![AcousticMaterial::GROUND],
         }
     }
 

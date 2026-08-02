@@ -236,6 +236,57 @@ def load_json(path: Path, label: str) -> Any:
         ) from error
 
 
+def validate_cross_fields(fixture: Any) -> list[Issue]:
+    """Rules that relate ordinary sources to pre-declared event slots."""
+    if not isinstance(fixture, dict):
+        return []
+    sources = fixture.get("sources", [])
+    events = fixture.get("events", [])
+    if not isinstance(sources, list) or not isinstance(events, list):
+        return []
+    errors: list[Issue] = []
+    total = len(sources) + 2 * len(events)
+    if total > 8:
+        errors.append(
+            Issue("$", f"ordinary plus pre-declared event sources total {total}; maximum is 8")
+        )
+    seen: dict[str, str] = {}
+    for index, source in enumerate(sources):
+        if isinstance(source, dict) and isinstance(source.get("id"), str):
+            seen[source["id"]] = f"$.sources[{index}].id"
+    for event_index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        direction = event.get("direction_enu")
+        if (
+            isinstance(direction, list)
+            and len(direction) == 3
+            and all(SchemaValidator._is_number(component) for component in direction)
+            and all(math.isfinite(component) for component in direction)
+            and sum(component * component for component in direction) <= 1.0e-12
+        ):
+            errors.append(
+                Issue(
+                    f"$.events[{event_index}].direction_enu",
+                    "ballistic direction must be non-zero",
+                )
+            )
+        event_sources = event.get("event_sources")
+        if not isinstance(event_sources, dict):
+            continue
+        for role in ("crack", "blast"):
+            source = event_sources.get(role)
+            if not isinstance(source, dict) or not isinstance(source.get("id"), str):
+                continue
+            path = f"$.events[{event_index}].event_sources.{role}.id"
+            source_id = source["id"]
+            if source_id in seen:
+                errors.append(Issue(path, f"duplicates source id declared at {seen[source_id]}"))
+            else:
+                seen[source_id] = path
+    return sorted(set(errors))
+
+
 def parse_args() -> argparse.Namespace:
     repository = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(
@@ -259,6 +310,7 @@ def main() -> int:
         if not isinstance(schema, dict):
             raise ValueError(f"schema {args.schema} must contain a JSON object")
         errors, warnings = SchemaValidator(schema).validate(fixture, schema)
+        errors = sorted(set(errors + validate_cross_fields(fixture)))
     except (KeyError, TypeError, ValueError) as error:
         print(f"FAIL {error}", file=sys.stderr)
         return 2

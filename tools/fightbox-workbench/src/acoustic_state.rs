@@ -11,8 +11,8 @@ use fightbox_runtime::MAX_ACTIVE_SOURCES;
 use fightbox_runtime::backend::{SimulationError, SimulationRunner, SimulationUpdate};
 use fightbox_runtime::{SnapshotPublication, SnapshotReader, SnapshotWriter};
 use fightbox_steam_audio::{
-    GovernorTransitionReason, PathQualityLevel, ReflectionQualityLevel, SourceQualityLevel,
-    StageOutputGains, SteamAudioSimulationRunner,
+    GovernorTransitionReason, PathQualityLevel, ReflectionQualityLevel, SourcePriorityClass,
+    SourceQualityLevel, StageOutputGains, SteamAudioSimulationRunner,
 };
 
 /// Whether a queried position sits inside an influencing baked probe.
@@ -119,6 +119,8 @@ pub(crate) struct AcousticTelemetry {
     /// The governor reports nothing for an unbaked generation.
     pub(crate) governor_available: bool,
     pub(crate) source_quality: [SourceQualityLevel; MAX_ACTIVE_SOURCES],
+    pub(crate) source_priority_class: [SourcePriorityClass; MAX_ACTIVE_SOURCES],
+    pub(crate) source_transient_protection_remaining_blocks: [u32; MAX_ACTIVE_SOURCES],
     pub(crate) source_physically_calibrated: [bool; MAX_ACTIVE_SOURCES],
     pub(crate) source_predicted_audibility_db: [f32; MAX_ACTIVE_SOURCES],
     /// Per-source Steam Audio direct occlusion, an audibility fraction:
@@ -172,6 +174,8 @@ impl AcousticTelemetry {
         baked_pathing: false,
         governor_available: false,
         source_quality: [SourceQualityLevel::Full; MAX_ACTIVE_SOURCES],
+        source_priority_class: [SourcePriorityClass::Steady; MAX_ACTIVE_SOURCES],
+        source_transient_protection_remaining_blocks: [0; MAX_ACTIVE_SOURCES],
         source_physically_calibrated: [false; MAX_ACTIVE_SOURCES],
         source_predicted_audibility_db: [0.0; MAX_ACTIVE_SOURCES],
         source_occlusion: [None; MAX_ACTIVE_SOURCES],
@@ -216,6 +220,15 @@ impl AcousticTelemetry {
                     .copied()
             })
             .flatten()
+    }
+
+    fn priority(self, source_index: usize) -> Option<(SourcePriorityClass, u32)> {
+        (self.known && self.governor_available).then(|| {
+            (
+                self.source_priority_class[source_index],
+                self.source_transient_protection_remaining_blocks[source_index],
+            )
+        })
     }
 
     fn path_eq(self, source_index: usize) -> Option<[f32; 3]> {
@@ -266,6 +279,8 @@ impl AcousticTelemetryTap {
             baked_pathing: capabilities.baked_pathing,
             governor_available: governor.is_some(),
             source_quality: [SourceQualityLevel::Full; MAX_ACTIVE_SOURCES],
+            source_priority_class: [SourcePriorityClass::Steady; MAX_ACTIVE_SOURCES],
+            source_transient_protection_remaining_blocks: [0; MAX_ACTIVE_SOURCES],
             source_physically_calibrated: [false; MAX_ACTIVE_SOURCES],
             source_predicted_audibility_db: [0.0; MAX_ACTIVE_SOURCES],
             source_occlusion: [None; MAX_ACTIVE_SOURCES],
@@ -317,6 +332,9 @@ impl AcousticTelemetryTap {
             });
             for (index, source) in governor.sources.iter().enumerate() {
                 telemetry.source_quality[index] = source.quality;
+                telemetry.source_priority_class[index] = source.priority_class;
+                telemetry.source_transient_protection_remaining_blocks[index] =
+                    source.transient_protection_remaining_blocks;
                 telemetry.source_physically_calibrated[index] = source.physically_calibrated;
                 telemetry.source_predicted_audibility_db[index] = source.predicted_audibility_db;
             }
@@ -357,6 +375,7 @@ pub(crate) struct SourceAcousticState {
     pub(crate) quality: SourceQuality,
     pub(crate) physically_calibrated: Option<bool>,
     pub(crate) predicted_audibility_db: Option<f32>,
+    pub(crate) priority: Option<(SourcePriorityClass, u32)>,
     pub(crate) path_eq: Option<[f32; 3]>,
     pub(crate) path_sh_energy: Option<f32>,
 }
@@ -382,6 +401,7 @@ impl SourceAcousticState {
         quality: SourceQuality::Unknown,
         physically_calibrated: None,
         predicted_audibility_db: None,
+        priority: None,
         path_eq: None,
         path_sh_energy: None,
     };
@@ -428,6 +448,7 @@ impl SourceAcousticState {
             quality,
             physically_calibrated: telemetry.physically_calibrated(source_index),
             predicted_audibility_db: telemetry.predicted_audibility_db(source_index),
+            priority: telemetry.priority(source_index),
             path_eq: telemetry.path_eq(source_index),
             path_sh_energy: telemetry.path_sh_energy(source_index),
         }
@@ -764,12 +785,18 @@ mod tests {
         source_path_eq[0] = Some([0.626, 0.272, 0.151]);
         let mut source_path_sh_energy = [None; MAX_ACTIVE_SOURCES];
         source_path_sh_energy[0] = Some(1.25e-5);
+        let mut source_priority_class = [SourcePriorityClass::Steady; MAX_ACTIVE_SOURCES];
+        source_priority_class[0] = SourcePriorityClass::TransientEvent;
+        let mut source_transient_protection_remaining_blocks = [0; MAX_ACTIVE_SOURCES];
+        source_transient_protection_remaining_blocks[0] = 731;
         let state = SourceAcousticState::evaluate(
             inputs(),
             AcousticTelemetry {
                 source_predicted_audibility_db,
                 source_path_eq,
                 source_path_sh_energy,
+                source_priority_class,
+                source_transient_protection_remaining_blocks,
                 ..telemetry()
             },
             0,
@@ -783,6 +810,10 @@ mod tests {
         assert_eq!(
             path_diagnostics_text(state),
             "path SH 1.250e-5   EQ 0.626/0.272/0.151"
+        );
+        assert_eq!(
+            state.priority,
+            Some((SourcePriorityClass::TransientEvent, 731))
         );
     }
 

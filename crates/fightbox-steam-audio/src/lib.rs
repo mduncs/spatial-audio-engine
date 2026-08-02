@@ -13,6 +13,7 @@
 
 #[cfg(any(feature = "linked-sdk", test))]
 mod backend_snapshot;
+mod ballistic_event;
 mod elevated_probes;
 mod governor;
 mod impulse_shaping;
@@ -26,6 +27,10 @@ mod status;
 mod width_render;
 #[allow(unsafe_code)]
 mod world_swap;
+pub use ballistic_event::{
+    BallisticEventError, BallisticEventLevels, BallisticEventSource, BallisticShot,
+    BallisticShotPlan, EVENT_PROGRAM_SECONDS, plan_ballistic_shot, synthesize_crack_stem,
+};
 pub use elevated_probes::ElevatedProbeLayer;
 pub use governor::{
     DeliveredReflectionQuality, GovernorSimulationPass, GovernorTransitionReason, PathQualityLevel,
@@ -924,6 +929,9 @@ pub struct MultiSourceDescriptor {
     directivity: fightbox_api::Directivity,
     extent: fightbox_api::ExtentDescriptor,
     impulse_class: fightbox_api::ImpulseClass,
+    initially_active: bool,
+    priority_class: SourcePriorityClass,
+    reflection_send_enabled: bool,
 }
 
 impl MultiSourceDescriptor {
@@ -937,6 +945,9 @@ impl MultiSourceDescriptor {
             directivity: fightbox_api::Directivity::OMNIDIRECTIONAL,
             extent: fightbox_api::ExtentDescriptor::Point,
             impulse_class: fightbox_api::ImpulseClass::None,
+            initially_active: true,
+            priority_class: SourcePriorityClass::Steady,
+            reflection_send_enabled: true,
         }
     }
 
@@ -984,6 +995,36 @@ impl MultiSourceDescriptor {
     #[must_use]
     pub const fn with_impulse_class(mut self, impulse_class: fightbox_api::ImpulseClass) -> Self {
         self.impulse_class = impulse_class;
+        self
+    }
+
+    /// Selects whether the pre-declared source participates in the first frame.
+    ///
+    /// Reusable event slots use `false`: their SDK objects and render effects
+    /// are constructed with the world, but no audible snapshot can expose the
+    /// slot until a direct simulation pass publishes its trigger-time pose and
+    /// occlusion together.
+    #[must_use]
+    pub const fn with_initially_active(mut self, initially_active: bool) -> Self {
+        self.initially_active = initially_active;
+        self
+    }
+
+    /// Attaches the governor's persistent scheduling class to this stable slot.
+    #[must_use]
+    pub const fn with_source_priority(mut self, priority_class: SourcePriorityClass) -> Self {
+        self.priority_class = priority_class;
+        self
+    }
+
+    /// Enables or suppresses this source's own reflection-effect send.
+    ///
+    /// The ballistic crack uses `false` in v1. Direct HRTF, direct occlusion,
+    /// and baked pathing remain available; only the source's reflection mixer
+    /// contribution is pinned off.
+    #[must_use]
+    pub const fn with_reflection_send(mut self, enabled: bool) -> Self {
+        self.reflection_send_enabled = enabled;
         self
     }
 

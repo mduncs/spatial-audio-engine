@@ -1,5 +1,6 @@
 mod acoustic_state;
 mod asset;
+mod ballistic_event;
 mod capture;
 mod fixture;
 mod pose;

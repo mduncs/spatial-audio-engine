@@ -17,8 +17,91 @@ pub struct Fixture {
     #[serde(default)]
     pub fixture_id: Option<String>,
     pub sources: Vec<FixtureSource>,
+    #[serde(default)]
+    pub events: Vec<FixtureEvent>,
     pub listener: FixtureListener,
     pub simulation: FixtureSimulation,
+}
+
+/// Triggerable events whose source slots are still constructed at startup.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FixtureEvent {
+    BallisticShot {
+        id: String,
+        trigger_key: FixtureTriggerKey,
+        event_sources: BallisticEventSources,
+        muzzle_m: [f64; 3],
+        direction_enu: [f64; 3],
+        mach: f64,
+        asset_id: String,
+        levels: BallisticEventLevels,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FixtureTriggerKey {
+    Space,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BallisticEventSources {
+    pub crack: BallisticEventSourceDeclaration,
+    pub blast: BallisticEventSourceDeclaration,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BallisticEventSourceDeclaration {
+    pub id: String,
+    pub default_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BallisticEventLevels {
+    pub blast_spl_at_one_meter_db: f64,
+    pub crack_over_blast_db_at_30_m: f64,
+}
+
+impl FixtureEvent {
+    pub fn ballistic_shot(&self) -> BallisticShotFixture<'_> {
+        match self {
+            Self::BallisticShot {
+                id,
+                trigger_key,
+                event_sources,
+                muzzle_m,
+                direction_enu,
+                mach,
+                asset_id,
+                levels,
+            } => BallisticShotFixture {
+                id,
+                trigger_key: *trigger_key,
+                event_sources,
+                muzzle_m: *muzzle_m,
+                direction_enu: *direction_enu,
+                mach: *mach,
+                asset_id,
+                levels: *levels,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BallisticShotFixture<'a> {
+    pub id: &'a str,
+    pub trigger_key: FixtureTriggerKey,
+    pub event_sources: &'a BallisticEventSources,
+    pub muzzle_m: [f64; 3],
+    pub direction_enu: [f64; 3],
+    pub mach: f64,
+    pub asset_id: &'a str,
+    pub levels: BallisticEventLevels,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -239,10 +322,14 @@ impl Fixture {
     fn parse(bytes: &[u8], source: &str) -> Result<Self, String> {
         let fixture: Self = serde_json::from_slice(bytes)
             .map_err(|error| format!("invalid fixture {source}: {error}"))?;
+        let declared_source_count = fixture.sources.len() + fixture.events.len() * 2;
         if fixture.sources.is_empty()
-            || fixture.sources.len() > fightbox_runtime::MAX_ACTIVE_SOURCES
+            || declared_source_count > fightbox_runtime::MAX_ACTIVE_SOURCES
         {
-            return Err("fixture must contain 1..=MAX_ACTIVE_SOURCES sources".into());
+            return Err(
+                "fixture must contain 1..=MAX_ACTIVE_SOURCES total ordinary and event sources"
+                    .into(),
+            );
         }
         fixture.initial_listener_position()?;
         for source in &fixture.sources {
@@ -254,11 +341,71 @@ impl Fixture {
                 trajectory.validate(&format!("source {}", source.id))?;
             }
         }
+        fixture.validate_events()?;
         if let Some(trajectory) = &fixture.listener.trajectory {
             trajectory.validate("listener")?;
         }
         fixture.validate_simulation()?;
         Ok(fixture)
+    }
+
+    fn validate_events(&self) -> Result<(), String> {
+        if self.events.len() > 1 {
+            return Err("workbench supports at most one ballistic_shot event".into());
+        }
+        let mut ids = self
+            .sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        for event in &self.events {
+            let shot = event.ballistic_shot();
+            if shot.id.trim().is_empty() || shot.asset_id.trim().is_empty() {
+                return Err("ballistic_shot id and asset_id must be non-empty".into());
+            }
+            if !shot.mach.is_finite() || shot.mach <= 1.0 {
+                return Err("ballistic_shot mach must be finite and > 1".into());
+            }
+            if shot
+                .muzzle_m
+                .into_iter()
+                .chain(shot.direction_enu)
+                .any(|component| !component.is_finite() || !(component as f32).is_finite())
+            {
+                return Err("ballistic_shot muzzle_m and direction_enu must be finite".into());
+            }
+            let direction_energy = shot
+                .direction_enu
+                .into_iter()
+                .map(|component| component * component)
+                .sum::<f64>();
+            if direction_energy <= 1.0e-12 {
+                return Err("ballistic_shot direction_enu must be non-zero".into());
+            }
+            if !shot.levels.blast_spl_at_one_meter_db.is_finite()
+                || !shot.levels.crack_over_blast_db_at_30_m.is_finite()
+            {
+                return Err("ballistic_shot levels must be finite".into());
+            }
+            for source in [&shot.event_sources.crack, &shot.event_sources.blast] {
+                if source.id.trim().is_empty() {
+                    return Err("ballistic_shot event source ids must be non-empty".into());
+                }
+                if source.default_active {
+                    return Err("ballistic_shot event sources must be default_active=false".into());
+                }
+                if ids.contains(&source.id.as_str()) {
+                    return Err(format!("duplicate fixture source id {}", source.id));
+                }
+                ids.push(&source.id);
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn declared_source_count(&self) -> usize {
+        self.sources.len() + self.events.len() * 2
     }
 
     pub fn initial_listener_position(&self) -> Result<EnuVector3, String> {
@@ -774,6 +921,21 @@ mod tests {
             EnuVector3::new(292.5, 292.5, 1.5)
         );
         assert_eq!(fixture.sources.len(), 4);
+        assert_eq!(fixture.declared_source_count(), 6);
+        assert_eq!(fixture.events.len(), 1);
+        let shot = fixture.events[0].ballistic_shot();
+        assert_eq!(shot.id, "megablock-supersonic-shot");
+        assert_eq!(shot.trigger_key, FixtureTriggerKey::Space);
+        assert_eq!(shot.muzzle_m, [137.5, 262.5, 1.5]);
+        assert_eq!(shot.direction_enu, [1.0, 0.0, 0.0]);
+        assert_eq!(shot.mach, 2.5);
+        assert_eq!(shot.asset_id, "artillery-impact");
+        assert_eq!(shot.levels.blast_spl_at_one_meter_db, 155.0);
+        assert_eq!(shot.levels.crack_over_blast_db_at_30_m, 3.0);
+        assert_eq!(shot.event_sources.crack.id, "megablock-shot-crack");
+        assert!(!shot.event_sources.crack.default_active);
+        assert_eq!(shot.event_sources.blast.id, "megablock-shot-blast");
+        assert!(!shot.event_sources.blast.default_active);
         assert!(fixture.sources[0].default_enabled);
         assert_eq!(fixture.sources[0].reference_level.db_spl, 105.0);
         assert_eq!(

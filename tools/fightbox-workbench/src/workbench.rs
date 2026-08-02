@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
 use fightbox_api::{
-    EngineConfig, EnuVector3, ListenerState, OutputSafetyConfig, Pose, SceneCalibration, SourceId,
-    SourceProfile,
+    AssetAnalysis, AssetMeasurementProvenance, EngineConfig, EnuVector3, ListenerState,
+    OutputSafetyConfig, Pose, ReferenceLevel, SceneCalibration, SourceId, SourceProfile,
 };
 use fightbox_runtime::backend::{SimulationUpdate, SourceMotion};
 use fightbox_runtime::{
@@ -14,8 +14,10 @@ use fightbox_runtime::{
     SourcePropagation,
 };
 use fightbox_steam_audio::{
-    AudioConfig, DirectOcclusionMode, MultiSourceDescriptor, S3SimulationConfig,
-    StageOutputGainControl, StageOutputGains, build_multi_source_session,
+    AudioConfig, BallisticEventLevels as EngineBallisticEventLevels, BallisticShot,
+    DirectOcclusionMode, EVENT_PROGRAM_SECONDS, MultiSourceDescriptor, S3SimulationConfig,
+    SourcePriorityClass, StageOutputGainControl, StageOutputGains, build_multi_source_session,
+    plan_ballistic_shot, synthesize_crack_stem,
 };
 use fightbox_world::{AcousticMesh, read_package};
 
@@ -26,6 +28,9 @@ use crate::acoustic_state::{
     stage_chips,
 };
 use crate::asset::load_asset;
+use crate::ballistic_event::{
+    EventStemReader, EventStemWriter, event_stem_channel, generate_blast_stem,
+};
 use crate::capture::{
     BakeProvenance, BrowserScan, CaptureBrowserEntry, CaptureController, CaptureDraft,
     CaptureEndStats, CaptureEngineConfig, CaptureQualitySettings, CaptureSourceState, CaptureTap,
@@ -33,7 +38,8 @@ use crate::capture::{
     reveal_in_finder, scan_capture_bundles, sha256_file, utc_timestamp_now,
 };
 use crate::fixture::{
-    Fixture, Trajectory, VisibilityRangeAdoption, load_baked, occlusion_mode_for_extent, scene_mesh,
+    BallisticShotFixture, Fixture, FixtureTriggerKey, Trajectory, VisibilityRangeAdoption,
+    load_baked, occlusion_mode_for_extent, scene_mesh,
 };
 use crate::pose::{ListenerControl, PoseMailbox};
 
@@ -80,6 +86,7 @@ pub struct Workbench {
     reflection_warmup_started: Instant,
     reflection_warmup_reported: bool,
     first_frame_reported: bool,
+    ballistic_event: Option<BallisticEventView>,
 }
 
 struct SourceView {
@@ -95,6 +102,58 @@ struct SourceView {
     trajectory: Option<SourceTrajectory>,
     acoustic: SourceAcousticState,
     occlusion_mode: DirectOcclusionMode,
+    event_role: Option<BallisticSourceRole>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BallisticSourceRole {
+    Crack,
+    Blast,
+}
+
+struct BallisticEventView {
+    id: String,
+    trigger_key: FixtureTriggerKey,
+    shot: BallisticShot,
+    crack_source_index: usize,
+    blast_source_index: usize,
+    blast_asset: Vec<f32>,
+    stem_writer: EventStemWriter,
+    calibration_writer: SnapshotWriter<EventCalibrationSnapshot>,
+    crack_profile: SourceProfile,
+    blast_profile: SourceProfile,
+    generation: u64,
+    release_after_blocks: u64,
+    deactivate_after_block: Option<u64>,
+    awaiting_inactive_publication: bool,
+    status: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EventCalibrationSnapshot {
+    generation: u64,
+    crack_source_index: usize,
+    blast_source_index: usize,
+    crack_spl_at_one_meter_db: f32,
+    blast_spl_at_one_meter_db: f32,
+    crack_program_rms_dbfs: f32,
+}
+
+impl EventCalibrationSnapshot {
+    const NONE: Self = Self {
+        generation: 0,
+        crack_source_index: 0,
+        blast_source_index: 0,
+        crack_spl_at_one_meter_db: 0.0,
+        blast_spl_at_one_meter_db: 0.0,
+        crack_program_rms_dbfs: -120.0,
+    };
+}
+
+struct EventRuntimeCalibration {
+    reader: SnapshotReader<EventCalibrationSnapshot>,
+    profiles: Vec<SourceProfile>,
+    applied_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +311,50 @@ fn configure_output_safety(
     Ok((controller, reader))
 }
 
+fn shot_from_fixture(declaration: BallisticShotFixture<'_>) -> BallisticShot {
+    BallisticShot {
+        muzzle_position_enu: to_enu(declaration.muzzle_m),
+        direction_enu: to_enu(declaration.direction_enu),
+        mach: declaration.mach,
+        levels: EngineBallisticEventLevels {
+            blast_spl_at_one_meter_db: declaration.levels.blast_spl_at_one_meter_db,
+            crack_over_blast_db_at_reference: declaration.levels.crack_over_blast_db_at_30_m,
+        },
+    }
+}
+
+fn ballistic_crack_analysis(program_rms_dbfs: f32) -> Result<AssetAnalysis, String> {
+    let provenance = AssetMeasurementProvenance::new(
+        "fightbox-workbench/ballistic-n-wave-audible-segment-rms+analytic-peak/v1",
+    )
+    .map_err(|error| format!("invalid ballistic crack provenance: {error:?}"))?;
+    AssetAnalysis::new(program_rms_dbfs, 0.0, provenance)
+        .map_err(|error| format!("invalid ballistic crack analysis: {error:?}"))
+}
+
+fn ballistic_source_profile(
+    id: &str,
+    position: EnuVector3,
+    spl_at_one_meter_db: f32,
+    asset_analysis: AssetAnalysis,
+) -> SourceProfile {
+    SourceProfile {
+        id: SourceId::new(id),
+        pose: Pose {
+            position,
+            forward: EnuVector3::new(0.0, 1.0, 0.0),
+            up: EnuVector3::new(0.0, 0.0, 1.0),
+        },
+        reference_level: ReferenceLevel::SplAtOneMeter {
+            db_spl: spl_at_one_meter_db,
+        },
+        asset_analysis,
+        extent: fightbox_api::ExtentDescriptor::Point,
+        directivity: fightbox_api::Directivity::OMNIDIRECTIONAL,
+        max_speed_mps: 0.0,
+    }
+}
+
 impl Workbench {
     pub fn load(args: LaunchArgs, startup_started: Instant) -> Result<Self, String> {
         let phase_started = Instant::now();
@@ -335,13 +438,14 @@ impl Workbench {
                 sample_rate_hz: SAMPLE_RATE,
                 block_size_frames: BLOCK_SIZE,
                 speed_of_sound_mps: EngineConfig::default().speed_of_sound_mps,
-                max_active_sources: fixture.sources.len() as u8,
+                max_active_sources: fixture.declared_source_count() as u8,
             },
         };
 
-        let mut prepared_sources = Vec::with_capacity(fixture.sources.len());
+        let mut prepared_sources = Vec::with_capacity(fixture.declared_source_count());
+        let mut descriptors = Vec::with_capacity(fixture.declared_source_count());
         let mut source_motion = [SourceMotion::default(); fightbox_runtime::MAX_ACTIVE_SOURCES];
-        let mut source_views = Vec::with_capacity(fixture.sources.len());
+        let mut source_views = Vec::with_capacity(fixture.declared_source_count());
         for (index, source) in fixture.sources.iter().enumerate() {
             let position = source.initial_position()?;
             let trajectory = source
@@ -355,24 +459,28 @@ impl Workbench {
                 forward: EnuVector3::new(0.0, 1.0, 0.0),
                 up: EnuVector3::new(0.0, 0.0, 1.0),
             };
-            prepared_sources.push((
-                SourceProfile {
-                    id: SourceId::new(&source.id),
-                    pose,
-                    reference_level: source.reference_level.to_api(),
-                    asset_analysis: asset.analysis,
-                    extent: source.extent,
-                    directivity: source.directivity.to_api(),
-                    max_speed_mps: source
-                        .trajectory
-                        .as_ref()
-                        .map(|trajectory| {
-                            trajectory.max_speed_mps.unwrap_or(trajectory.speed_mps) as f32
-                        })
-                        .unwrap_or(0.0),
-                },
-                asset.samples,
-            ));
+            let profile = SourceProfile {
+                id: SourceId::new(&source.id),
+                pose,
+                reference_level: source.reference_level.to_api(),
+                asset_analysis: asset.analysis,
+                extent: source.extent,
+                directivity: source.directivity.to_api(),
+                max_speed_mps: source
+                    .trajectory
+                    .as_ref()
+                    .map(|trajectory| {
+                        trajectory.max_speed_mps.unwrap_or(trajectory.speed_mps) as f32
+                    })
+                    .unwrap_or(0.0),
+            };
+            descriptors.push(
+                MultiSourceDescriptor::at(profile.pose.position)
+                    .with_reference_level(profile.reference_level)
+                    .with_directivity(profile.directivity)
+                    .with_extent(profile.extent),
+            );
+            prepared_sources.push((profile, asset.samples));
             source_motion[index] = SourceMotion {
                 active: true,
                 pose,
@@ -391,17 +499,139 @@ impl Workbench {
                 trajectory,
                 acoustic: SourceAcousticState::UNKNOWN,
                 occlusion_mode: occlusion_mode_for_extent(simulation_config, source.extent),
+                event_role: None,
             });
         }
-        let descriptors = prepared_sources
-            .iter()
-            .map(|(profile, _)| {
-                MultiSourceDescriptor::at(profile.pose.position)
-                    .with_reference_level(profile.reference_level)
-                    .with_directivity(profile.directivity)
-                    .with_extent(profile.extent)
-            })
-            .collect::<Vec<_>>();
+        let event_program_frames =
+            (EVENT_PROGRAM_SECONDS * f64::from(SAMPLE_RATE)).round() as usize;
+        let mut ballistic_event = None;
+        let mut event_stem_reader = None;
+        let mut event_calibration_reader = None;
+        if let Some(event) = fixture.events.first() {
+            let declaration = event.ballistic_shot();
+            let shot = shot_from_fixture(declaration);
+            let initial_plan = plan_ballistic_shot(shot, initial_listener.pose.position)
+                .map_err(|error| format!("invalid ballistic_shot geometry: {error:?}"))?;
+            let (_, crack_program_rms_dbfs) =
+                synthesize_crack_stem(&initial_plan, SAMPLE_RATE, event_program_frames)
+                    .map_err(|error| format!("cannot synthesize ballistic crack: {error:?}"))?;
+            let crack_analysis = ballistic_crack_analysis(crack_program_rms_dbfs)?;
+            let blast_asset = load_asset(declaration.asset_id)?;
+            // Validate that the pinned artillery onset and signed crop fit now,
+            // while all filesystem and allocation work remains off callback.
+            let (_, blast_event_analysis) =
+                generate_blast_stem(&blast_asset.samples, SAMPLE_RATE, event_program_frames, 0)?;
+
+            let crack_source_index = prepared_sources.len();
+            let blast_source_index = crack_source_index + 1;
+            let crack_position = initial_plan
+                .crack
+                .map_or(shot.muzzle_position_enu, |source| source.position_enu);
+            let crack_spl = initial_plan
+                .crack
+                .map_or(shot.levels.blast_spl_at_one_meter_db, |source| {
+                    source.spl_at_one_meter_db
+                }) as f32;
+            let crack_profile = ballistic_source_profile(
+                &declaration.event_sources.crack.id,
+                crack_position,
+                crack_spl,
+                crack_analysis,
+            );
+            let blast_profile = ballistic_source_profile(
+                &declaration.event_sources.blast.id,
+                shot.muzzle_position_enu,
+                shot.levels.blast_spl_at_one_meter_db as f32,
+                blast_event_analysis,
+            );
+            descriptors.push(
+                MultiSourceDescriptor::at(crack_profile.pose.position)
+                    .with_reference_level(crack_profile.reference_level)
+                    .with_impulse_class(fightbox_api::ImpulseClass::None)
+                    .with_initially_active(false)
+                    .with_source_priority(SourcePriorityClass::TransientEvent)
+                    .with_reflection_send(false),
+            );
+            descriptors.push(
+                MultiSourceDescriptor::at(blast_profile.pose.position)
+                    .with_reference_level(blast_profile.reference_level)
+                    .with_impulse_class(fightbox_api::ImpulseClass::ArtilleryThunder)
+                    .with_initially_active(false)
+                    .with_source_priority(SourcePriorityClass::TransientEvent),
+            );
+            prepared_sources.push((crack_profile.clone(), vec![0.0; event_program_frames]));
+            prepared_sources.push((blast_profile.clone(), vec![0.0; event_program_frames]));
+            source_motion[crack_source_index] = SourceMotion {
+                active: false,
+                pose: crack_profile.pose,
+                linear_velocity_mps: EnuVector3::default(),
+            };
+            source_motion[blast_source_index] = SourceMotion {
+                active: false,
+                pose: blast_profile.pose,
+                linear_velocity_mps: EnuVector3::default(),
+            };
+            for (role, profile, asset_id) in [
+                (
+                    BallisticSourceRole::Crack,
+                    &crack_profile,
+                    "ballistic_n_wave",
+                ),
+                (
+                    BallisticSourceRole::Blast,
+                    &blast_profile,
+                    declaration.asset_id,
+                ),
+            ] {
+                source_views.push(SourceView {
+                    id: profile.id.0.clone(),
+                    asset_id: asset_id.to_owned(),
+                    position: profile.pose.position,
+                    declared_spl_at_one_meter_db: match profile.reference_level {
+                        ReferenceLevel::SplAtOneMeter { db_spl } => db_spl,
+                        ReferenceLevel::CreativeDb { .. } => unreachable!(),
+                    },
+                    enabled: false,
+                    muted: false,
+                    soloed: false,
+                    street_height_m: profile.pose.position.up_m,
+                    height: SourceHeight::Street,
+                    trajectory: None,
+                    acoustic: SourceAcousticState::UNKNOWN,
+                    occlusion_mode: occlusion_mode_for_extent(
+                        simulation_config,
+                        fightbox_api::ExtentDescriptor::Point,
+                    ),
+                    event_role: Some(role),
+                });
+            }
+            let (stem_writer, stem_reader) = event_stem_channel(event_program_frames);
+            let (calibration_writer, calibration_reader) =
+                SnapshotPublication::new(EventCalibrationSnapshot::NONE);
+            event_stem_reader = Some((crack_source_index, blast_source_index, stem_reader));
+            event_calibration_reader = Some(calibration_reader);
+            ballistic_event = Some(BallisticEventView {
+                id: declaration.id.to_owned(),
+                trigger_key: declaration.trigger_key,
+                shot,
+                crack_source_index,
+                blast_source_index,
+                blast_asset: blast_asset.samples,
+                stem_writer,
+                calibration_writer,
+                crack_profile,
+                blast_profile,
+                generation: 0,
+                release_after_blocks: (((EVENT_PROGRAM_SECONDS
+                    + f64::from(simulation_config.reflection_duration_s))
+                    * f64::from(SAMPLE_RATE)
+                    / f64::from(BLOCK_SIZE))
+                .ceil()) as u64,
+                deactivate_after_block: None,
+                awaiting_inactive_publication: false,
+                status: None,
+            });
+        }
         let audio_config = AudioConfig {
             sample_rate_hz: SAMPLE_RATE as i32,
             frame_size: BLOCK_SIZE as i32,
@@ -505,6 +735,14 @@ impl Workbench {
             MeterAccumulator::new(SAMPLE_RATE, BLOCK_SIZE, METER_WINDOW_SECONDS),
             audio_block_writer,
             Some(capture_tap),
+            event_calibration_reader.map(|reader| EventRuntimeCalibration {
+                reader,
+                profiles: prepared_sources
+                    .iter()
+                    .map(|(profile, _)| profile.clone())
+                    .collect(),
+                applied_generation: 0,
+            }),
         );
         let playback = source_views
             .iter()
@@ -521,6 +759,7 @@ impl Workbench {
             signals,
             playback,
             source_mix_reader,
+            event_stem_reader,
             args.device.as_deref(),
         );
         eprintln!(
@@ -568,6 +807,7 @@ impl Workbench {
             reflection_warmup_started,
             reflection_warmup_reported: false,
             first_frame_reported: false,
+            ballistic_event,
         })
     }
 
@@ -620,6 +860,179 @@ impl Workbench {
             .expect("workbench source positions remain finite");
     }
 
+    fn retire_ballistic_event_if_complete(&mut self) {
+        let elapsed_blocks = self.audio_block_reader.read();
+        let Some(event) = &mut self.ballistic_event else {
+            return;
+        };
+        let Some(deadline) = event.deactivate_after_block else {
+            return;
+        };
+        if elapsed_blocks < deadline || event.stem_writer.completed_generation() < event.generation
+        {
+            return;
+        }
+        self.source_motion[event.crack_source_index].active = false;
+        self.source_motion[event.blast_source_index].active = false;
+        self.sources[event.crack_source_index].enabled = false;
+        self.sources[event.blast_source_index].enabled = false;
+        event.deactivate_after_block = None;
+        event.awaiting_inactive_publication = true;
+        self.source_mix_writer
+            .publish(SourceMix::from_sources(&self.sources));
+    }
+
+    fn refresh_ballistic_event_rearm(&mut self) {
+        let telemetry = self.acoustic_telemetry.read();
+        let Some(event) = &mut self.ballistic_event else {
+            return;
+        };
+        if !event.awaiting_inactive_publication
+            || !telemetry.known
+            || telemetry.source_occlusion[event.crack_source_index].is_some()
+            || telemetry.source_occlusion[event.blast_source_index].is_some()
+        {
+            return;
+        }
+        // Both stable slots have now appeared inactive in a direct-pass
+        // publication. A subsequent trigger is therefore a real false->true
+        // activation in the backend and re-arms both transient windows.
+        event.awaiting_inactive_publication = false;
+        event.status = Some(format!("{} reusable slots re-armed", event.id));
+    }
+
+    fn trigger_ballistic_event(&mut self, listener_position: EnuVector3) -> Result<(), String> {
+        let Some(event) = &mut self.ballistic_event else {
+            return Ok(());
+        };
+        if event.awaiting_inactive_publication {
+            event.status = Some(format!(
+                "{} is waiting for its inactive direct-pass publication",
+                event.id
+            ));
+            return Ok(());
+        }
+        if event.deactivate_after_block.is_some() {
+            event.status = Some(format!(
+                "{} still owns its reusable slots; wait for the blast tail",
+                event.id
+            ));
+            return Ok(());
+        }
+
+        let plan = plan_ballistic_shot(event.shot, listener_position)
+            .map_err(|error| format!("ballistic trigger rejected: {error:?}"))?;
+        let earliest_arrival_s = plan.crack.map_or(plan.blast.arrival_time_s, |crack| {
+            crack.arrival_time_s.min(plan.blast.arrival_time_s)
+        });
+        let direct_tick_s = 1.0 / f64::from(SimulationCadences::default().direct_hz);
+        if earliest_arrival_s < direct_tick_s {
+            return Err(format!(
+                "ballistic trigger rejected: earliest onset {:.3} ms leaves less than one {:.3} ms direct-simulation tick",
+                earliest_arrival_s * 1_000.0,
+                direct_tick_s * 1_000.0,
+            ));
+        }
+        let program_frames = (EVENT_PROGRAM_SECONDS * f64::from(SAMPLE_RATE)).round() as usize;
+        let (crack_stem, crack_program_rms_dbfs) =
+            synthesize_crack_stem(&plan, SAMPLE_RATE, program_frames)
+                .map_err(|error| format!("cannot synthesize ballistic crack: {error:?}"))?;
+        // The muzzle emission epoch is the trigger itself. Consequently the
+        // blast dry stem embeds zero silence and the engine's ordinary
+        // muzzle/listener delay supplies its full ballistic arrival.
+        let (blast_stem, _) =
+            generate_blast_stem(&event.blast_asset, SAMPLE_RATE, program_frames, 0)?;
+        event.generation = event.generation.wrapping_add(1).max(1);
+        let crack_active = plan.crack.is_some();
+        let crack_position = plan
+            .crack
+            .map_or(event.shot.muzzle_position_enu, |source| source.position_enu);
+        let crack_spl = plan
+            .crack
+            .map_or(event.shot.levels.blast_spl_at_one_meter_db, |source| {
+                source.spl_at_one_meter_db
+            }) as f32;
+        event.crack_profile.pose.position = crack_position;
+        event.crack_profile.reference_level = ReferenceLevel::SplAtOneMeter { db_spl: crack_spl };
+        event.crack_profile.asset_analysis.program_rms_dbfs = crack_program_rms_dbfs;
+        event.blast_profile.pose.position = plan.blast.position_enu;
+        event.blast_profile.reference_level = ReferenceLevel::SplAtOneMeter {
+            db_spl: plan.blast.spl_at_one_meter_db as f32,
+        };
+
+        // Publish the new calibrated drives before the PCM generation. The
+        // callback sees both at one block boundary and the leading silence
+        // leaves the direct simulation worker time to publish occlusion.
+        event.calibration_writer.publish(EventCalibrationSnapshot {
+            generation: event.generation,
+            crack_source_index: event.crack_source_index,
+            blast_source_index: event.blast_source_index,
+            crack_spl_at_one_meter_db: crack_spl,
+            blast_spl_at_one_meter_db: plan.blast.spl_at_one_meter_db as f32,
+            crack_program_rms_dbfs,
+        });
+        self.output_safety_controller
+            .set_source(event.crack_source_index, &event.crack_profile, None)
+            .map_err(|error| format!("cannot calibrate ballistic crack safety: {error:?}"))?;
+        self.output_safety_controller
+            .set_source(event.blast_source_index, &event.blast_profile, None)
+            .map_err(|error| format!("cannot calibrate ballistic blast safety: {error:?}"))?;
+
+        self.sources[event.crack_source_index].position = crack_position;
+        self.sources[event.crack_source_index].declared_spl_at_one_meter_db = crack_spl;
+        self.sources[event.crack_source_index].enabled = crack_active;
+        self.source_motion[event.crack_source_index].pose.position = crack_position;
+        self.source_motion[event.crack_source_index].active = crack_active;
+        self.sources[event.blast_source_index].position = plan.blast.position_enu;
+        self.sources[event.blast_source_index].declared_spl_at_one_meter_db =
+            plan.blast.spl_at_one_meter_db as f32;
+        self.sources[event.blast_source_index].enabled = true;
+        self.source_motion[event.blast_source_index].pose.position = plan.blast.position_enu;
+        self.source_motion[event.blast_source_index].active = true;
+        self.source_mix_writer
+            .publish(SourceMix::from_sources(&self.sources));
+
+        let crack_text = plan.crack.map_or_else(
+            || "rejected (blast only)".to_owned(),
+            |crack| {
+                format!(
+                    "{:.4} ms = {:.4} embedded + {:.4} engine; SPL1m {:.2}",
+                    crack.arrival_time_s * 1_000.0,
+                    crack.embedded_leading_silence_s * 1_000.0,
+                    crack.engine_propagation_delay_s * 1_000.0,
+                    crack.spl_at_one_meter_db,
+                )
+            },
+        );
+        event.status = Some(format!(
+            "{} #{} · t* {:.4} ms · lead {:.4} ms · crack {} · blast {:.4} ms · dir crack [{:+.3},{:+.3},{:+.3}] blast [{:+.3},{:+.3},{:+.3}]",
+            event.id,
+            event.generation,
+            plan.tangent.t_star_s * 1_000.0,
+            plan.tangent.lead_time_s * 1_000.0,
+            crack_text,
+            plan.blast.arrival_time_s * 1_000.0,
+            plan.crack_arrival_direction_enu.east_m,
+            plan.crack_arrival_direction_enu.north_m,
+            plan.crack_arrival_direction_enu.up_m,
+            plan.blast_arrival_direction_enu.east_m,
+            plan.blast_arrival_direction_enu.north_m,
+            plan.blast_arrival_direction_enu.up_m,
+        ));
+        event.deactivate_after_block = Some(
+            self.audio_block_reader
+                .read()
+                .saturating_add(event.release_after_blocks),
+        );
+
+        // This release publication is last. The audio reader adopts crack and
+        // blast together and resets their shared trigger cursor to zero.
+        event
+            .stem_writer
+            .publish(event.generation, crack_active, &crack_stem, &blast_stem);
+        Ok(())
+    }
+
     fn apply_source_height(&mut self, index: usize, selection: SourceHeight) {
         self.sources[index].height = selection;
         let mut position = self.sources[index].position;
@@ -630,15 +1043,18 @@ impl Workbench {
     }
 
     fn update_control(&mut self, ctx: &egui::Context, drag_delta_x: f32) {
+        self.retire_ballistic_event_if_complete();
+        self.refresh_ballistic_event_rearm();
         if drag_delta_x != 0.0 && !self.autopilot.enabled {
             self.listener.turn(drag_delta_x * YAW_RADIANS_PER_POINT);
         }
-        let (forward, right, sprinting, delta_seconds) = ctx.input(|input| {
+        let (forward, right, sprinting, delta_seconds, trigger_shot) = ctx.input(|input| {
             (
                 axis(input, egui::Key::W, egui::Key::S),
                 axis(input, egui::Key::D, egui::Key::A),
                 input.modifiers.shift,
                 input.stable_dt.min(0.1),
+                input.key_pressed(egui::Key::Space),
             )
         });
         if self.autopilot.enabled && (forward != 0.0 || right != 0.0) {
@@ -661,6 +1077,12 @@ impl Workbench {
             self.listener.walk(forward, right, sprinting, delta_seconds)
         };
         let listener = self.listener.listener_state(velocity);
+        if trigger_shot
+            && let Err(error) = self.trigger_ballistic_event(listener.pose.position)
+            && let Some(event) = &mut self.ballistic_event
+        {
+            event.status = Some(error);
+        }
         self.output_safety_controller
             .set_listener_position(listener.pose.position)
             .expect("workbench listener controls remain finite");
@@ -1006,6 +1428,14 @@ impl Workbench {
         ui.heading("Fightbox");
         ui.label("WASD walk · Shift sprint");
         ui.label("Drag in view to turn head");
+        if let Some(event) = &self.ballistic_event {
+            ui.label(match event.trigger_key {
+                FixtureTriggerKey::Space => "Space fires ballistic shot",
+            });
+            if let Some(status) = &event.status {
+                ui.small(status);
+            }
+        }
         ui.separator();
         ui.monospace(format!(
             "ENU  {:7.2}  {:7.2}  {:5.2} m",
@@ -1069,7 +1499,7 @@ impl Workbench {
         let mut source_height_changed = None;
         let source_height_levels = self.source_height_levels;
         for (index, source) in self.sources.iter_mut().enumerate() {
-            ui.add_enabled_ui(mix_controls_enabled, |ui| {
+            ui.add_enabled_ui(mix_controls_enabled && source.event_role.is_none(), |ui| {
                 ui.horizontal(|ui| {
                     if ui
                         .checkbox(&mut source.enabled, "")
@@ -1095,8 +1525,17 @@ impl Workbench {
                         source_mix_changed = true;
                     }
                     ui.monospace(&source.id);
-                    if source.asset_id == ARTILLERY_ASSET_ID {
+                    if let Some(role) = source.event_role {
+                        ui.small(match role {
+                            BallisticSourceRole::Crack => "event crack · direct/path only",
+                            BallisticSourceRole::Blast => "event blast",
+                        });
+                    }
+                    if source.asset_id == ARTILLERY_ASSET_ID && source.event_role.is_none() {
                         ui.small(format!("{ARTILLERY_RETRIGGER_SECONDS} s retrigger"));
+                    }
+                    if let Some((priority, remaining_blocks)) = source.acoustic.priority {
+                        ui.small(format!("{priority:?} · protect {remaining_blocks} blocks"));
                     }
                 });
                 ui.horizontal(|ui| {
@@ -1461,9 +1900,28 @@ trait ListenerStateSink {
     fn set_listener_state(&mut self, listener: ListenerState);
 }
 
+trait SourceProfileSink {
+    fn set_source_profile(
+        &mut self,
+        source_index: usize,
+        profile: &SourceProfile,
+    ) -> Result<(), RenderError>;
+}
+
 impl ListenerStateSink for RuntimeGraph {
     fn set_listener_state(&mut self, listener: ListenerState) {
         RuntimeGraph::set_listener_state(self, listener);
+    }
+}
+
+impl SourceProfileSink for RuntimeGraph {
+    fn set_source_profile(
+        &mut self,
+        source_index: usize,
+        profile: &SourceProfile,
+    ) -> Result<(), RenderError> {
+        self.set_source(source_index, profile, SceneCalibration::default())?;
+        Ok(())
     }
 }
 
@@ -1475,6 +1933,7 @@ struct LateBoundProcessor<P> {
     audio_block_writer: SnapshotWriter<u64>,
     capture_tap: Option<CaptureTap>,
     elapsed_blocks: u64,
+    event_calibration: Option<EventRuntimeCalibration>,
 }
 
 impl<P> LateBoundProcessor<P> {
@@ -1485,6 +1944,7 @@ impl<P> LateBoundProcessor<P> {
         meter: MeterAccumulator,
         audio_block_writer: SnapshotWriter<u64>,
         capture_tap: Option<CaptureTap>,
+        event_calibration: Option<EventRuntimeCalibration>,
     ) -> Self {
         Self {
             processor,
@@ -1494,16 +1954,38 @@ impl<P> LateBoundProcessor<P> {
             audio_block_writer,
             capture_tap,
             elapsed_blocks: 0,
+            event_calibration,
         }
     }
 }
 
-impl<P: BlockProcessor + ListenerStateSink> BlockProcessor for LateBoundProcessor<P> {
+impl<P: BlockProcessor + ListenerStateSink + SourceProfileSink> BlockProcessor
+    for LateBoundProcessor<P>
+{
     fn block_size_frames(&self) -> usize {
         self.processor.block_size_frames()
     }
 
     fn process_block(&mut self, block: ProcessBlock<'_>) -> Result<(), RenderError> {
+        if let Some(event) = &mut self.event_calibration {
+            let calibration = event.reader.read();
+            if calibration.generation != 0 && calibration.generation != event.applied_generation {
+                let crack = &mut event.profiles[calibration.crack_source_index];
+                crack.reference_level = ReferenceLevel::SplAtOneMeter {
+                    db_spl: calibration.crack_spl_at_one_meter_db,
+                };
+                crack.asset_analysis.program_rms_dbfs = calibration.crack_program_rms_dbfs;
+                self.processor
+                    .set_source_profile(calibration.crack_source_index, crack)?;
+                let blast = &mut event.profiles[calibration.blast_source_index];
+                blast.reference_level = ReferenceLevel::SplAtOneMeter {
+                    db_spl: calibration.blast_spl_at_one_meter_db,
+                };
+                self.processor
+                    .set_source_profile(calibration.blast_source_index, blast)?;
+                event.applied_generation = calibration.generation;
+            }
+        }
         let listener = self.pose_reader.read();
         self.processor.set_listener_state(listener);
         let ProcessBlock {
@@ -1718,6 +2200,14 @@ struct WorkbenchInput {
     signals: Vec<Vec<f32>>,
     playback: Vec<SourcePlayback>,
     source_mix_reader: SnapshotReader<SourceMix>,
+    event: Option<BallisticEventInput>,
+}
+
+#[cfg(feature = "live-output")]
+struct BallisticEventInput {
+    crack_source_index: usize,
+    blast_source_index: usize,
+    stems: EventStemReader,
 }
 
 #[cfg(feature = "live-output")]
@@ -1725,15 +2215,37 @@ impl fightbox_runtime::live::LiveInputProvider for WorkbenchInput {
     fn fill_block(&mut self, sources: &mut fightbox_runtime::live::LiveSourceBuffer) {
         let mix = self.source_mix_reader.read();
         let gains = mix.gains(self.signals.len());
+        if let Some(event) = &mut self.event {
+            event.stems.begin_block();
+        }
         for index in 0..self.signals.len() {
             let Some(output) = sources.add_source(index) else {
                 return;
             };
-            let signal = &self.signals[index];
-            for sample in output {
-                *sample =
-                    self.playback[index].next_sample(signal, mix.enabled[index]) * gains[index];
+            if let Some(event) = &mut self.event
+                && index == event.crack_source_index
+            {
+                event.stems.fill_crack(output);
+                for sample in output {
+                    *sample *= gains[index];
+                }
+            } else if let Some(event) = &mut self.event
+                && index == event.blast_source_index
+            {
+                event.stems.fill_blast(output);
+                for sample in output {
+                    *sample *= gains[index];
+                }
+            } else {
+                let signal = &self.signals[index];
+                for sample in output {
+                    *sample =
+                        self.playback[index].next_sample(signal, mix.enabled[index]) * gains[index];
+                }
             }
+        }
+        if let Some(event) = &mut self.event {
+            event.stems.end_block(BLOCK_SIZE as usize);
         }
     }
 }
@@ -1745,12 +2257,20 @@ fn start_audio<P: BlockProcessor + Send + 'static>(
     signals: Vec<Vec<f32>>,
     playback: Vec<SourcePlayback>,
     source_mix_reader: SnapshotReader<SourceMix>,
+    event: Option<(usize, usize, EventStemReader)>,
     device: Option<&str>,
 ) -> AudioState {
     let input = Box::new(WorkbenchInput {
         signals,
         playback,
         source_mix_reader,
+        event: event.map(
+            |(crack_source_index, blast_source_index, stems)| BallisticEventInput {
+                crack_source_index,
+                blast_source_index,
+                stems,
+            },
+        ),
     });
     let output = match device {
         Some(name) => {
@@ -1776,6 +2296,7 @@ fn start_audio<P: BlockProcessor + Send + 'static>(
     _signals: Vec<Vec<f32>>,
     _playback: Vec<SourcePlayback>,
     _source_mix_reader: SnapshotReader<SourceMix>,
+    _event: Option<(usize, usize, EventStemReader)>,
     _device: Option<&str>,
 ) -> AudioState {
     AudioState::Unavailable("binary was built without the live-output feature".into())
@@ -2349,6 +2870,16 @@ mod tests {
         }
     }
 
+    impl SourceProfileSink for RecordingProcessor {
+        fn set_source_profile(
+            &mut self,
+            _source_index: usize,
+            _profile: &SourceProfile,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+    }
+
     impl BlockProcessor for RecordingProcessor {
         fn block_size_frames(&self) -> usize {
             1
@@ -2398,6 +2929,7 @@ mod tests {
             meter_writer,
             MeterAccumulator::new(48_000, 1, 0.5),
             audio_block_writer,
+            None,
             None,
         );
         let mut left = [0.0];
