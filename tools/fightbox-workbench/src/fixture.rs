@@ -927,7 +927,7 @@ mod tests {
         let shot = fixture.events[0].ballistic_shot();
         assert_eq!(shot.id, "megablock-supersonic-shot");
         assert_eq!(shot.trigger_key, FixtureTriggerKey::Space);
-        assert_eq!(shot.muzzle_m, [137.5, 262.5, 1.5]);
+        assert_eq!(shot.muzzle_m, [30.0, 288.0, 1.5]);
         assert_eq!(shot.direction_enu, [1.0, 0.0, 0.0]);
         assert_eq!(shot.mach, 2.5);
         assert_eq!(shot.asset_id, "artillery-impact");
@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(fixture.sources[0].extent, ExtentDescriptor::Point);
         assert_eq!(fixture.sources[1].asset_id, "artillery-impact");
         assert_eq!(fixture.sources[1].reference_level.db_spl, 155.0);
-        assert!(!fixture.sources[1].default_enabled);
+        assert!(fixture.sources[1].default_enabled);
         assert_eq!(
             fixture.sources[1].directivity,
             FixtureDirectivity::default()
@@ -965,7 +965,7 @@ mod tests {
         );
         assert_eq!(fixture.sources[2].asset_id, "ff-siren");
         assert_eq!(fixture.sources[2].reference_level.db_spl, 118.0);
-        assert!(!fixture.sources[2].default_enabled);
+        assert!(fixture.sources[2].default_enabled);
         assert_eq!(
             fixture.sources[2].directivity,
             FixtureDirectivity {
@@ -984,7 +984,7 @@ mod tests {
         );
         assert_eq!(fixture.sources[3].asset_id, "church-bells");
         assert_eq!(fixture.sources[3].reference_level.db_spl, 115.0);
-        assert!(!fixture.sources[3].default_enabled);
+        assert!(fixture.sources[3].default_enabled);
         assert_eq!(
             fixture.sources[3].directivity,
             FixtureDirectivity::default()
@@ -1065,7 +1065,7 @@ mod tests {
 
         let shot = fixture.events[0].ballistic_shot();
         assert_eq!(shot.id, "checkpoint-m2-shot");
-        assert_eq!(shot.muzzle_m, [292.5, 102.5, 2.0]);
+        assert_eq!(shot.muzzle_m, [289.0, 102.5, 2.0]);
         assert_eq!(shot.direction_enu, [0.0, 1.0, 0.0]);
         assert_eq!(shot.mach, 2.6);
         assert_eq!(shot.asset_id, "squad-m2-blast");

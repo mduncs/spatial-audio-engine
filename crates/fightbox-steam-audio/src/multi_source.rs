@@ -2353,6 +2353,10 @@ mod megablock_corner_diagnostic;
 mod wave13_corner_gate;
 
 #[cfg(test)]
+#[path = "wave14_echo_truth.rs"]
+mod wave14_echo_truth;
+
+#[cfg(test)]
 #[allow(unsafe_code)]
 #[path = "reflection_budget_diagnostics.rs"]
 mod reflection_budget_diagnostics;
