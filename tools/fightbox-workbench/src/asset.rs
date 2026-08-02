@@ -58,6 +58,7 @@ pub struct WavBlock {
     pub r#loop: bool,
 }
 
+#[derive(Clone)]
 pub struct PreparedAsset {
     pub samples: Vec<f32>,
     pub analysis: AssetAnalysis,
@@ -347,6 +348,31 @@ mod tests {
                 asset.samples.iter().all(|sample| sample.is_finite()),
                 "{asset_id}"
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local gitignored Squad WAVs prepared by tools/prepare-squad-assets.py"]
+    fn prepared_squad_descriptors_round_trip_through_the_workbench_loader() {
+        for asset_id in [
+            "squad-abrams-idle",
+            "squad-ural-idle",
+            "squad-generator-diesel",
+            "squad-fire-car",
+            "squad-fire-building-large",
+            "squad-fob-radio-static",
+            "squad-camo-tent-flap",
+            "squad-mi8-rotor-close",
+            "squad-m2-blast",
+        ] {
+            let asset = load_asset(asset_id).unwrap_or_else(|error| panic!("{asset_id}: {error}"));
+            assert!(!asset.samples.is_empty(), "{asset_id}");
+            assert!(
+                asset.samples.iter().all(|sample| sample.is_finite()),
+                "{asset_id}"
+            );
+            assert!(asset.analysis.program_rms_dbfs.is_finite(), "{asset_id}");
+            assert!(asset.analysis.true_peak_dbtp.is_finite(), "{asset_id}");
         }
     }
 }

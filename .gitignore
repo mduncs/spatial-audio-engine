@@ -1,6 +1,7 @@
 /target/
 /.cache/
 fixtures/assets/music/*.wav
+fixtures/assets/squad/
 __pycache__/
 *.py[cod]
 .DS_Store

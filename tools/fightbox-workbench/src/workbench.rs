@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -14,12 +15,12 @@ use fightbox_runtime::{
     SourcePropagation,
 };
 use fightbox_steam_audio::{
-    AudioConfig, BallisticEventLevels as EngineBallisticEventLevels, BallisticShot,
-    DirectOcclusionMode, EVENT_PROGRAM_SECONDS, MultiSourceDescriptor, S3SimulationConfig,
-    SourcePriorityClass, StageOutputGainControl, StageOutputGains, build_multi_source_session,
-    plan_ballistic_shot, synthesize_crack_stem,
+    AudioConfig, BakedProbeBatch, BallisticEventLevels as EngineBallisticEventLevels,
+    BallisticShot, DirectOcclusionMode, EVENT_PROGRAM_SECONDS, MultiSourceDescriptor,
+    S3SimulationConfig, SceneMesh, SourcePriorityClass, StageOutputGainControl, StageOutputGains,
+    build_multi_source_session, plan_ballistic_shot, synthesize_crack_stem,
 };
-use fightbox_world::{AcousticMesh, read_package};
+use fightbox_world::{AcousticMesh, LoadedPackage, read_package};
 
 use crate::LaunchArgs;
 use crate::acoustic_state::{
@@ -27,7 +28,7 @@ use crate::acoustic_state::{
     SourceAcousticState, path_diagnostics_text, probe_text, probe_tone, quality_text, quality_tone,
     stage_chips,
 };
-use crate::asset::load_asset;
+use crate::asset::{PreparedAsset, load_asset};
 use crate::ballistic_event::{
     EventStemReader, EventStemWriter, event_stem_channel, generate_blast_stem,
 };
@@ -53,6 +54,276 @@ const FIRST_PERSON_NEAR_M: f32 = 0.1;
 const ARTILLERY_ASSET_ID: &str = "artillery-impact";
 const ARTILLERY_RETRIGGER_SECONDS: u32 = 3;
 const PICTURE_IN_PICTURE_MARGIN: f32 = 14.0;
+
+#[derive(Clone)]
+struct SceneSpec {
+    path: PathBuf,
+    id: String,
+    fixture: Fixture,
+}
+
+impl SceneSpec {
+    fn read(path: PathBuf) -> Result<Self, String> {
+        let fixture = Fixture::read(&path)?;
+        let id = fixture.fixture_id.clone().unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workbench-fixture")
+                .to_owned()
+        });
+        Ok(Self { path, id, fixture })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SceneBuildMode {
+    Steady {
+        listener_override: Option<ListenerControl>,
+    },
+    BallisticTransient {
+        listener: ListenerControl,
+        omitted_source_ids: Vec<String>,
+    },
+}
+
+impl SceneBuildMode {
+    fn listener_override(&self) -> Option<ListenerControl> {
+        match self {
+            Self::Steady { listener_override } => *listener_override,
+            Self::BallisticTransient { listener, .. } => Some(*listener),
+        }
+    }
+
+    fn includes_source(&self, source_id: &str) -> bool {
+        match self {
+            Self::Steady { .. } => true,
+            Self::BallisticTransient {
+                omitted_source_ids, ..
+            } => !omitted_source_ids.iter().any(|id| id == source_id),
+        }
+    }
+
+    fn is_ballistic_transient(&self) -> bool {
+        matches!(self, Self::BallisticTransient { .. })
+    }
+}
+
+fn planned_physical_source_ids(fixture: &Fixture, mode: &SceneBuildMode) -> Vec<String> {
+    let mut ids = fixture
+        .sources
+        .iter()
+        .filter(|source| mode.includes_source(&source.id))
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    let include_event_slots = !fixture.events.is_empty()
+        && (!fixture.event_requires_transient_rebuild() || mode.is_ballistic_transient());
+    if include_event_slots && let Some(event) = fixture.events.first() {
+        let shot = event.ballistic_shot();
+        ids.push(shot.event_sources.crack.id.clone());
+        ids.push(shot.event_sources.blast.id.clone());
+    }
+    ids
+}
+
+#[derive(Clone, Debug)]
+enum SceneAction {
+    TriggerBallistic {
+        listener: ListenerControl,
+        omitted_source_ids: Vec<String>,
+    },
+    RestoreSteady {
+        listener: ListenerControl,
+    },
+}
+
+#[derive(Default)]
+struct SceneSlotState {
+    active_ids: Vec<String>,
+}
+
+impl SceneSlotState {
+    fn replace(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.active_ids.clear();
+        self.active_ids.extend(ids);
+        assert!(self.active_ids.len() <= fightbox_runtime::MAX_ACTIVE_SOURCES);
+    }
+
+    fn teardown(&mut self) {
+        self.active_ids.clear();
+    }
+}
+
+pub struct WorkbenchApp {
+    args: LaunchArgs,
+    package: LoadedPackage,
+    baked: BakedProbeBatch,
+    scene_mesh: SceneMesh,
+    assets: BTreeMap<String, PreparedAsset>,
+    scenes: Vec<SceneSpec>,
+    active_scene_index: usize,
+    active: Option<Workbench>,
+    slots: SceneSlotState,
+    scene_status: Option<String>,
+    startup_started: Instant,
+}
+
+impl WorkbenchApp {
+    pub fn load(args: LaunchArgs, startup_started: Instant) -> Result<Self, String> {
+        let phase_started = Instant::now();
+        let package = read_package(&args.package)
+            .map_err(|error| format!("cannot load package {}: {error}", args.package.display()))?;
+        eprintln!(
+            "[startup] package load: {} ms",
+            phase_started.elapsed().as_millis()
+        );
+        let scenes = args
+            .fixtures
+            .iter()
+            .cloned()
+            .map(SceneSpec::read)
+            .collect::<Result<Vec<_>, _>>()?;
+        let phase_started = Instant::now();
+        let asset_ids = scenes
+            .iter()
+            .flat_map(|scene| {
+                scene
+                    .fixture
+                    .sources
+                    .iter()
+                    .map(|source| source.asset_id.clone())
+                    .chain(
+                        scene
+                            .fixture
+                            .events
+                            .iter()
+                            .map(|event| event.ballistic_shot().asset_id.to_owned()),
+                    )
+            })
+            .collect::<BTreeSet<_>>();
+        let assets = asset_ids
+            .into_iter()
+            .map(|asset_id| load_asset(&asset_id).map(|asset| (asset_id, asset)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        eprintln!(
+            "[startup] prepared asset cache: {} assets in {} ms",
+            assets.len(),
+            phase_started.elapsed().as_millis()
+        );
+        let phase_started = Instant::now();
+        let baked = load_baked(&args.baked, &package)?;
+        eprintln!(
+            "[startup] baked probes load: {} ms",
+            phase_started.elapsed().as_millis()
+        );
+        let phase_started = Instant::now();
+        let scene_mesh = scene_mesh(&package)?;
+        eprintln!(
+            "[startup] scene mesh preparation: {} ms",
+            phase_started.elapsed().as_millis()
+        );
+        let active = Workbench::load_scene(
+            &args,
+            &scenes[0],
+            &package,
+            &baked,
+            &scene_mesh,
+            &assets,
+            &SceneBuildMode::Steady {
+                listener_override: None,
+            },
+            startup_started,
+        )?;
+        let mut slots = SceneSlotState::default();
+        slots.replace(active.physical_source_ids());
+        Ok(Self {
+            args,
+            package,
+            baked,
+            scene_mesh,
+            assets,
+            scenes,
+            active_scene_index: 0,
+            active: Some(active),
+            slots,
+            scene_status: None,
+            startup_started,
+        })
+    }
+
+    fn rebuild(&mut self, scene_index: usize, mode: SceneBuildMode, reason: &str) {
+        let previous_index = self.active_scene_index;
+        let previous_listener = self.active.as_ref().map(|active| active.listener);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.can_rebuild())
+        {
+            self.scene_status = Some("Finish the active capture before changing scenes".into());
+            return;
+        }
+        let stop_warning = self
+            .active
+            .as_ref()
+            .and_then(|active| active.stop_audio().err());
+        drop(self.active.take());
+        self.slots.teardown();
+        let build = Workbench::load_scene(
+            &self.args,
+            &self.scenes[scene_index],
+            &self.package,
+            &self.baked,
+            &self.scene_mesh,
+            &self.assets,
+            &mode,
+            self.startup_started,
+        );
+        match build {
+            Ok(active) => {
+                self.active_scene_index = scene_index;
+                self.slots.replace(active.physical_source_ids());
+                self.active = Some(active);
+                let warning = stop_warning
+                    .map(|warning| format!("; previous output pause warned: {warning}"))
+                    .unwrap_or_default();
+                self.scene_status = Some(format!(
+                    "{reason}: active scene {}{warning}",
+                    self.scenes[scene_index].id
+                ));
+            }
+            Err(error) => {
+                let restore_mode = SceneBuildMode::Steady {
+                    listener_override: previous_listener,
+                };
+                match Workbench::load_scene(
+                    &self.args,
+                    &self.scenes[previous_index],
+                    &self.package,
+                    &self.baked,
+                    &self.scene_mesh,
+                    &self.assets,
+                    &restore_mode,
+                    self.startup_started,
+                ) {
+                    Ok(active) => {
+                        self.active_scene_index = previous_index;
+                        self.slots.replace(active.physical_source_ids());
+                        self.active = Some(active);
+                        self.scene_status = Some(format!(
+                            "Could not rebuild {}: {error}; restored {}",
+                            self.scenes[scene_index].id, self.scenes[previous_index].id
+                        ));
+                    }
+                    Err(restore_error) => {
+                        self.scene_status = Some(format!(
+                            "Could not rebuild {}: {error}; restore also failed: {restore_error}",
+                            self.scenes[scene_index].id
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub struct Workbench {
     mesh: AcousticMesh,
@@ -87,6 +358,9 @@ pub struct Workbench {
     reflection_warmup_reported: bool,
     first_frame_reported: bool,
     ballistic_event: Option<BallisticEventView>,
+    fixture_requires_transient_rebuild: bool,
+    transient_event_scene: bool,
+    scene_action: Option<SceneAction>,
 }
 
 struct SourceView {
@@ -356,39 +630,25 @@ fn ballistic_source_profile(
 }
 
 impl Workbench {
-    pub fn load(args: LaunchArgs, startup_started: Instant) -> Result<Self, String> {
-        let phase_started = Instant::now();
-        let package = read_package(&args.package)
-            .map_err(|error| format!("cannot load package {}: {error}", args.package.display()))?;
-        eprintln!(
-            "[startup] package load: {} ms",
-            phase_started.elapsed().as_millis()
-        );
-
-        let phase_started = Instant::now();
-        let fixture = Fixture::read(&args.fixture)?;
-        eprintln!(
-            "[startup] fixture load: {} ms",
-            phase_started.elapsed().as_millis()
-        );
-
-        let phase_started = Instant::now();
-        let baked = load_baked(&args.baked, &package)?;
-        eprintln!(
-            "[startup] baked probes load: {} ms",
-            phase_started.elapsed().as_millis()
-        );
-
-        let phase_started = Instant::now();
-        let scene = scene_mesh(&package)?;
-        eprintln!(
-            "[startup] scene mesh preparation: {} ms",
-            phase_started.elapsed().as_millis()
-        );
-        let listener = ListenerControl::at(
-            fixture.initial_listener_position()?,
-            to_enu(fixture.listener.forward_enu),
-        );
+    fn load_scene(
+        args: &LaunchArgs,
+        scene_spec: &SceneSpec,
+        package: &LoadedPackage,
+        baked: &BakedProbeBatch,
+        scene_mesh: &SceneMesh,
+        assets: &BTreeMap<String, PreparedAsset>,
+        mode: &SceneBuildMode,
+        startup_started: Instant,
+    ) -> Result<Self, String> {
+        let fixture = &scene_spec.fixture;
+        let listener = mode.listener_override().unwrap_or_else(|| {
+            ListenerControl::at(
+                fixture
+                    .initial_listener_position()
+                    .expect("scene specifications are validated when loaded"),
+                to_enu(fixture.listener.forward_enu),
+            )
+        });
         let initial_listener = listener.listener_state(EnuVector3::default());
         let (pose_mailbox, pose_reader) = PoseMailbox::new(initial_listener);
         let visibility_range = fixture.visibility_range_adoption();
@@ -402,22 +662,16 @@ impl Workbench {
             );
         }
         let simulation_config = fixture.simulation_config();
-        let fixture_id = fixture.fixture_id.clone().unwrap_or_else(|| {
-            args.fixture
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("workbench-fixture")
-                .to_owned()
-        });
-        let fixture_content_sha256 = sha256_file(&args.fixture)
-            .ok_or_else(|| format!("cannot hash fixture {}", args.fixture.display()))?;
+        let fixture_id = scene_spec.id.clone();
+        let fixture_content_sha256 = sha256_file(&scene_spec.path)
+            .ok_or_else(|| format!("cannot hash fixture {}", scene_spec.path.display()))?;
         let package_manifest_sha256 = sha256_file(&args.package.join("manifest.json"));
         let bake_manifest_path = args.baked.join("city-bake-manifest.json");
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let (engine_commit, engine_dirty) = git_identity(&repository);
         let capture_static = CaptureStaticContext {
             fixture_id,
-            fixture_path: args.fixture.display().to_string(),
+            fixture_path: scene_spec.path.display().to_string(),
             fixture_content_sha256,
             engine_commit,
             engine_dirty,
@@ -442,18 +696,36 @@ impl Workbench {
             },
         };
 
-        let mut prepared_sources = Vec::with_capacity(fixture.declared_source_count());
-        let mut descriptors = Vec::with_capacity(fixture.declared_source_count());
+        let include_event_slots = !fixture.events.is_empty()
+            && (!fixture.event_requires_transient_rebuild() || mode.is_ballistic_transient());
+        let planned_source_ids = planned_physical_source_ids(fixture, mode);
+        let runtime_source_count = planned_source_ids.len();
+        if runtime_source_count > fightbox_runtime::MAX_ACTIVE_SOURCES {
+            return Err(format!(
+                "scene {} requires {runtime_source_count} physical source slots",
+                scene_spec.id
+            ));
+        }
+        let mut prepared_sources = Vec::with_capacity(runtime_source_count);
+        let mut descriptors = Vec::with_capacity(runtime_source_count);
         let mut source_motion = [SourceMotion::default(); fightbox_runtime::MAX_ACTIVE_SOURCES];
-        let mut source_views = Vec::with_capacity(fixture.declared_source_count());
-        for (index, source) in fixture.sources.iter().enumerate() {
+        let mut source_views = Vec::with_capacity(runtime_source_count);
+        for source in fixture
+            .sources
+            .iter()
+            .filter(|source| mode.includes_source(&source.id))
+        {
+            let index = prepared_sources.len();
             let position = source.initial_position()?;
             let trajectory = source
                 .trajectory
                 .as_ref()
                 .map(SourceTrajectory::from_fixture)
                 .transpose()?;
-            let asset = load_asset(&source.asset_id)?;
+            let asset = assets
+                .get(&source.asset_id)
+                .ok_or_else(|| format!("asset cache is missing {}", source.asset_id))?
+                .clone();
             let pose = Pose {
                 position,
                 forward: EnuVector3::new(0.0, 1.0, 0.0),
@@ -507,7 +779,7 @@ impl Workbench {
         let mut ballistic_event = None;
         let mut event_stem_reader = None;
         let mut event_calibration_reader = None;
-        if let Some(event) = fixture.events.first() {
+        if include_event_slots && let Some(event) = fixture.events.first() {
             let declaration = event.ballistic_shot();
             let shot = shot_from_fixture(declaration);
             let initial_plan = plan_ballistic_shot(shot, initial_listener.pose.position)
@@ -516,7 +788,10 @@ impl Workbench {
                 synthesize_crack_stem(&initial_plan, SAMPLE_RATE, event_program_frames)
                     .map_err(|error| format!("cannot synthesize ballistic crack: {error:?}"))?;
             let crack_analysis = ballistic_crack_analysis(crack_program_rms_dbfs)?;
-            let blast_asset = load_asset(declaration.asset_id)?;
+            let blast_asset = assets
+                .get(declaration.asset_id)
+                .ok_or_else(|| format!("asset cache is missing {}", declaration.asset_id))?
+                .clone();
             // Validate that the pinned artillery onset and signed crop fit now,
             // while all filesystem and allocation work remains off callback.
             let (_, blast_event_analysis) =
@@ -638,8 +913,8 @@ impl Workbench {
         };
         let phase_started = Instant::now();
         let (runner, mut backend) = build_multi_source_session(
-            &scene,
-            &baked,
+            scene_mesh,
+            baked,
             audio_config,
             simulation_config,
             &descriptors,
@@ -769,14 +1044,19 @@ impl Workbench {
         let phase_started = Instant::now();
         let faces = mesh_faces(&package.mesh);
         let camera = Camera::for_mesh(&package.mesh);
-        let autopilot = Autopilot::new(Bounds2::for_mesh(&package.mesh));
+        let autopilot = Autopilot::for_scene(
+            Bounds2::for_mesh(&package.mesh),
+            fixture,
+            &scene_spec.id,
+            listener.position,
+        );
         let source_height_levels = SourceHeightLevels::for_mesh(&package.mesh);
         eprintln!(
             "[startup] workbench view preparation: {} ms",
             phase_started.elapsed().as_millis()
         );
-        Ok(Self {
-            mesh: package.mesh,
+        let mut workbench = Self {
+            mesh: package.mesh.clone(),
             faces,
             sources: source_views,
             listener,
@@ -808,7 +1088,63 @@ impl Workbench {
             reflection_warmup_reported: false,
             first_frame_reported: false,
             ballistic_event,
-        })
+            fixture_requires_transient_rebuild: fixture.event_requires_transient_rebuild(),
+            transient_event_scene: mode.is_ballistic_transient(),
+            scene_action: None,
+        };
+        if mode.is_ballistic_transient() {
+            workbench.trigger_ballistic_event(initial_listener.pose.position)?;
+        }
+        debug_assert_eq!(workbench.physical_source_ids(), planned_source_ids);
+        Ok(workbench)
+    }
+
+    fn physical_source_ids(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(|source| source.id.clone())
+            .collect()
+    }
+
+    fn can_rebuild(&self) -> bool {
+        matches!(self.capture_state, CaptureUiState::Idle)
+    }
+
+    fn stop_audio(&self) -> Result<(), String> {
+        match &self.audio {
+            #[cfg(feature = "live-output")]
+            AudioState::Live(output) => output
+                .stop()
+                .map_err(|error| format!("cannot pause output for scene rebuild: {error:?}")),
+            AudioState::Unavailable(_) => Ok(()),
+        }
+    }
+
+    fn take_scene_action(&mut self) -> Option<SceneAction> {
+        self.scene_action.take()
+    }
+
+    fn least_audible_ordinary_sources(&self, count: usize) -> Vec<String> {
+        let mut ranked = self
+            .sources
+            .iter()
+            .filter(|source| source.event_role.is_none())
+            .map(|source| {
+                let predicted = if source.enabled && !source.muted {
+                    predicted_scene_spl_at_listener_db(
+                        source.declared_spl_at_one_meter_db,
+                        source.position,
+                        self.listener.position,
+                        OutputSafetyConfig::DEFAULT_SOURCE_RADIUS_M,
+                    )
+                } else {
+                    f32::NEG_INFINITY
+                };
+                (source.id.clone(), predicted)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| left.1.total_cmp(&right.1));
+        ranked.into_iter().take(count).map(|(id, _)| id).collect()
     }
 
     fn update_source_motion(&mut self) {
@@ -880,9 +1216,17 @@ impl Workbench {
         event.awaiting_inactive_publication = true;
         self.source_mix_writer
             .publish(SourceMix::from_sources(&self.sources));
+        if self.transient_event_scene {
+            self.scene_action = Some(SceneAction::RestoreSteady {
+                listener: self.listener,
+            });
+        }
     }
 
     fn refresh_ballistic_event_rearm(&mut self) {
+        if self.transient_event_scene {
+            return;
+        }
         let telemetry = self.acoustic_telemetry.read();
         let Some(event) = &mut self.ballistic_event else {
             return;
@@ -1077,11 +1421,22 @@ impl Workbench {
             self.listener.walk(forward, right, sprinting, delta_seconds)
         };
         let listener = self.listener.listener_state(velocity);
-        if trigger_shot
-            && let Err(error) = self.trigger_ballistic_event(listener.pose.position)
-            && let Some(event) = &mut self.ballistic_event
-        {
-            event.status = Some(error);
+        if trigger_shot {
+            if self.fixture_requires_transient_rebuild && !self.transient_event_scene {
+                if self.can_rebuild() {
+                    self.scene_action = Some(SceneAction::TriggerBallistic {
+                        listener: self.listener,
+                        omitted_source_ids: self.least_audible_ordinary_sources(2),
+                    });
+                } else {
+                    self.capture_status =
+                        Some("Finish the active capture before firing the ballistic event".into());
+                }
+            } else if let Err(error) = self.trigger_ballistic_event(listener.pose.position)
+                && let Some(event) = &mut self.ballistic_event
+            {
+                event.status = Some(error);
+            }
         }
         self.output_safety_controller
             .set_listener_position(listener.pose.position)
@@ -1435,6 +1790,8 @@ impl Workbench {
             if let Some(status) = &event.status {
                 ui.small(status);
             }
+        } else if self.fixture_requires_transient_rebuild {
+            ui.label("Space fires ballistic shot · transient scene rebuild");
         }
         ui.separator();
         ui.monospace(format!(
@@ -1713,8 +2070,8 @@ impl Workbench {
     }
 }
 
-impl eframe::App for Workbench {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl Workbench {
+    fn update_ui(&mut self, ctx: &egui::Context) {
         self.update_source_motion();
         self.refresh_acoustic_state();
         self.update_capture_lifecycle();
@@ -1769,6 +2126,87 @@ impl eframe::App for Workbench {
                 self.startup_started.elapsed().as_millis()
             );
             self.first_frame_reported = true;
+        }
+    }
+}
+
+impl eframe::App for WorkbenchApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut requested_scene = None;
+        if self.scenes.len() > 1 {
+            if ctx.input(|input| input.key_pressed(egui::Key::T)) {
+                requested_scene = Some((self.active_scene_index + 1) % self.scenes.len());
+            }
+            egui::TopBottomPanel::top("scene-tabs").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(format!(
+                        "Scene: {}",
+                        self.scenes[self.active_scene_index].id
+                    ));
+                    ui.separator();
+                    for (index, scene) in self.scenes.iter().enumerate() {
+                        if ui
+                            .selectable_label(index == self.active_scene_index, &scene.id)
+                            .clicked()
+                        {
+                            requested_scene = Some(index);
+                        }
+                    }
+                    ui.separator();
+                    ui.small("T cycles scenes · Space fires event");
+                });
+                if let Some(status) = &self.scene_status {
+                    ui.small(status);
+                }
+            });
+        }
+        if let Some(scene_index) = requested_scene
+            && scene_index != self.active_scene_index
+        {
+            self.rebuild(
+                scene_index,
+                SceneBuildMode::Steady {
+                    listener_override: None,
+                },
+                "scene switch",
+            );
+        }
+
+        if let Some(active) = &mut self.active {
+            active.update_ui(ctx);
+        } else {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("Scene unavailable");
+                if let Some(status) = &self.scene_status {
+                    ui.label(status);
+                }
+            });
+        }
+
+        let action = self.active.as_mut().and_then(Workbench::take_scene_action);
+        match action {
+            Some(SceneAction::TriggerBallistic {
+                listener,
+                omitted_source_ids,
+            }) => {
+                let omitted = omitted_source_ids.join(", ");
+                self.rebuild(
+                    self.active_scene_index,
+                    SceneBuildMode::BallisticTransient {
+                        listener,
+                        omitted_source_ids,
+                    },
+                    &format!("ballistic event temporarily preempted {omitted}"),
+                );
+            }
+            Some(SceneAction::RestoreSteady { listener }) => self.rebuild(
+                self.active_scene_index,
+                SceneBuildMode::Steady {
+                    listener_override: Some(listener),
+                },
+                "ballistic event complete; steady sources restored",
+            ),
+            None => {}
         }
     }
 }
@@ -2605,6 +3043,47 @@ impl RectCircuit {
             direction: [0.0, -1.0],
         }
     }
+
+    fn distance_for_position(self, position: EnuVector3) -> f32 {
+        let width = self.max[0] - self.min[0];
+        let height = self.max[1] - self.min[1];
+        let candidates = [
+            (
+                [position.east_m.clamp(self.min[0], self.max[0]), self.min[1]],
+                position.east_m.clamp(self.min[0], self.max[0]) - self.min[0],
+            ),
+            (
+                [
+                    self.max[0],
+                    position.north_m.clamp(self.min[1], self.max[1]),
+                ],
+                width + position.north_m.clamp(self.min[1], self.max[1]) - self.min[1],
+            ),
+            (
+                [position.east_m.clamp(self.min[0], self.max[0]), self.max[1]],
+                width + height + self.max[0] - position.east_m.clamp(self.min[0], self.max[0]),
+            ),
+            (
+                [
+                    self.min[0],
+                    position.north_m.clamp(self.min[1], self.max[1]),
+                ],
+                2.0 * width + height + self.max[1]
+                    - position.north_m.clamp(self.min[1], self.max[1]),
+            ),
+        ];
+        candidates
+            .into_iter()
+            .min_by(|left, right| {
+                let left_distance =
+                    (left.0[0] - position.east_m).powi(2) + (left.0[1] - position.north_m).powi(2);
+                let right_distance = (right.0[0] - position.east_m).powi(2)
+                    + (right.0[1] - position.north_m).powi(2);
+                left_distance.total_cmp(&right_distance)
+            })
+            .map_or(0.0, |candidate| candidate.1)
+            .rem_euclid(self.perimeter())
+    }
 }
 
 struct Autopilot {
@@ -2622,6 +3101,36 @@ impl Autopilot {
             distance_m: 0.0,
             circuit: bounds.inset_circuit(),
         }
+    }
+
+    fn for_scene(
+        bounds: Bounds2,
+        fixture: &Fixture,
+        scene_id: &str,
+        listener_position: EnuVector3,
+    ) -> Self {
+        let mut autopilot = Self::new(bounds);
+        if scene_id != "checkpoint-block" {
+            return autopilot;
+        }
+        let Some(trajectory) = &fixture.listener.trajectory else {
+            return autopilot;
+        };
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for waypoint in &trajectory.waypoints_m {
+            min[0] = min[0].min(waypoint[0] as f32);
+            min[1] = min[1].min(waypoint[1] as f32);
+            max[0] = max[0].max(waypoint[0] as f32);
+            max[1] = max[1].max(waypoint[1] as f32);
+        }
+        if trajectory.waypoints_m.len() == 4 && min[0] < max[0] && min[1] < max[1] {
+            autopilot.circuit = RectCircuit { min, max };
+            autopilot.speed_mps = trajectory.speed_mps as f32;
+            autopilot.distance_m = autopilot.circuit.distance_for_position(listener_position);
+            autopilot.enabled = true;
+        }
+        autopilot
     }
 
     fn reset(&mut self) {
@@ -2856,6 +3365,81 @@ fn normalize3(vector: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_slot_teardown_and_rebuild_never_leaks_previous_scene_ids() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let megablock = Fixture::read(&root.join("fixtures/city/megablock/fixture.json")).unwrap();
+        let checkpoint = Fixture::read(&root.join("fixtures/checkpoint/fixture.json")).unwrap();
+        let steady = SceneBuildMode::Steady {
+            listener_override: None,
+        };
+        let transient = SceneBuildMode::BallisticTransient {
+            listener: ListenerControl::at(
+                EnuVector3::new(292.5, 330.0, 1.5),
+                EnuVector3::new(0.0, 1.0, 0.0),
+            ),
+            omitted_source_ids: vec![
+                "fob-radio-checkpoint".into(),
+                "camo-net-flap-checkpoint".into(),
+            ],
+        };
+
+        let megablock_ids = planned_physical_source_ids(&megablock, &steady);
+        let checkpoint_ids = planned_physical_source_ids(&checkpoint, &steady);
+        let transient_ids = planned_physical_source_ids(&checkpoint, &transient);
+        assert_eq!(megablock_ids.len(), 6);
+        assert_eq!(checkpoint_ids.len(), 8);
+        assert_eq!(transient_ids.len(), 8);
+        assert!(transient_ids.contains(&"checkpoint-m2-shot-crack".into()));
+        assert!(transient_ids.contains(&"checkpoint-m2-shot-blast".into()));
+        assert!(!transient_ids.contains(&"fob-radio-checkpoint".into()));
+        assert!(!transient_ids.contains(&"camo-net-flap-checkpoint".into()));
+
+        let mut slots = SceneSlotState::default();
+        slots.replace(megablock_ids.clone());
+        slots.teardown();
+        assert!(slots.active_ids.is_empty());
+        slots.replace(checkpoint_ids.clone());
+        assert_eq!(slots.active_ids, checkpoint_ids);
+        assert!(
+            slots
+                .active_ids
+                .iter()
+                .all(|id| !id.starts_with("megablock-shot-"))
+        );
+        slots.teardown();
+        slots.replace(megablock_ids.clone());
+        assert_eq!(slots.active_ids, megablock_ids);
+        assert!(
+            slots
+                .active_ids
+                .iter()
+                .all(|id| !id.starts_with("checkpoint-"))
+        );
+    }
+
+    #[test]
+    fn checkpoint_autopilot_uses_the_fixture_loop_and_walking_speed() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture = Fixture::read(&root.join("fixtures/checkpoint/fixture.json")).unwrap();
+        let mut autopilot = Autopilot::for_scene(
+            Bounds2 {
+                min: [0.0, 0.0],
+                max: [585.0, 585.0],
+            },
+            &fixture,
+            "checkpoint-block",
+            EnuVector3::new(197.5, 292.5, 1.5),
+        );
+        assert!(autopilot.enabled);
+        assert_eq!(autopilot.speed_mps, 1.5);
+        assert_eq!(autopilot.circuit.min, [197.5, 292.5]);
+        assert_eq!(autopilot.circuit.max, [292.5, 387.5]);
+        let sample = autopilot.advance(1.0);
+        assert_eq!(sample.position, [199.0, 292.5]);
+        assert_eq!(sample.direction, [1.0, 0.0]);
+    }
     use std::sync::{Arc, Mutex};
 
     struct RecordingProcessor {

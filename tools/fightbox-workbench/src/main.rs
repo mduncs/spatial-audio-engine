@@ -9,7 +9,7 @@ fn main() {
             eprintln!("{message}");
             eprintln!(
                 "usage: fightbox-workbench --package <pkg.fightbox> --baked <dir> \
-                 --fixture <fixture.json> [--device <name>]"
+                 --fixture <fixture.json> [--fixture <fixture.json> ...] [--device <name>]"
             );
             std::process::exit(2);
         }
@@ -23,7 +23,7 @@ fn main() {
 fn parse_args(arguments: impl Iterator<Item = String>) -> Result<LaunchArgs, String> {
     let mut package = None;
     let mut baked = None;
-    let mut fixture = None;
+    let mut fixtures = Vec::new();
     let mut device = None;
     let mut arguments = arguments;
     while let Some(flag) = arguments.next() {
@@ -33,7 +33,7 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<LaunchArgs, Str
         match flag.as_str() {
             "--package" => package = Some(PathBuf::from(value)),
             "--baked" => baked = Some(PathBuf::from(value)),
-            "--fixture" => fixture = Some(PathBuf::from(value)),
+            "--fixture" => fixtures.push(PathBuf::from(value)),
             "--device" => device = Some(value),
             _ => return Err(format!("unknown argument {flag}")),
         }
@@ -41,7 +41,9 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<LaunchArgs, Str
     Ok(LaunchArgs {
         package: package.ok_or("--package is required")?,
         baked: baked.ok_or("--baked is required")?,
-        fixture: fixture.ok_or("--fixture is required")?,
+        fixtures: (!fixtures.is_empty())
+            .then_some(fixtures)
+            .ok_or("--fixture is required")?,
         device,
     })
 }
@@ -68,6 +70,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.package, PathBuf::from("block.fightbox"));
+        assert_eq!(args.fixtures, vec![PathBuf::from("fixture.json")]);
         assert_eq!(args.device.as_deref(), Some("DAC"));
+    }
+
+    #[test]
+    fn preserves_repeated_fixture_order_for_scene_tabs() {
+        let args = parse_args(
+            [
+                "--package",
+                "block.fightbox",
+                "--baked",
+                "bake",
+                "--fixture",
+                "megablock.json",
+                "--fixture",
+                "checkpoint.json",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            args.fixtures,
+            vec![
+                PathBuf::from("megablock.json"),
+                PathBuf::from("checkpoint.json")
+            ]
+        );
     }
 }

@@ -15,7 +15,7 @@ pub use pose::{ListenerControl, PoseMailbox};
 pub struct LaunchArgs {
     pub package: PathBuf,
     pub baked: PathBuf,
-    pub fixture: PathBuf,
+    pub fixtures: Vec<PathBuf>,
     pub device: Option<String>,
 }
 
@@ -29,7 +29,7 @@ pub fn launch(args: LaunchArgs) -> Result<(), String> {
             .with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
-    let app = workbench::Workbench::load(args, startup_started)?;
+    let app = workbench::WorkbenchApp::load(args, startup_started)?;
     let window_started = Instant::now();
     eframe::run_native(
         title,

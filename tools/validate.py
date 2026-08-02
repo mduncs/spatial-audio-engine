@@ -237,7 +237,7 @@ def load_json(path: Path, label: str) -> Any:
 
 
 def validate_cross_fields(fixture: Any) -> list[Issue]:
-    """Rules that relate ordinary sources to pre-declared event slots."""
+    """Rules that relate ordinary sources and triggerable events."""
     if not isinstance(fixture, dict):
         return []
     sources = fixture.get("sources", [])
@@ -245,11 +245,6 @@ def validate_cross_fields(fixture: Any) -> list[Issue]:
     if not isinstance(sources, list) or not isinstance(events, list):
         return []
     errors: list[Issue] = []
-    total = len(sources) + 2 * len(events)
-    if total > 8:
-        errors.append(
-            Issue("$", f"ordinary plus pre-declared event sources total {total}; maximum is 8")
-        )
     seen: dict[str, str] = {}
     for index, source in enumerate(sources):
         if isinstance(source, dict) and isinstance(source.get("id"), str):

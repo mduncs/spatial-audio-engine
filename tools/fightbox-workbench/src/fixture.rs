@@ -322,14 +322,10 @@ impl Fixture {
     fn parse(bytes: &[u8], source: &str) -> Result<Self, String> {
         let fixture: Self = serde_json::from_slice(bytes)
             .map_err(|error| format!("invalid fixture {source}: {error}"))?;
-        let declared_source_count = fixture.sources.len() + fixture.events.len() * 2;
         if fixture.sources.is_empty()
-            || declared_source_count > fightbox_runtime::MAX_ACTIVE_SOURCES
+            || fixture.sources.len() > fightbox_runtime::MAX_ACTIVE_SOURCES
         {
-            return Err(
-                "fixture must contain 1..=MAX_ACTIVE_SOURCES total ordinary and event sources"
-                    .into(),
-            );
+            return Err("fixture must contain 1..=MAX_ACTIVE_SOURCES ordinary sources".into());
         }
         fixture.initial_listener_position()?;
         for source in &fixture.sources {
@@ -405,7 +401,12 @@ impl Fixture {
 
     #[must_use]
     pub fn declared_source_count(&self) -> usize {
-        self.sources.len() + self.events.len() * 2
+        (self.sources.len() + self.events.len() * 2).min(fightbox_runtime::MAX_ACTIVE_SOURCES)
+    }
+
+    #[must_use]
+    pub fn event_requires_transient_rebuild(&self) -> bool {
+        !self.events.is_empty() && self.sources.len() + 2 > fightbox_runtime::MAX_ACTIVE_SOURCES
     }
 
     pub fn initial_listener_position(&self) -> Result<EnuVector3, String> {
@@ -995,6 +996,81 @@ mod tests {
         );
         let text = std::fs::read_to_string(fixture_path).unwrap();
         assert!(text.contains("4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843"));
+    }
+
+    #[test]
+    fn checkpoint_fixture_matches_the_approved_scene_contract() {
+        let fixture = Fixture::read(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/checkpoint/fixture.json"),
+        )
+        .unwrap();
+        assert_eq!(fixture.fixture_id.as_deref(), Some("checkpoint-block"));
+        assert_eq!(fixture.sources.len(), 8);
+        assert_eq!(fixture.events.len(), 1);
+        assert_eq!(fixture.declared_source_count(), 8);
+        assert!(fixture.event_requires_transient_rebuild());
+        assert_eq!(
+            fixture.initial_listener_position().unwrap(),
+            EnuVector3::new(197.5, 292.5, 1.5)
+        );
+        let listener_path = fixture.listener.trajectory.as_ref().unwrap();
+        assert_eq!(
+            listener_path.waypoints_m,
+            vec![
+                [197.5, 292.5, 1.5],
+                [292.5, 292.5, 1.5],
+                [292.5, 387.5, 1.5],
+                [197.5, 387.5, 1.5],
+            ]
+        );
+        assert_eq!(listener_path.speed_mps, 1.5);
+        assert_eq!(listener_path.max_speed_mps, Some(1.5));
+
+        let expected = [
+            ("abrams-idle-checkpoint", "squad-abrams-idle", 90.0),
+            ("ural-truck-idle-north", "squad-ural-idle", 84.0),
+            ("generator-parallel-street", "squad-generator-diesel", 84.0),
+            ("burning-car-west-leg", "squad-fire-car", 85.0),
+            ("building-fire-far-east", "squad-fire-building-large", 96.0),
+            ("fob-radio-checkpoint", "squad-fob-radio-static", 70.0),
+            ("camo-net-flap-checkpoint", "squad-camo-tent-flap", 65.0),
+            ("mi8-orbit", "squad-mi8-rotor-close", 126.0),
+        ];
+        for (source, (id, asset_id, spl)) in fixture.sources.iter().zip(expected) {
+            assert_eq!(source.id, id);
+            assert_eq!(source.asset_id, asset_id);
+            assert_eq!(source.reference_level.db_spl, spl);
+        }
+        assert_eq!(
+            fixture.sources[0].extent,
+            ExtentDescriptor::LineSegment { length_m: 8.0 }
+        );
+        assert_eq!(
+            fixture.sources[4].extent,
+            ExtentDescriptor::LineSegment { length_m: 12.0 }
+        );
+        assert_eq!(fixture.sources[5].extent, ExtentDescriptor::Point);
+        let orbit = fixture.sources[7].trajectory.as_ref().unwrap();
+        assert_eq!(orbit.speed_mps, 30.0);
+        assert_eq!(orbit.max_speed_mps, Some(30.0));
+        assert_eq!(
+            orbit.waypoints_m,
+            vec![
+                [102.5, 102.5, 55.0],
+                [482.5, 102.5, 55.0],
+                [482.5, 482.5, 55.0],
+                [102.5, 482.5, 55.0],
+            ]
+        );
+
+        let shot = fixture.events[0].ballistic_shot();
+        assert_eq!(shot.id, "checkpoint-m2-shot");
+        assert_eq!(shot.muzzle_m, [292.5, 102.5, 2.0]);
+        assert_eq!(shot.direction_enu, [0.0, 1.0, 0.0]);
+        assert_eq!(shot.mach, 2.6);
+        assert_eq!(shot.asset_id, "squad-m2-blast");
+        assert_eq!(shot.levels.blast_spl_at_one_meter_db, 155.0);
+        assert_eq!(shot.levels.crack_over_blast_db_at_30_m, 3.0);
     }
 
     #[test]

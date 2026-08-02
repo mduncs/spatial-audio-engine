@@ -1,0 +1,26 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-m2-blast",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-m2-blast.wav",
+      "sha256": "7c11e3390b57ca4e8bdec250235f20da1977a887790234af0cdacdbdebbc2f18",
+      "start_frame": 0,
+      "loop": false
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 0.115,
+  "target_rms_dbfs": -20.0,
+  "expected_reference_rms_dbfs": -11.537003,
+  "calibration": {
+    "applied_gain_db": -8.462997
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of a Squad v8.1 game asset; this descriptor grants no right to redistribute audio bytes."
+  ]
+}
