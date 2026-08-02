@@ -2,13 +2,13 @@
 //!
 //! The frozen Phase A containers mirror `fixtures/fixture.schema.json` and deny
 //! unknown fields. This parser also owns the backward-compatible optional
-//! `source.directivity` extension; its nested shape and numeric ranges are just
-//! as strict. The structural `const` constraints the frozen schema expresses
-//! (schema version, coordinate frame, kernel, gate, source mode, probe/path-bake
-//! shape) are checked again here after deserialization so a wrong fixture fails
-//! with a specific message rather than a silent backend default. NaN/infinity
-//! cannot appear in parsed JSON text, but finite reference levels are validated
-//! too.
+//! `source.directivity` and `source.extent` extensions; their nested shapes and
+//! numeric ranges are just as strict. The structural `const` constraints the
+//! frozen schema expresses (schema version, coordinate frame, kernel, gate,
+//! source mode, probe/path-bake shape) are checked again here after
+//! deserialization so a wrong fixture fails with a specific message rather than
+//! a silent backend default. NaN/infinity cannot appear in parsed JSON text, but
+//! finite reference levels and source extent dimensions are validated too.
 //!
 //! This layer only parses and validates; it builds no SDK handles and renders
 //! nothing. Backend construction lives in [`crate::scene`].
@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::schema::FIXTURE;
+use fightbox_api::{ExtentDescriptor, ExtentError};
 
 /// A 3-component vector in local ENU metres, read from a JSON array of length 3.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -133,6 +134,78 @@ impl Default for Directivity {
     }
 }
 
+/// Closed fixture JSON representation of [`ExtentDescriptor`].
+///
+/// Struct-style variants, including the fieldless `point` variant, let serde's
+/// `deny_unknown_fields` enforce the same exact-field contract as the schema.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ExtentWire {
+    Point {},
+    MultiPoint { count: u8 },
+    LineSegment { length_m: f64 },
+    StereoImage { width_m: f64 },
+}
+
+impl From<ExtentWire> for ExtentDescriptor {
+    fn from(value: ExtentWire) -> Self {
+        match value {
+            ExtentWire::Point {} => Self::Point,
+            ExtentWire::MultiPoint { count } => Self::MultiPoint { count },
+            ExtentWire::LineSegment { length_m } => Self::LineSegment {
+                length_m: length_m as f32,
+            },
+            ExtentWire::StereoImage { width_m } => Self::StereoImage {
+                width_m: width_m as f32,
+            },
+        }
+    }
+}
+
+impl From<ExtentDescriptor> for ExtentWire {
+    fn from(value: ExtentDescriptor) -> Self {
+        match value {
+            ExtentDescriptor::Point => Self::Point {},
+            ExtentDescriptor::MultiPoint { count } => Self::MultiPoint { count },
+            ExtentDescriptor::LineSegment { length_m } => Self::LineSegment {
+                length_m: f64::from(length_m),
+            },
+            ExtentDescriptor::StereoImage { width_m } => Self::StereoImage {
+                width_m: f64::from(width_m),
+            },
+        }
+    }
+}
+
+mod extent_json {
+    use super::{ExtentDescriptor, ExtentWire};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ExtentDescriptor, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ExtentWire::deserialize(deserializer).map(Into::into)
+    }
+
+    pub fn serialize<S>(value: &ExtentDescriptor, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ExtentWire::from(*value).serialize(serializer)
+    }
+}
+
+fn validate_extent(extent: ExtentDescriptor) -> Result<(), String> {
+    extent.validate().map_err(|error| match error {
+        ExtentError::EmptyMultiPoint => "source.extent.count must be >= 1".into(),
+        ExtentError::NonFiniteLineLength => "source.extent.length_m must be finite".into(),
+        ExtentError::NonPositiveLineLength => "source.extent.length_m must be > 0".into(),
+        ExtentError::NonFiniteStereoWidth => "source.extent.width_m must be finite".into(),
+        ExtentError::NonPositiveStereoWidth => "source.extent.width_m must be > 0".into(),
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -142,6 +215,8 @@ pub struct Source {
     pub asset_id: String,
     #[serde(default)]
     pub directivity: Directivity,
+    #[serde(default, with = "extent_json")]
+    pub extent: ExtentDescriptor,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -348,6 +423,7 @@ impl Fixture {
             return Err("source.reference_level.db_spl must be finite".into());
         }
         self.source.directivity.validate()?;
+        validate_extent(self.source.extent)?;
         // Material property ranges mirror the fixture schema.
         for (name, material) in &self.geometry.materials {
             check_material(name, material)?;
@@ -627,6 +703,7 @@ mod tests {
     use super::*;
 
     const FIXTURE_SCHEMA: &str = include_str!("../../../fixtures/fixture.schema.json");
+    const S6A_SCHEMA: &str = include_str!("../../../fixtures/s6a.schema.json");
     const MEGABLOCK: &str = include_str!("../../../fixtures/city/megablock/fixture.json");
 
     fn schema_accepts_directivity(value: Option<&serde_json::Value>) -> bool {
@@ -699,12 +776,106 @@ mod tests {
         )
     }
 
+    fn schema_accepts_extent(value: Option<&serde_json::Value>) -> bool {
+        schema_accepts_extent_in(FIXTURE_SCHEMA, value)
+    }
+
+    fn schema_accepts_extent_in(schema_text: &str, value: Option<&serde_json::Value>) -> bool {
+        let schema: serde_json::Value =
+            serde_json::from_str(schema_text).expect("fixture schema must be valid JSON");
+        let source_schema = &schema["$defs"]["source"];
+        let source_required = source_schema["required"]
+            .as_array()
+            .expect("source.required must be an array");
+
+        let Some(value) = value else {
+            return !source_required
+                .iter()
+                .any(|field| field.as_str() == Some("extent"));
+        };
+        if source_schema["properties"]["extent"]["$ref"] != "#/$defs/extent" {
+            return false;
+        }
+
+        schema["$defs"]["extent"]["oneOf"]
+            .as_array()
+            .expect("extent.oneOf must be an array")
+            .iter()
+            .filter(|shape| extent_shape_accepts(shape, value))
+            .count()
+            == 1
+    }
+
+    fn extent_shape_accepts(shape: &serde_json::Value, value: &serde_json::Value) -> bool {
+        if shape["type"] != "object" || shape["additionalProperties"] != false {
+            return false;
+        }
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        let properties = shape["properties"]
+            .as_object()
+            .expect("extent shape properties must be an object");
+        let required = shape["required"]
+            .as_array()
+            .expect("extent shape required must be an array");
+        if required
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|field| !object.contains_key(field))
+            || object.keys().any(|field| !properties.contains_key(field))
+        {
+            return false;
+        }
+
+        properties.iter().all(|(field, field_schema)| {
+            let Some(value) = object.get(field) else {
+                return true;
+            };
+            if let Some(expected) = field_schema.get("const") {
+                return value == expected;
+            }
+            match field_schema["type"].as_str() {
+                Some("integer") => {
+                    let Some(number) = value.as_u64() else {
+                        return false;
+                    };
+                    let minimum = field_schema["minimum"]
+                        .as_u64()
+                        .expect("extent integer minimum must be unsigned");
+                    number >= minimum
+                }
+                Some("number") => {
+                    let Some(number) = value.as_f64() else {
+                        return false;
+                    };
+                    let minimum = field_schema["exclusiveMinimum"]
+                        .as_f64()
+                        .expect("extent number minimum must be numeric");
+                    number.is_finite() && number > minimum
+                }
+                _ => false,
+            }
+        })
+    }
+
+    fn s0_with_extent(extent: Option<&serde_json::Value>) -> String {
+        let Some(extent) = extent else {
+            return test_fixtures::S0.to_owned();
+        };
+        test_fixtures::S0.replace(
+            r#""asset_id": "s0-calibrated-pink""#,
+            &format!(r#""asset_id": "s0-calibrated-pink", "extent": {extent}"#),
+        )
+    }
+
     #[test]
     fn parses_repo_fixtures() {
         let s0 = test_fixtures::s0();
         assert_eq!(s0.gate().unwrap(), Gate::S0);
         assert_eq!(s0.source.asset_id, "s0-calibrated-pink");
         assert_eq!(s0.source.directivity, Directivity::default());
+        assert_eq!(s0.source.extent, ExtentDescriptor::Point);
         assert_eq!(s0.listener.trajectory_m.len(), 6);
 
         let s3 = test_fixtures::s3();
@@ -731,6 +902,35 @@ mod tests {
         let encoded = serde_json::to_string(&parsed).unwrap();
         let reparsed = Fixture::parse(&encoded).unwrap();
         assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn parses_and_round_trips_all_present_source_extents() {
+        for (extent, expected) in [
+            (
+                serde_json::json!({"kind": "point"}),
+                ExtentDescriptor::Point,
+            ),
+            (
+                serde_json::json!({"kind": "multi_point", "count": 3}),
+                ExtentDescriptor::MultiPoint { count: 3 },
+            ),
+            (
+                serde_json::json!({"kind": "line_segment", "length_m": 6.0}),
+                ExtentDescriptor::LineSegment { length_m: 6.0 },
+            ),
+            (
+                serde_json::json!({"kind": "stereo_image", "width_m": 4.0}),
+                ExtentDescriptor::StereoImage { width_m: 4.0 },
+            ),
+        ] {
+            let parsed = Fixture::parse(&s0_with_extent(Some(&extent))).unwrap();
+            assert_eq!(parsed.source.extent, expected);
+
+            let encoded = serde_json::to_string(&parsed).unwrap();
+            let reparsed = Fixture::parse(&encoded).unwrap();
+            assert_eq!(reparsed, parsed);
+        }
     }
 
     #[test]
@@ -793,6 +993,87 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_and_rust_parser_have_extent_parity() {
+        for (case, extent, expected) in [
+            ("absent defaults to point", None, true),
+            ("point", Some(serde_json::json!({"kind": "point"})), true),
+            (
+                "multi-point",
+                Some(serde_json::json!({"kind": "multi_point", "count": 3})),
+                true,
+            ),
+            (
+                "line segment",
+                Some(serde_json::json!({
+                    "kind": "line_segment",
+                    "length_m": 6.0,
+                })),
+                true,
+            ),
+            (
+                "stereo image",
+                Some(serde_json::json!({
+                    "kind": "stereo_image",
+                    "width_m": 4.0,
+                })),
+                true,
+            ),
+            (
+                "line segment missing length",
+                Some(serde_json::json!({"kind": "line_segment"})),
+                false,
+            ),
+            (
+                "point with stray count",
+                Some(serde_json::json!({"kind": "point", "count": 1})),
+                false,
+            ),
+            (
+                "empty multi-point",
+                Some(serde_json::json!({"kind": "multi_point", "count": 0})),
+                false,
+            ),
+            (
+                "non-positive stereo width",
+                Some(serde_json::json!({
+                    "kind": "stereo_image",
+                    "width_m": 0.0,
+                })),
+                false,
+            ),
+            (
+                "wrong dimension for line segment",
+                Some(serde_json::json!({
+                    "kind": "line_segment",
+                    "width_m": 6.0,
+                })),
+                false,
+            ),
+        ] {
+            let fixture_schema_accepts = schema_accepts_extent(extent.as_ref());
+            let s6a_schema_accepts = schema_accepts_extent_in(S6A_SCHEMA, extent.as_ref());
+            let parser_accepts = Fixture::parse(&s0_with_extent(extent.as_ref())).is_ok();
+            assert_eq!(
+                fixture_schema_accepts, expected,
+                "fixture JSON Schema outcome for {case}"
+            );
+            assert_eq!(
+                s6a_schema_accepts, expected,
+                "S6a JSON Schema outcome for {case}"
+            );
+            assert_eq!(parser_accepts, expected, "Rust parser outcome for {case}");
+            assert_eq!(
+                fixture_schema_accepts, parser_accepts,
+                "fixture schema/parser parity for {case}"
+            );
+            assert_eq!(
+                s6a_schema_accepts, parser_accepts,
+                "S6a schema/parser parity for {case}"
+            );
+        }
+    }
+
+    #[test]
     fn megablock_directivity_matches_schema_and_rust_parser_contract() {
         let fixture: serde_json::Value =
             serde_json::from_str(MEGABLOCK).expect("megablock fixture must be valid JSON");
@@ -812,12 +1093,36 @@ mod tests {
         assert_eq!(
             parsed,
             Directivity {
-                dipole_weight: 0.75,
+                dipole_weight: 0.5,
                 dipole_power: 2.0,
             }
         );
         assert!(sources.iter().all(|source| {
             source["id"] == "siren-circling-center-block" || source.get("directivity").is_none()
+        }));
+    }
+
+    #[test]
+    fn megablock_extent_matches_schema_and_rust_parser_contract() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(MEGABLOCK).expect("megablock fixture must be valid JSON");
+        let sources = fixture["sources"]
+            .as_array()
+            .expect("megablock sources must be an array");
+        let artillery = sources
+            .iter()
+            .find(|source| source["id"] == "artillery-sw-map-corner")
+            .expect("megablock artillery source must exist");
+        let extent = &artillery["extent"];
+
+        assert!(schema_accepts_extent(Some(extent)));
+        let parsed = Fixture::parse(&s0_with_extent(Some(extent))).unwrap();
+        assert_eq!(
+            parsed.source.extent,
+            ExtentDescriptor::LineSegment { length_m: 6.0 }
+        );
+        assert!(sources.iter().all(|source| {
+            source["id"] == "artillery-sw-map-corner" || source.get("extent").is_none()
         }));
     }
 
@@ -846,6 +1151,36 @@ mod tests {
             assert!(
                 error.contains(expected),
                 "expected {expected:?} in directivity error, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_unknown_shaped_source_extent() {
+        for (extent, expected) in [
+            (
+                r#"{"kind": "multi_point", "count": 0}"#,
+                "source.extent.count must be >= 1",
+            ),
+            (
+                r#"{"kind": "line_segment", "length_m": 0.0}"#,
+                "source.extent.length_m must be > 0",
+            ),
+            (
+                r#"{"kind": "stereo_image", "width_m": -1.0}"#,
+                "source.extent.width_m must be > 0",
+            ),
+            (r#"{"kind": "line_segment"}"#, "missing field `length_m`"),
+            (r#"{"kind": "point", "count": 1}"#, "unknown field `count`"),
+        ] {
+            let text = test_fixtures::S0.replace(
+                r#""asset_id": "s0-calibrated-pink""#,
+                &format!(r#""asset_id": "s0-calibrated-pink", "extent": {extent}"#),
+            );
+            let error = Fixture::parse(&text).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in extent error, got: {error}"
             );
         }
     }

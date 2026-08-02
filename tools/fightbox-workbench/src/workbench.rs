@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
 use fightbox_api::{
-    EngineConfig, EnuVector3, ExtentDescriptor, ListenerState, OutputSafetyConfig, Pose,
-    ReferenceLevel, SceneCalibration, SourceId, SourceProfile,
+    EngineConfig, EnuVector3, ListenerState, OutputSafetyConfig, Pose, ReferenceLevel,
+    SceneCalibration, SourceId, SourceProfile,
 };
 use fightbox_runtime::backend::{SimulationUpdate, SourceMotion};
 use fightbox_runtime::{
@@ -348,7 +348,7 @@ impl Workbench {
                         db_spl: source.reference_level.db_spl as f32,
                     },
                     asset_analysis: asset.analysis,
-                    extent: ExtentDescriptor::Point,
+                    extent: source.extent,
                     directivity: source.directivity.to_api(),
                     max_speed_mps: source
                         .trajectory
@@ -2487,7 +2487,7 @@ mod tests {
                 fightbox_api::AssetMeasurementProvenance::new("workbench-safety-test/v1").unwrap(),
             )
             .unwrap(),
-            extent: ExtentDescriptor::Point,
+            extent: fightbox_api::ExtentDescriptor::Point,
             directivity: fightbox_api::Directivity::default(),
             max_speed_mps: 0.0,
         };

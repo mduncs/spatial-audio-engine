@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fightbox.dev/schema/fixture-workbench-1.json",
+  "title": "Fightbox workbench fixture profile",
+  "description": "Fixture fields consumed by the lenient fightbox-workbench loader. Scene geometry and bake metadata are loaded from the package and baked directory, so richer fixture metadata may remain alongside this profile without becoming a workbench parser requirement.",
+  "type": "object",
+  "required": ["schema_version", "sources", "listener", "simulation"],
+  "properties": {
+    "schema_version": {"const": "fightbox.fixture.workbench.v1"},
+    "fixture_id": {"type": "string"},
+    "sources": {"$ref": "#/$defs/sources"},
+    "listener": {"$ref": "#/$defs/listener"},
+    "simulation": {"$ref": "#/$defs/simulation"}
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "vec3": {
+      "type": "array",
+      "items": {"type": "number"},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "extent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {"kind": {"const": "point"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "count"],
+          "properties": {
+            "kind": {"const": "multi_point"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 255}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "length_m"],
+          "properties": {
+            "kind": {"const": "line_segment"},
+            "length_m": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 3.4028234663852886e38
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "width_m"],
+          "properties": {
+            "kind": {"const": "stereo_image"},
+            "width_m": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 3.4028234663852886e38
+            }
+          }
+        }
+      ]
+    },
+    "directivity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dipole_weight", "dipole_power"],
+      "properties": {
+        "dipole_weight": {"type": "number", "minimum": 0, "maximum": 1},
+        "dipole_power": {"type": "number", "minimum": 0.25, "maximum": 16}
+      }
+    },
+    "reference_level": {
+      "type": "object",
+      "required": ["db_spl"],
+      "properties": {
+        "mode": {"type": "string"},
+        "db_spl": {"type": "number"}
+      },
+      "additionalProperties": true
+    },
+    "trajectory": {
+      "type": "object",
+      "required": ["waypoints_m", "speed_mps"],
+      "properties": {
+        "waypoints_m": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/vec3"},
+          "minItems": 2
+        },
+        "speed_mps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3.4028234663852886e38
+        },
+        "max_speed_mps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3.4028234663852886e38
+        }
+      },
+      "additionalProperties": true,
+      "$comment": "The Rust loader additionally enforces speed_mps <= max_speed_mps when max_speed_mps is present."
+    },
+    "source": {
+      "type": "object",
+      "required": ["id", "asset_id", "reference_level"],
+      "properties": {
+        "id": {"type": "string"},
+        "asset_id": {"type": "string"},
+        "reference_level": {"$ref": "#/$defs/reference_level"},
+        "default_enabled": {"type": "boolean"},
+        "directivity": {"$ref": "#/$defs/directivity"},
+        "extent": {"$ref": "#/$defs/extent"},
+        "position_m": {"$ref": "#/$defs/vec3"},
+        "trajectory": {"$ref": "#/$defs/trajectory"}
+      },
+      "additionalProperties": true,
+      "oneOf": [
+        {"required": ["position_m"]},
+        {"required": ["trajectory"]}
+      ]
+    },
+    "sources": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/source"},
+      "minItems": 1,
+      "maxItems": 8
+    },
+    "listener": {
+      "type": "object",
+      "required": ["forward_enu"],
+      "properties": {
+        "position_m": {"$ref": "#/$defs/vec3"},
+        "trajectory": {"$ref": "#/$defs/trajectory"},
+        "forward_enu": {"$ref": "#/$defs/vec3"}
+      },
+      "additionalProperties": true,
+      "oneOf": [
+        {"required": ["position_m"]},
+        {"required": ["trajectory"]}
+      ]
+    },
+    "simulation": {
+      "type": "object",
+      "required": ["direct", "reflections", "pathing"],
+      "properties": {
+        "direct": {
+          "type": "object",
+          "properties": {
+            "occlusion_samples": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            }
+          },
+          "additionalProperties": true
+        },
+        "reflections": {
+          "type": "object",
+          "properties": {
+            "rays": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+            "bounces": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+            "duration_s": {"type": "number"}
+          },
+          "additionalProperties": true
+        },
+        "pathing": {
+          "type": "object",
+          "properties": {
+            "order": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+            "validation": {"type": "boolean"},
+            "alternate_paths": {"type": "boolean"}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

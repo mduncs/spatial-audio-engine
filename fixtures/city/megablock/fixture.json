@@ -1,5 +1,5 @@
 {
-  "schema_version": "fightbox.fixture.s6a.v1",
+  "schema_version": "fightbox.fixture.workbench.v1",
   "fixture_id": "megablock-walk",
   "gate": "S5",
   "coordinate_frame": {
@@ -34,6 +34,10 @@
         "mode": "SplAtOneMeter",
         "db_spl": 155
       },
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 6.0
+      },
       "position_m": [
         102.5,
         102.5,
@@ -49,7 +53,7 @@
         "db_spl": 118
       },
       "directivity": {
-        "dipole_weight": 0.75,
+        "dipole_weight": 0.5,
         "dipole_power": 2.0
       },
       "trajectory": {
@@ -74,7 +78,7 @@
       "position_m": [
         482.5,
         292.5,
-        1.5
+        60.0
       ]
     }
   ],
@@ -201,7 +205,7 @@
       "max_m": [
         585,
         585,
-        2.5
+        63.0
       ],
       "spacing_m": 4.0
     },
@@ -222,7 +226,7 @@
       "For city synth --seed 1 --blocks 6x6, the source is at the central east/north street intersection [292.5, 292.5, 1.5] and the listener begins one 95 m block pitch west at the same 1.5 m height.",
       "The source uses asset_id toms-diner, whose exact WAV reference is fixtures/assets/music/toms-diner-48k-mono.wav with sha256 4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843.",
       "The moving siren follows its four waypoints as a closed cycle at 8 m/s; after the last waypoint it traverses the closing segment back to the first.",
-      "The static bell is two 95 m grid pitches east of the central Tom's Diner source.",
+      "The static bell is two 95 m grid pitches east of the central Tom's Diner source and elevated to 60 m, above the nearby 26–38 m rooftops and inside the 63 m probe layer's influence shell.",
       "The artillery source sits at the southwest-most interior street intersection [102.5, 102.5, 1.5], roughly 212 m from the listener spawn, inside the compiled mesh bounds so reflections and pathing have surrounding geometry; the map-edge intersection [7.5, 7.5] lies outside the building mesh and produces no reflected energy.",
       "The local metre coordinate frame is shared byte-for-byte in meaning by city synth, city compile, city render, and the workbench."
     ],

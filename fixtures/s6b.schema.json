@@ -40,6 +40,7 @@
       "minItems": 3,
       "maxItems": 3
     },
+    "extent": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "point"}}}, {"type": "object", "additionalProperties": false, "required": ["kind", "count"], "properties": {"kind": {"const": "multi_point"}, "count": {"type": "integer", "minimum": 1}}}, {"type": "object", "additionalProperties": false, "required": ["kind", "length_m"], "properties": {"kind": {"const": "line_segment"}, "length_m": {"type": "number", "exclusiveMinimum": 0}}}, {"type": "object", "additionalProperties": false, "required": ["kind", "width_m"], "properties": {"kind": {"const": "stereo_image"}, "width_m": {"type": "number", "exclusiveMinimum": 0}}}]},
     "coordinate_frame": {
       "type": "object",
       "additionalProperties": false,
@@ -97,7 +98,17 @@
         },
         "reference_level": {"$ref": "#/$defs/reference_level"},
         "position_m": {"$ref": "#/$defs/vec3"},
-        "trajectory": {"$ref": "#/$defs/trajectory"}
+        "trajectory": {"$ref": "#/$defs/trajectory"},
+        "directivity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dipole_weight", "dipole_power"],
+          "properties": {
+            "dipole_weight": {"type": "number", "minimum": 0, "maximum": 1},
+            "dipole_power": {"type": "number", "minimum": 0.25, "maximum": 16}
+          }
+        },
+        "extent": {"$ref": "#/$defs/extent"}
       },
       "oneOf": [
         {"required": ["position_m"]},

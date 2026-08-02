@@ -1,5 +1,5 @@
 {
-  "schema_version": "fightbox.fixture.s6a.v1",
+  "schema_version": "fightbox.fixture.workbench.v1",
   "fixture_id": "chicago-block-workbench",
   "gate": "S5",
   "coordinate_frame": {

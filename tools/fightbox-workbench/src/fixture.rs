@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use fightbox_api::{Directivity, EnuVector3};
+use fightbox_api::{Directivity, EnuVector3, ExtentDescriptor, ExtentError};
 use fightbox_steam_audio::{
     AcousticMaterial, BakedProbeBatch, DirectOcclusionMode, PROBE_BATCH_METADATA_SCHEMA,
     ProbeBatchMetadata, ReflectionEffectConfig, S3SimulationConfig, STEAM_AUDIO_UPSTREAM_COMMIT,
@@ -28,6 +28,8 @@ pub struct FixtureSource {
     pub default_enabled: bool,
     #[serde(default)]
     pub directivity: FixtureDirectivity,
+    #[serde(default, deserialize_with = "deserialize_extent")]
+    pub extent: ExtentDescriptor,
     pub position_m: Option<[f64; 3]>,
     pub trajectory: Option<Trajectory>,
 }
@@ -89,6 +91,53 @@ impl Default for FixtureDirectivity {
             dipole_power: 1.0,
         }
     }
+}
+
+/// Closed fixture JSON representation of [`ExtentDescriptor`].
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum FixtureExtentWire {
+    Point {},
+    MultiPoint { count: u8 },
+    LineSegment { length_m: f64 },
+    StereoImage { width_m: f64 },
+}
+
+fn deserialize_extent<'de, D>(deserializer: D) -> Result<ExtentDescriptor, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let extent = match FixtureExtentWire::deserialize(deserializer)? {
+        FixtureExtentWire::Point {} => ExtentDescriptor::Point,
+        FixtureExtentWire::MultiPoint { count } => ExtentDescriptor::MultiPoint { count },
+        FixtureExtentWire::LineSegment { length_m } => ExtentDescriptor::LineSegment {
+            length_m: length_m as f32,
+        },
+        FixtureExtentWire::StereoImage { width_m } => ExtentDescriptor::StereoImage {
+            width_m: width_m as f32,
+        },
+    };
+    Ok(extent)
+}
+
+fn validate_extent(extent: ExtentDescriptor, source_id: &str) -> Result<(), String> {
+    extent.validate().map_err(|error| match error {
+        ExtentError::EmptyMultiPoint => {
+            format!("source {source_id} extent.count must be >= 1")
+        }
+        ExtentError::NonFiniteLineLength => {
+            format!("source {source_id} extent.length_m must be finite")
+        }
+        ExtentError::NonPositiveLineLength => {
+            format!("source {source_id} extent.length_m must be > 0")
+        }
+        ExtentError::NonFiniteStereoWidth => {
+            format!("source {source_id} extent.width_m must be finite")
+        }
+        ExtentError::NonPositiveStereoWidth => {
+            format!("source {source_id} extent.width_m must be > 0")
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -155,6 +204,7 @@ impl Fixture {
         for source in &fixture.sources {
             source.initial_position()?;
             source.directivity.validate(&source.id)?;
+            validate_extent(source.extent, &source.id)?;
             if let Some(trajectory) = &source.trajectory {
                 trajectory.validate(&format!("source {}", source.id))?;
             }
@@ -391,6 +441,7 @@ mod tests {
             fixture.sources[0].directivity,
             FixtureDirectivity::default()
         );
+        assert_eq!(fixture.sources[0].extent, ExtentDescriptor::Point);
     }
 
     #[test]
@@ -450,6 +501,75 @@ mod tests {
     }
 
     #[test]
+    fn fixture_source_accepts_all_extent_kinds_and_defaults_absent_to_point() {
+        let fixture = Fixture::parse(
+            include_bytes!("../../../fixtures/city/chicago-walk/fixture.json"),
+            "extent-default-test",
+        )
+        .unwrap();
+        assert_eq!(fixture.sources[0].extent, ExtentDescriptor::Point);
+
+        for (extent, expected) in [
+            (r#"{"kind": "point"}"#, ExtentDescriptor::Point),
+            (
+                r#"{"kind": "multi_point", "count": 3}"#,
+                ExtentDescriptor::MultiPoint { count: 3 },
+            ),
+            (
+                r#"{"kind": "line_segment", "length_m": 6.0}"#,
+                ExtentDescriptor::LineSegment { length_m: 6.0 },
+            ),
+            (
+                r#"{"kind": "stereo_image", "width_m": 4.0}"#,
+                ExtentDescriptor::StereoImage { width_m: 4.0 },
+            ),
+        ] {
+            let text = include_str!("../../../fixtures/city/chicago-walk/fixture.json").replace(
+                r#""position_m": [12.5, -12.0, 1.5]"#,
+                &format!(
+                    r#""extent": {extent},
+      "position_m": [12.5, -12.0, 1.5]"#
+                ),
+            );
+            let fixture = Fixture::parse(text.as_bytes(), "extent-test").unwrap();
+            assert_eq!(fixture.sources[0].extent, expected);
+        }
+    }
+
+    #[test]
+    fn fixture_source_rejects_invalid_and_unknown_extent_shapes() {
+        for (extent, expected) in [
+            (
+                r#"{"kind": "multi_point", "count": 0}"#,
+                "extent.count must be >= 1",
+            ),
+            (
+                r#"{"kind": "line_segment", "length_m": 0.0}"#,
+                "extent.length_m must be > 0",
+            ),
+            (
+                r#"{"kind": "stereo_image", "width_m": -1.0}"#,
+                "extent.width_m must be > 0",
+            ),
+            (r#"{"kind": "line_segment"}"#, "missing field `length_m`"),
+            (r#"{"kind": "point", "count": 1}"#, "unknown field `count`"),
+        ] {
+            let text = include_str!("../../../fixtures/city/chicago-walk/fixture.json").replace(
+                r#""position_m": [12.5, -12.0, 1.5]"#,
+                &format!(
+                    r#""extent": {extent},
+      "position_m": [12.5, -12.0, 1.5]"#
+                ),
+            );
+            let error = Fixture::parse(text.as_bytes(), "extent-test").unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in extent error, got: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn megablock_fixture_matches_the_synthesized_grid_frame() {
         let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/city/megablock/fixture.json");
@@ -469,12 +589,17 @@ mod tests {
             fixture.sources[0].directivity,
             FixtureDirectivity::default()
         );
+        assert_eq!(fixture.sources[0].extent, ExtentDescriptor::Point);
         assert_eq!(fixture.sources[1].asset_id, "artillery-impact");
         assert_eq!(fixture.sources[1].reference_level.db_spl, 155.0);
         assert!(!fixture.sources[1].default_enabled);
         assert_eq!(
             fixture.sources[1].directivity,
             FixtureDirectivity::default()
+        );
+        assert_eq!(
+            fixture.sources[1].extent,
+            ExtentDescriptor::LineSegment { length_m: 6.0 }
         );
         assert_eq!(
             fixture.sources[1].initial_position().unwrap(),
@@ -486,10 +611,11 @@ mod tests {
         assert_eq!(
             fixture.sources[2].directivity,
             FixtureDirectivity {
-                dipole_weight: 0.75,
+                dipole_weight: 0.5,
                 dipole_power: 2.0,
             }
         );
+        assert_eq!(fixture.sources[2].extent, ExtentDescriptor::Point);
         assert_eq!(
             fixture.sources[2].initial_position().unwrap(),
             EnuVector3::new(245.0, 245.0, 1.5)
@@ -505,9 +631,10 @@ mod tests {
             fixture.sources[3].directivity,
             FixtureDirectivity::default()
         );
+        assert_eq!(fixture.sources[3].extent, ExtentDescriptor::Point);
         assert_eq!(
             fixture.sources[3].initial_position().unwrap(),
-            EnuVector3::new(482.5, 292.5, 1.5)
+            EnuVector3::new(482.5, 292.5, 60.0)
         );
         let text = std::fs::read_to_string(fixture_path).unwrap();
         assert!(text.contains("4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843"));

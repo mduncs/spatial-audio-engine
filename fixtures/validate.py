@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Dependency-free semantic checks for the controlled Phase A fixtures."""
+"""JSON Schema and semantic checks for the Fightbox fixture set.
+
+With no arguments, every ``fixture.json`` and ``*-fixture.json`` below this
+directory is validated. Paths passed on the command line limit validation to
+those fixtures, which is useful for checking an isolated fixture or mutation.
+"""
 
 import json
 import hashlib
@@ -9,16 +14,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-SCHEMA_PATH = ROOT / "fixture.schema.json"
 ASSETS_DIR = ROOT / "assets"
 ASSET_SCHEMA_PATH = ASSETS_DIR / "asset.schema.json"
-FIXTURES = (
+# Canonical fixtures with checks beyond their JSON Schema contracts.
+SEMANTIC_FIXTURES = (
     (ROOT / "s0-free-field" / "fixture.json", "s0-free-field-100m-approach", "S0"),
     (ROOT / "s3-corner" / "fixture.json", "s3-masonry-building-corner", "S3"),
     (ROOT / "s6a-four-sources" / "fixture.json", "s6a-four-sources-one-moving", "S6A"),
 )
-SCHEMA_ID_V1 = "https://fightbox.dev/schema/fixture-1.json"
-SCHEMA_ID_S6A = "https://fightbox.dev/schema/fixture-s6a-1.json"
+DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 EPSILON = 1e-9
 ANALYTIC_EPSILON = 1e-6
 AZIMUTH_EPSILON_DEGREES = 1e-5
@@ -66,6 +70,135 @@ def reject_nonfinite(value):
 def load_json(path):
     with path.open(encoding="utf-8") as handle:
         return json.load(handle, parse_constant=reject_nonfinite)
+
+
+def display_path(path):
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def discover_fixture_paths():
+    return sorted(
+        path
+        for path in ROOT.rglob("*.json")
+        if path.name == "fixture.json" or path.name.endswith("-fixture.json")
+    )
+
+
+def load_fixture_documents(paths, errors):
+    fixtures = {}
+    for path in paths:
+        label = display_path(path)
+        try:
+            fixture = load_json(path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            errors.append(f"{label}: {error}")
+            continue
+        if not isinstance(fixture, dict):
+            errors.append(f"{label}: fixture root must be an object")
+            continue
+        finite_numbers(fixture, label, errors)
+        fixtures[path.resolve()] = fixture
+    return fixtures
+
+
+def load_schema_validators(required_versions, errors):
+    try:
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError
+    except ImportError as error:
+        raise RuntimeError(
+            "Python package 'jsonschema' with Draft 2020-12 support is required; "
+            "install it with: python3 -m pip install jsonschema"
+        ) from error
+
+    schemas = {}
+    schema_paths = {}
+    for schema_path in sorted(ROOT.glob("*.schema.json")):
+        label = schema_path.name
+        try:
+            schema = load_json(schema_path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            errors.append(f"{label}: {error}")
+            continue
+        version = schema.get("properties", {}).get("schema_version", {}).get("const")
+        if version not in required_versions:
+            continue
+        if not isinstance(version, str) or not version:
+            errors.append(f"{label}: properties.schema_version.const must be a string")
+            continue
+        if version in schemas:
+            errors.append(
+                f"{label}: schema_version {version!r} is already declared by "
+                f"{schema_paths[version].name}"
+            )
+            continue
+        schemas[version] = schema
+        schema_paths[version] = schema_path
+
+    validators = {}
+    for version in sorted(required_versions):
+        schema = schemas.get(version)
+        if schema is None:
+            errors.append(f"schema_version {version!r}: no schema declares this const")
+            continue
+        schema_path = schema_paths[version]
+        label = schema_path.name
+        if schema.get("$schema") != DRAFT_2020_12:
+            errors.append(f"{label}: $schema must declare Draft 2020-12")
+            continue
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as error:
+            location = ".".join(str(part) for part in error.absolute_path) or "$"
+            errors.append(f"{label}: invalid Draft 2020-12 schema at {location}: {error.message}")
+            continue
+        validators[version] = Draft202012Validator(schema)
+    return validators
+
+
+def format_json_path(parts):
+    result = "$"
+    for part in parts:
+        if isinstance(part, int):
+            result += f"[{part}]"
+        else:
+            result += f".{part}"
+    return result
+
+
+def validate_fixture_schemas(fixtures, validators, errors):
+    valid_paths = set()
+    for path, fixture in fixtures.items():
+        label = display_path(path)
+        version = fixture.get("schema_version")
+        if not isinstance(version, str) or not version:
+            errors.append(f"{label}: schema_version must be a non-empty string")
+            continue
+        validator = validators.get(version)
+        if validator is None:
+            errors.append(f"{label}: no valid schema is available for schema_version {version!r}")
+            continue
+        try:
+            schema_errors = sorted(
+                validator.iter_errors(fixture),
+                key=lambda error: (
+                    tuple(str(part) for part in error.absolute_path),
+                    error.message,
+                ),
+            )
+        except Exception as error:
+            errors.append(f"{label}: JSON Schema validation could not run: {error}")
+            continue
+        if schema_errors:
+            for error in schema_errors:
+                location = format_json_path(error.absolute_path)
+                errors.append(f"{label}: {location}: {error.message}")
+            continue
+        valid_paths.add(path)
+    return valid_paths
 
 
 def finite_numbers(value, path, errors):
@@ -771,54 +904,56 @@ def check_s3(fixture, label, valid_triangles, errors):
         errors.append(f"{label}: pathing toggles must uniquely be on,off")
 
 
-def main():
-    errors = []
-    try:
-        schema = load_json(SCHEMA_PATH)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        print(f"fixture-validation: failed\n- schema: {error}", file=sys.stderr)
-        return 1
-    if schema.get("$id") != SCHEMA_ID_V1:
-        errors.append("schema: unexpected $id")
-    if schema.get("properties", {}).get("schema_version", {}).get("const") != "fightbox.fixture.v1":
-        errors.append("schema: schema_version contract mismatch")
-    if schema.get("properties", {}).get("gate", {}).get("enum") != ["S0", "S3"]:
-        errors.append("schema: gate contract mismatch")
+def main(arguments=None):
+    if arguments is None:
+        arguments = sys.argv[1:]
 
-    # Load S6a schema
-    s6a_schema_path = ROOT / "s6a.schema.json"
+    WARNINGS.clear()
+    errors = []
+    explicit_paths = bool(arguments)
+    if explicit_paths:
+        fixture_paths = [Path(argument).expanduser().resolve() for argument in arguments]
+    else:
+        fixture_paths = discover_fixture_paths()
+    if not fixture_paths:
+        errors.append("no fixture JSON files found")
+
+    fixtures = load_fixture_documents(fixture_paths, errors)
+    required_versions = {
+        fixture.get("schema_version")
+        for fixture in fixtures.values()
+        if isinstance(fixture.get("schema_version"), str)
+    }
     try:
-        s6a_schema = load_json(s6a_schema_path)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        errors.append(f"s6a.schema.json: {error}")
-        s6a_schema = None
-    if s6a_schema and s6a_schema.get("$id") != SCHEMA_ID_S6A:
-        errors.append("s6a.schema.json: unexpected $id")
+        validators = load_schema_validators(required_versions, errors)
+    except RuntimeError as error:
+        print("fixture-validation: failed", file=sys.stderr)
+        print(f"- validator: {error}", file=sys.stderr)
+        print("- no fixtures were reported as valid", file=sys.stderr)
+        return 2
+    schema_valid_paths = validate_fixture_schemas(fixtures, validators, errors)
 
     # Validate additive file-backed records even when no checked-in fixture
     # currently binds them. Generated descriptor semantics remain owned by the
     # existing asset validator.
-    for descriptor_path in sorted(ASSETS_DIR.glob("*.json")):
-        if descriptor_path == ASSET_SCHEMA_PATH:
-            continue
-        try:
-            descriptor = load_json(descriptor_path)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            errors.append(f"{descriptor_path.relative_to(ROOT)}: {error}")
-            continue
-        check_wav_asset_descriptor(descriptor, descriptor_path, errors)
+    if not explicit_paths:
+        for descriptor_path in sorted(ASSETS_DIR.glob("*.json")):
+            if descriptor_path == ASSET_SCHEMA_PATH:
+                continue
+            try:
+                descriptor = load_json(descriptor_path)
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"{descriptor_path.relative_to(ROOT)}: {error}")
+                continue
+            check_wav_asset_descriptor(descriptor, descriptor_path, errors)
 
-    fixture_count = 0
     triangle_count = 0
-    for path, fixture_id, gate in FIXTURES:
-        label = path.relative_to(ROOT).as_posix()
-        try:
-            fixture = load_json(path)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            errors.append(f"{label}: {error}")
+    for path, fixture_id, gate in SEMANTIC_FIXTURES:
+        resolved_path = path.resolve()
+        if resolved_path not in schema_valid_paths:
             continue
-        fixture_count += 1
-        finite_numbers(fixture, label, errors)
+        label = path.relative_to(ROOT).as_posix()
+        fixture = fixtures[resolved_path]
         if not check_contract(fixture, label, fixture_id, gate, errors):
             continue
 
@@ -849,7 +984,7 @@ def main():
         return 1
     for warning in WARNINGS:
         print(f"WARN    {warning}", file=sys.stderr)
-    print(json.dumps({"fixture_validation": "ok", "fixtures": fixture_count, "triangles": triangle_count}, separators=(",", ":")))
+    print(json.dumps({"fixture_validation": "ok", "fixtures": len(fixtures), "triangles": triangle_count}, separators=(",", ":")))
     return 0
 
 

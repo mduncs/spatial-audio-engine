@@ -20,8 +20,8 @@ pub const VERIFY_RESULT: &str = "fightbox.verify-result.v1";
 
 /// The fixture schema version this CLI accepts (mirrors
 /// `fixture.schema.json`, which — like `s6a.schema.json` — now expresses the
-/// optional, strictly validated source directivity object directly; parser and
-/// JSON Schema are kept in parity by test under the same version).
+/// optional, strictly validated source directivity and extent objects directly;
+/// parser and JSON Schema are kept in parity by test under the same version).
 pub const FIXTURE: &str = "fightbox.fixture.v1";
 /// The asset descriptor schema version this CLI accepts.
 pub const ASSET_DESCRIPTOR: &str = "fightbox.asset-descriptor.v1";
