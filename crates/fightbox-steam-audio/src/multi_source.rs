@@ -10,7 +10,7 @@ use super::*;
 use crate::StageOutputGains;
 use crate::backend_snapshot::{
     SteamDirectParams, SteamPropagationSnapshot, SteamReflectionParams, SteamSourcePropagation,
-    api_enu_to_steam, fixed_path_sh, path_coefficient_count,
+    SteamWidthState, api_enu_to_steam, fixed_path_sh, path_coefficient_count,
 };
 use crate::governor::{
     GovernorRenderSnapshot, GovernorSimulationPass, QualityGovernor, QualityGovernorTelemetry,
@@ -21,9 +21,11 @@ use crate::motion_smoothing::{
     propagation_delay_samples,
 };
 use crate::probe_influence::SerializedProbeInfluences;
-use crate::propagation_delay::PropagationDelayLine;
+use crate::propagation_delay::{PropagationDelayLine, TELEPORT_DELAY_STEP_SECONDS};
+use crate::width_render::WIDTH_RENDERER_REVISION;
+use crate::width_render::{DECLARED_LATENCY_SAMPLES, LineWidthRenderer, line_geometry};
 use crate::{MemoryTrackingStatus, QualityTier, SessionMemoryTelemetry};
-use fightbox_api::{Directivity, EnuVector3 as ApiEnuVector3, Pose};
+use fightbox_api::{Directivity, EnuVector3 as ApiEnuVector3, ExtentDescriptor, Pose};
 use fightbox_runtime::SnapshotPublication;
 use fightbox_runtime::backend::{
     BackendRenderError, BackendSourceBlock, ListenerOrientation, MAX_ACTIVE_SOURCES,
@@ -190,6 +192,7 @@ pub(crate) struct MultiSourceSimulation {
     config: S3SimulationConfig,
     source_directivities: [Directivity; MAX_ACTIVE_SOURCES],
     source_occlusion_modes: [DirectOcclusionMode; MAX_ACTIVE_SOURCES],
+    source_extents: [ExtentDescriptor; MAX_ACTIVE_SOURCES],
     frame: SimulationFrame,
     valid_update: bool,
     snapshot: SteamPropagationSnapshot,
@@ -432,7 +435,14 @@ impl MultiSourceSimulation {
             let source_snapshot = &mut self.snapshot.sources[index];
             source_snapshot.active = self.frame.active[index];
             source_snapshot.source_position = self.frame.sources[index].position;
+            source_snapshot.source_forward = self.frame.sources[index].forward;
+            source_snapshot.source_up = self.frame.sources[index].up;
             source_snapshot.linear_velocity_mps = self.frame.source_linear_velocities_mps[index];
+            source_snapshot.width = width_snapshot(
+                self.source_extents[index],
+                self.frame.sources[index],
+                self.frame.listener.position,
+            );
             let mut outputs = ffi::IPLSimulationOutputs::zeroed();
             ffi::source_get_outputs(self.world.source(index), flag, &mut outputs);
             match flag {
@@ -553,6 +563,30 @@ fn same_position(left: SteamVector3, right: SteamVector3) -> bool {
     left.x.to_bits() == right.x.to_bits()
         && left.y.to_bits() == right.y.to_bits()
         && left.z.to_bits() == right.z.to_bits()
+}
+
+fn width_snapshot(
+    descriptor: ExtentDescriptor,
+    source: SteamPose,
+    listener_position: SteamVector3,
+) -> SteamWidthState {
+    let (geometric_k, phi_eff_radians) = match descriptor {
+        ExtentDescriptor::LineSegment { length_m } => {
+            let geometry =
+                line_geometry(source.position, source.forward, listener_position, length_m);
+            (geometry.k, geometry.phi_eff_radians)
+        }
+        // Wave 11 v1 is deliberately LineSegment-only. Keep the descriptor
+        // visible while proving every other kind remains on the point path.
+        _ => (0.0, 0.0),
+    };
+    SteamWidthState {
+        descriptor,
+        geometric_k,
+        phi_eff_radians,
+        declared_latency_samples: DECLARED_LATENCY_SAMPLES,
+        renderer_revision: WIDTH_RENDERER_REVISION,
+    }
 }
 
 fn radial_velocity_mps(
@@ -729,6 +763,11 @@ impl OwnedAudioBuffer {
     }
 
     fn write_mono(&mut self, samples: &mut [f32]) {
+        debug_assert_eq!(self.channels, 1);
+        self.write_interleaved(samples);
+    }
+
+    fn write_interleaved(&mut self, samples: &mut [f32]) {
         let mut raw = self.raw();
         ffi::audio_buffer_deinterleave(handle(self.context), samples, &mut raw);
     }
@@ -763,6 +802,16 @@ struct SourceRenderState {
     guard_reactivation_history: bool,
     reactivation_epoch_samples: usize,
     quality_gains: [f32; 3],
+    width: Option<LineWidthRenderState>,
+}
+
+struct LineWidthRenderState {
+    length_m: f32,
+    renderer: LineWidthRenderer,
+    plus_binaural_effect: usize,
+    minus_binaural_effect: usize,
+    presentation: OwnedAudioBuffer,
+    direct: OwnedAudioBuffer,
 }
 
 pub(crate) struct MultiSourceRenderGraph {
@@ -776,6 +825,8 @@ pub(crate) struct MultiSourceRenderGraph {
     ambisonics_decode: usize,
     mono_work: Vec<f32>,
     stereo_work: Vec<f32>,
+    width_work: Vec<f32>,
+    width_feed_work: Vec<f32>,
     publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
     stage_output_gain_writer: Option<fightbox_runtime::SnapshotWriter<StageOutputGains>>,
     stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
@@ -846,6 +897,9 @@ impl MultiSourceRenderGraph {
                     state.guard_reactivation_history = true;
                 }
                 state.propagation_delay.invalidate();
+                if let Some(width) = &mut state.width {
+                    width.renderer.reset();
+                }
                 state.last_propagation_observation = None;
                 state.reactivation_epoch_samples = 0;
             }
@@ -978,7 +1032,15 @@ impl MultiSourceRenderGraph {
             delay_target_samples.to_bits(),
             radial_velocity_mps.to_bits(),
         );
+        let mut width_teleported = false;
         if state.last_propagation_observation != Some(observation) {
+            width_teleported =
+                state
+                    .last_propagation_observation
+                    .is_some_and(|(_, previous_delay_bits, _)| {
+                        (delay_target_samples - f32::from_bits(previous_delay_bits)).abs()
+                            > TELEPORT_DELAY_STEP_SECONDS * self.audio.sample_rate_hz as f32
+                    });
             if radial_velocity_mps == 0.0 {
                 state
                     .propagation_delay
@@ -1015,8 +1077,6 @@ impl MultiSourceRenderGraph {
 
         let mut input = state.input.raw();
         if quality_ramps[0].is_audible() {
-            let mut direct_mono = state.direct_mono.raw();
-            let mut direct_stereo = state.direct_stereo.raw();
             // DirectEffect retains the preceding parameter frame and interpolates
             // through this block toward the exact backend endpoint supplied here.
             let mut direct_params = ffi::IPLDirectEffectParams {
@@ -1032,37 +1092,106 @@ impl MultiSourceRenderGraph {
                 occlusion: smoothed.direct.occlusion,
                 transmission: smoothed.direct.transmission,
             };
-            ffi::direct_effect_apply(
-                handle(state.direct_effect),
-                &mut direct_params,
-                &mut input,
-                &mut direct_mono,
-            );
-            let mut binaural_params = ffi::IPLBinauralEffectParams {
-                direction: relative_direction_steam(
+            if let Some(width) = &mut state.width {
+                let geometry = line_geometry(
                     smoothed.source_position,
+                    propagation.source_forward,
                     smoothed.listener_position,
-                    listener,
-                ),
-                interpolation: ffi::IPL_HRTFINTERPOLATION_BILINEAR,
-                spatialBlend: 1.0,
-                hrtf: handle(self.hrtf),
-                peakDelays: core::ptr::null_mut(),
-            };
-            ffi::binaural_effect_apply(
-                handle(state.binaural_effect),
-                &mut binaural_params,
-                &mut direct_mono,
-                &mut direct_stereo,
-            );
-            state.direct_stereo.read_interleaved(&mut self.stereo_work);
-            accumulate_stereo_ramped(
-                &self.stereo_work,
-                output_left,
-                output_right,
-                stage_output_gains.direct,
-                quality_ramps[0],
-            );
+                    width.length_m,
+                );
+                width.renderer.render_presentation(
+                    &self.mono_work,
+                    geometry.k,
+                    width_teleported,
+                    &mut self.width_work,
+                );
+                width.presentation.write_interleaved(&mut self.width_work);
+                let mut width_input = width.presentation.raw();
+                let mut width_direct = width.direct.raw();
+                ffi::direct_effect_apply(
+                    handle(state.direct_effect),
+                    &mut direct_params,
+                    &mut width_input,
+                    &mut width_direct,
+                );
+                width.direct.read_interleaved(&mut self.width_work);
+
+                let feeds = [
+                    (state.binaural_effect, geometry.center),
+                    (width.plus_binaural_effect, geometry.plus_endpoint),
+                    (width.minus_binaural_effect, geometry.minus_endpoint),
+                ];
+                for (channel, (binaural_effect, position)) in feeds.into_iter().enumerate() {
+                    for (frame, sample) in self.width_feed_work.iter_mut().enumerate() {
+                        *sample = self.width_work[frame * 3 + channel];
+                    }
+                    state.direct_mono.write_mono(&mut self.width_feed_work);
+                    let mut direct_mono = state.direct_mono.raw();
+                    let mut direct_stereo = state.direct_stereo.raw();
+                    let mut binaural_params = ffi::IPLBinauralEffectParams {
+                        direction: relative_direction_steam(
+                            position,
+                            smoothed.listener_position,
+                            listener,
+                        ),
+                        interpolation: ffi::IPL_HRTFINTERPOLATION_BILINEAR,
+                        spatialBlend: 1.0,
+                        hrtf: handle(self.hrtf),
+                        peakDelays: core::ptr::null_mut(),
+                    };
+                    ffi::binaural_effect_apply(
+                        handle(binaural_effect),
+                        &mut binaural_params,
+                        &mut direct_mono,
+                        &mut direct_stereo,
+                    );
+                    state.direct_stereo.read_interleaved(&mut self.stereo_work);
+                    accumulate_stereo_ramped(
+                        &self.stereo_work,
+                        output_left,
+                        output_right,
+                        stage_output_gains.direct,
+                        quality_ramps[0],
+                    );
+                }
+            } else {
+                // Structural legacy bypass. Point, MultiPoint, StereoImage, and
+                // the default/extent-absent descriptor execute the unchanged
+                // mono DirectEffect -> point BinauralEffect path.
+                let mut direct_mono = state.direct_mono.raw();
+                let mut direct_stereo = state.direct_stereo.raw();
+                ffi::direct_effect_apply(
+                    handle(state.direct_effect),
+                    &mut direct_params,
+                    &mut input,
+                    &mut direct_mono,
+                );
+                let mut binaural_params = ffi::IPLBinauralEffectParams {
+                    direction: relative_direction_steam(
+                        smoothed.source_position,
+                        smoothed.listener_position,
+                        listener,
+                    ),
+                    interpolation: ffi::IPL_HRTFINTERPOLATION_BILINEAR,
+                    spatialBlend: 1.0,
+                    hrtf: handle(self.hrtf),
+                    peakDelays: core::ptr::null_mut(),
+                };
+                ffi::binaural_effect_apply(
+                    handle(state.binaural_effect),
+                    &mut binaural_params,
+                    &mut direct_mono,
+                    &mut direct_stereo,
+                );
+                state.direct_stereo.read_interleaved(&mut self.stereo_work);
+                accumulate_stereo_ramped(
+                    &self.stereo_work,
+                    output_left,
+                    output_right,
+                    stage_output_gains.direct,
+                    quality_ramps[0],
+                );
+            }
         }
 
         // PathEffect likewise retains its EQ/SH parameter frame and
@@ -1297,6 +1426,12 @@ impl Drop for MultiSourceRenderGraph {
             ffi::direct_effect_release(&mut direct);
             let mut binaural = handle(source.binaural_effect);
             ffi::binaural_effect_release(&mut binaural);
+            if let Some(width) = &mut source.width {
+                let mut plus = handle(width.plus_binaural_effect);
+                ffi::binaural_effect_release(&mut plus);
+                let mut minus = handle(width.minus_binaural_effect);
+                ffi::binaural_effect_release(&mut minus);
+            }
             let mut path = handle(source.path_effect);
             ffi::path_effect_release(&mut path);
             let mut reflections = handle(source.reflection_effect);
@@ -1340,7 +1475,7 @@ pub(crate) fn build_multi_source_generation(
     quality_tier: QualityTier,
 ) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
     validate_multi_source_config(mesh, baked, audio, config, descriptors, quality_tier)?;
-    let memory = session_memory_telemetry(audio, config, descriptors.len(), baked)?;
+    let memory = session_memory_telemetry(audio, config, descriptors, baked)?;
     let world = Arc::new(create_world(
         mesh,
         baked,
@@ -1359,22 +1494,27 @@ pub(crate) fn build_multi_source_generation(
     }; MAX_ACTIVE_SOURCES];
     let mut source_directivities = [Directivity::OMNIDIRECTIONAL; MAX_ACTIVE_SOURCES];
     let mut source_occlusion_modes = [config.direct_occlusion; MAX_ACTIVE_SOURCES];
+    let mut source_extents = [ExtentDescriptor::Point; MAX_ACTIVE_SOURCES];
     let mut active = [false; MAX_ACTIVE_SOURCES];
+    let listener = SteamPose::from_api(default_api_pose(ApiEnuVector3::default()))
+        .expect("canonical listener pose is valid");
     for (index, descriptor) in descriptors.iter().enumerate() {
-        source_poses[index] =
-            SteamPose::from_api(default_api_pose(descriptor.initial_position_enu)).ok_or(
-                BackendError::InvalidInput("multi-source descriptor position must be finite"),
-            )?;
+        source_poses[index] = SteamPose::from_api(descriptor.initial_pose()).ok_or(
+            BackendError::InvalidInput("multi-source descriptor position must be finite"),
+        )?;
         source_directivities[index] = descriptor.directivity;
         source_occlusion_modes[index] =
             crate::direct_occlusion_for_extent(config, descriptor.extent);
+        source_extents[index] = descriptor.extent;
         active[index] = true;
         initial.sources[index].active = true;
         initial.sources[index].source_position = source_poses[index].position;
+        initial.sources[index].source_forward = source_poses[index].forward;
+        initial.sources[index].source_up = source_poses[index].up;
+        initial.sources[index].width =
+            width_snapshot(descriptor.extent, source_poses[index], listener.position);
         initial.sources[index].configured_pathing_order = config.pathing_order as u8;
     }
-    let listener = SteamPose::from_api(default_api_pose(ApiEnuVector3::default()))
-        .expect("canonical listener pose is valid");
     let (writer, reader) = SnapshotPublication::new(initial);
     let (stage_output_gain_writer, stage_output_gains) =
         SnapshotPublication::new(StageOutputGains::UNITY);
@@ -1388,6 +1528,7 @@ pub(crate) fn build_multi_source_generation(
         stage_output_gain_writer,
         stage_output_gains,
         governor_quality,
+        descriptors,
     )?;
     let simulation = MultiSourceSimulation {
         world,
@@ -1395,6 +1536,7 @@ pub(crate) fn build_multi_source_generation(
         config,
         source_directivities,
         source_occlusion_modes,
+        source_extents,
         frame: SimulationFrame {
             listener,
             listener_linear_velocity_mps: SteamVector3::default(),
@@ -1433,10 +1575,11 @@ fn validate_multi_source_config(
         ));
     }
     if descriptors.iter().any(|descriptor| {
-        !descriptor.initial_position_enu.is_finite() || !descriptor.declared_level_db().is_finite()
+        SteamPose::from_api(descriptor.initial_pose()).is_none()
+            || !descriptor.declared_level_db().is_finite()
     }) {
         return Err(BackendError::InvalidInput(
-            "multi-source descriptor positions and reference levels must be finite",
+            "multi-source descriptor poses and reference levels must be finite and non-degenerate",
         ));
     }
     if descriptors
@@ -1494,12 +1637,16 @@ fn validate_multi_source_config(
 fn session_memory_telemetry(
     audio: AudioConfig,
     config: S3SimulationConfig,
-    source_count: usize,
+    descriptors: &[crate::MultiSourceDescriptor],
     baked: Option<&BakedProbeBatch>,
 ) -> Result<SessionMemoryTelemetry, BackendError> {
     let frames = u64::try_from(audio.frame_size)
         .map_err(|_| BackendError::InvalidInput("audio frame size must be positive"))?;
-    let sources = source_count as u64;
+    let sources = descriptors.len() as u64;
+    let wide_sources = descriptors
+        .iter()
+        .filter(|descriptor| matches!(descriptor.extent, ExtentDescriptor::LineSegment { .. }))
+        .count() as u64;
     let channels = u64::try_from(ambisonics_channel_count(config.reflection_order)?)
         .map_err(|_| BackendError::InvalidInput("Ambisonic channel count must be positive"))?;
     let ir_samples = u64::try_from(reflection_ir_size(
@@ -1527,14 +1674,18 @@ fn session_memory_telemetry(
             0
         };
     // Per source: mono input + mono direct + stereo direct + stereo path +
-    // Ambisonic reflection scratch. Shared: Ambisonic reflection mix + stereo
-    // decode target.
+    // Ambisonic reflection scratch. A line adds three-channel presentation and
+    // direct buffers. Shared: Ambisonic reflection mix + stereo decode target.
     let audio_buffer_payload_bytes = sources
         .saturating_mul(6_u64.saturating_add(channels))
+        .saturating_add(wide_sources.saturating_mul(6))
         .saturating_add(channels.saturating_add(2))
         .saturating_mul(frames)
         .saturating_mul(float_bytes);
-    let render_scratch_bytes = 3_u64.saturating_mul(frames).saturating_mul(float_bytes);
+    let width_scratch_channels = if wide_sources > 0 { 4 } else { 0 };
+    let render_scratch_bytes = (3_u64 + width_scratch_channels)
+        .saturating_mul(frames)
+        .saturating_mul(float_bytes);
     let propagation_delay_line_bytes = sources
         .saturating_mul(
             maximum_propagation_delay_samples(audio.sample_rate_hz).saturating_add(4) as u64,
@@ -1740,6 +1891,7 @@ fn create_render_graph(
     stage_output_gain_writer: fightbox_runtime::SnapshotWriter<StageOutputGains>,
     stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
     mut governor_quality: fightbox_runtime::SnapshotReader<GovernorRenderSnapshot>,
+    descriptors: &[crate::MultiSourceDescriptor],
 ) -> Result<MultiSourceRenderGraph, BackendError> {
     let context = world.context();
     let mut audio_settings = raw_audio_settings(audio);
@@ -1811,6 +1963,7 @@ fn create_render_graph(
             channels,
             maximum_delay_samples,
             initial_delay_samples,
+            descriptors[index].extent,
         )?);
     }
     let applied_governor_quality = governor_quality.read();
@@ -1826,6 +1979,9 @@ fn create_render_graph(
             state.quality_gains[1] = 0.0;
         }
     }
+    let has_line_width = descriptors
+        .iter()
+        .any(|descriptor| matches!(descriptor.extent, ExtentDescriptor::LineSegment { .. }));
     Ok(MultiSourceRenderGraph {
         world,
         config,
@@ -1838,6 +1994,22 @@ fn create_render_graph(
         ambisonics_decode: decode as usize,
         mono_work: vec![0.0; audio.frame_size as usize],
         stereo_work: vec![0.0; audio.frame_size as usize * 2],
+        width_work: vec![
+            0.0;
+            if has_line_width {
+                audio.frame_size as usize * 3
+            } else {
+                0
+            }
+        ],
+        width_feed_work: vec![
+            0.0;
+            if has_line_width {
+                audio.frame_size as usize
+            } else {
+                0
+            }
+        ],
         publication,
         stage_output_gain_writer: Some(stage_output_gain_writer),
         stage_output_gains,
@@ -1886,8 +2058,15 @@ fn create_source_render_state(
     channels: i32,
     maximum_delay_samples: usize,
     initial_delay_samples: f32,
+    extent: ExtentDescriptor,
 ) -> Result<SourceRenderState, BackendError> {
-    let mut direct_settings = ffi::IPLDirectEffectSettings { numChannels: 1 };
+    let line_length_m = match extent {
+        ExtentDescriptor::LineSegment { length_m } => Some(length_m),
+        _ => None,
+    };
+    let mut direct_settings = ffi::IPLDirectEffectSettings {
+        numChannels: if line_length_m.is_some() { 3 } else { 1 },
+    };
     let mut direct = core::ptr::null_mut();
     sdk_status(
         "iplDirectEffectCreate",
@@ -1934,6 +2113,38 @@ fn create_source_render_state(
             &mut reflection,
         ),
     )?;
+    let width = line_length_m
+        .map(|length_m| {
+            let mut plus_binaural = core::ptr::null_mut();
+            sdk_status(
+                "iplBinauralEffectCreate(line plus endpoint)",
+                ffi::binaural_effect_create(
+                    context,
+                    audio_settings,
+                    &mut binaural_settings,
+                    &mut plus_binaural,
+                ),
+            )?;
+            let mut minus_binaural = core::ptr::null_mut();
+            sdk_status(
+                "iplBinauralEffectCreate(line minus endpoint)",
+                ffi::binaural_effect_create(
+                    context,
+                    audio_settings,
+                    &mut binaural_settings,
+                    &mut minus_binaural,
+                ),
+            )?;
+            Ok::<_, BackendError>(LineWidthRenderState {
+                length_m,
+                renderer: LineWidthRenderer::new(audio_settings.samplingRate),
+                plus_binaural_effect: plus_binaural as usize,
+                minus_binaural_effect: minus_binaural as usize,
+                presentation: OwnedAudioBuffer::allocate(context, 3, audio_settings.frameSize)?,
+                direct: OwnedAudioBuffer::allocate(context, 3, audio_settings.frameSize)?,
+            })
+        })
+        .transpose()?;
     Ok(SourceRenderState {
         direct_effect: direct as usize,
         binaural_effect: binaural as usize,
@@ -1964,6 +2175,7 @@ fn create_source_render_state(
         guard_reactivation_history: false,
         reactivation_epoch_samples: 0,
         quality_gains: [1.0; 3],
+        width,
     })
 }
 
@@ -1971,9 +2183,15 @@ fn create_source_render_state(
 #[path = "multi_source_teleport_tests.rs"]
 mod teleport_tests;
 
-#[cfg(test)] #[allow(unsafe_code)] #[path = "reflection_budget_diagnostics.rs"] mod reflection_budget_diagnostics;
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[path = "reflection_budget_diagnostics.rs"]
+mod reflection_budget_diagnostics;
 
-#[cfg(test)] #[allow(unsafe_code)] #[path = "width_binaural_prototype.rs"] mod width_binaural_prototype;
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[path = "width_binaural_prototype.rs"]
+mod width_binaural_prototype;
 
 #[cfg(test)]
 mod tests {
@@ -2378,6 +2596,7 @@ mod tests {
     fn directivity_capture(
         directivity: Option<Directivity>,
         source_forward: ApiEnuVector3,
+        extent: Option<ExtentDescriptor>,
     ) -> (Vec<f32>, SteamDirectParams) {
         let mesh = SceneMesh::controlled_s3_corner();
         let audio = AudioConfig {
@@ -2389,6 +2608,9 @@ mod tests {
         let mut descriptor = crate::MultiSourceDescriptor::at(source_position);
         if let Some(directivity) = directivity {
             descriptor = descriptor.with_directivity(directivity);
+        }
+        if let Some(extent) = extent {
+            descriptor = descriptor.with_extent(extent);
         }
         let descriptors = [descriptor];
         let (mut simulation, mut render) = build_multi_source_generation(
@@ -2452,11 +2674,18 @@ mod tests {
     #[test]
     fn weight_zero_direct_render_is_bit_identical_to_the_prechange_fingerprint() {
         let toward = ApiEnuVector3::new(2.0, 3.0, 0.0);
-        let (legacy_default, legacy_direct) = directivity_capture(None, toward);
+        let (legacy_default, legacy_direct) = directivity_capture(None, toward, None);
         let (explicit_omni, explicit_direct) =
-            directivity_capture(Some(Directivity::OMNIDIRECTIONAL), toward);
+            directivity_capture(Some(Directivity::OMNIDIRECTIONAL), toward, None);
+        let (explicit_point, point_direct) = directivity_capture(
+            Some(Directivity::OMNIDIRECTIONAL),
+            toward,
+            Some(ExtentDescriptor::Point),
+        );
         assert_eq!(sample_bits(&explicit_omni), sample_bits(&legacy_default));
+        assert_eq!(sample_bits(&explicit_point), sample_bits(&legacy_default));
         assert_eq!(explicit_direct, legacy_direct);
+        assert_eq!(point_direct, legacy_direct);
 
         // Captured before directivity was plumbed through `source_inputs`: this
         // pins the same deterministic scene, tone, direct effect, and HRTF PCM.
@@ -2473,6 +2702,61 @@ mod tests {
     }
 
     #[test]
+    fn line_segment_uses_one_source_slot_and_three_directional_feeds() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let source_position = ApiEnuVector3::new(2.0, 3.0, 1.5);
+        let listener_position = ApiEnuVector3::new(4.0, 6.0, 1.5);
+        let descriptors = [crate::MultiSourceDescriptor::at(source_position)
+            .with_extent(ExtentDescriptor::LineSegment { length_m: 6.0 })];
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        simulation.update_inputs(&one_source_update(true, source_position, listener_position));
+        simulation.run_direct().unwrap();
+
+        assert_eq!(simulation.world.source_count, 1);
+        assert_eq!(render.sources.len(), 1);
+        let width = render.sources[0]
+            .width
+            .as_ref()
+            .expect("LineSegment must own width state");
+        assert_ne!(render.sources[0].binaural_effect, 0);
+        assert_ne!(width.plus_binaural_effect, 0);
+        assert_ne!(width.minus_binaural_effect, 0);
+
+        let mut energy = 0.0_f64;
+        let mut global_frame = 0_usize;
+        for _ in 0..24 {
+            let input = (0..audio.frame_size)
+                .map(|_| {
+                    let sample = (TAU * 731.0 * global_frame as f32 / audio.sample_rate_hz as f32)
+                        .sin()
+                        * 0.125;
+                    global_frame += 1;
+                    sample
+                })
+                .collect::<Vec<_>>();
+            let (left, right) = render_one_source_block(&mut render, &input);
+            for sample in left.into_iter().chain(right) {
+                assert!(sample.is_finite());
+                energy += f64::from(sample * sample);
+            }
+        }
+        assert!(energy > 1.0e-6, "line renderer produced no direct output");
+    }
+
+    #[test]
     fn directional_source_outputs_less_direct_energy_when_facing_away() {
         let directivity = Directivity {
             dipole_weight: 0.7,
@@ -2480,8 +2764,8 @@ mod tests {
         };
         let toward_axis = ApiEnuVector3::new(2.0, 3.0, 0.0);
         let away_axis = ApiEnuVector3::new(-2.0, -3.0, 0.0);
-        let (toward, toward_direct) = directivity_capture(Some(directivity), toward_axis);
-        let (away, away_direct) = directivity_capture(Some(directivity), away_axis);
+        let (toward, toward_direct) = directivity_capture(Some(directivity), toward_axis, None);
+        let (away, away_direct) = directivity_capture(Some(directivity), away_axis, None);
         let toward_energy = energy(&toward);
         let away_energy = energy(&away);
 
@@ -2608,6 +2892,65 @@ mod tests {
             simulation.run_direct(),
             Err(SimulationError::InvalidUpdate)
         ));
+    }
+
+    #[test]
+    fn snapshot_seeds_pose_and_publishes_line_width_state_only() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let source_pose = Pose {
+            position: ApiEnuVector3::new(0.0, 5.0, 0.0),
+            forward: ApiEnuVector3::new(1.0, 0.0, 0.0),
+            up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+        };
+        let descriptors = [
+            crate::MultiSourceDescriptor::at(source_pose.position)
+                .with_initial_pose(source_pose)
+                .with_extent(ExtentDescriptor::LineSegment { length_m: 6.0 }),
+            crate::MultiSourceDescriptor::at(source_pose.position)
+                .with_initial_pose(source_pose)
+                .with_extent(ExtentDescriptor::StereoImage { width_m: 6.0 }),
+        ];
+        let (simulation, render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+
+        assert_eq!(simulation.world.source_count, 2);
+        assert!(render.sources[0].width.is_some());
+        assert!(render.sources[1].width.is_none());
+
+        let line = simulation.snapshot.sources[0];
+        assert_eq!(line.source_forward, api_enu_to_steam(source_pose.forward));
+        assert_eq!(line.source_up, api_enu_to_steam(source_pose.up));
+        assert_eq!(
+            line.width.descriptor,
+            ExtentDescriptor::LineSegment { length_m: 6.0 }
+        );
+        let expected_k = 3.0_f32 / (5.0_f32 * 5.0 + 3.0_f32 * 3.0).sqrt();
+        assert!((line.width.geometric_k - expected_k).abs() <= 2.0e-6);
+        assert_eq!(
+            line.width.phi_eff_radians.to_bits(),
+            (crate::width_render::PHI_MAX_RADIANS * line.width.geometric_k).to_bits()
+        );
+        assert_eq!(line.width.declared_latency_samples, 0);
+
+        let stereo = simulation.snapshot.sources[1].width;
+        assert_eq!(
+            stereo.descriptor,
+            ExtentDescriptor::StereoImage { width_m: 6.0 }
+        );
+        assert_eq!(stereo.geometric_k.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(stereo.phi_eff_radians.to_bits(), 0.0_f32.to_bits());
     }
 
     #[test]

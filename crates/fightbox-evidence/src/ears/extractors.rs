@@ -19,7 +19,7 @@ pub struct Pcm<'a> {
 }
 
 impl Pcm<'_> {
-    fn validate(self) -> Result<(), AnalysisError> {
+    pub(crate) fn validate(self) -> Result<(), AnalysisError> {
         if self.sample_rate_hz < 8_000 {
             return Err(AnalysisError::UnsupportedSampleRate(self.sample_rate_hz));
         }
@@ -48,10 +48,24 @@ impl Pcm<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisError {
+    /// The extractor requires at least an 8 kHz sample rate.
     UnsupportedSampleRate(u32),
+    /// Deinterleaved stereo channels have different frame counts.
     ChannelLengthMismatch { left: usize, right: usize },
+    /// The capture is shorter than the extractor's minimum evidence window.
     CaptureTooShort { samples: usize },
+    /// PCM or derived input contains a non-finite sample.
     NonFiniteSample,
+    /// A geometry track is not aligned one-for-one with the PCM frames.
+    TrackLengthMismatch {
+        frames: usize,
+        distances: usize,
+        angular_subtenses: Option<usize>,
+    },
+    /// A geometry track contains a non-finite or out-of-domain value.
+    InvalidTrack,
+    /// Window, hop, frequency, lag, clarity, or energy settings are invalid.
+    InvalidConfiguration,
 }
 
 /// Scalar evidence used by Gate 0 and later capture comparisons.

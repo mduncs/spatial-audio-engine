@@ -21,6 +21,8 @@ mod probe_influence;
 #[cfg(any(feature = "linked-sdk", test))]
 mod propagation_delay;
 mod status;
+#[cfg(any(feature = "linked-sdk", test))]
+mod width_render;
 #[allow(unsafe_code)]
 mod world_swap;
 pub use elevated_probes::ElevatedProbeLayer;
@@ -907,11 +909,14 @@ pub struct S3SimulationConfig {
 /// [`fightbox_runtime::backend::SimulationRunner::update_inputs`] call.
 /// Directivity is immutable world data; its lobe follows the forward axis in
 /// the source pose supplied through that runtime update.
-/// Extent is also immutable world data and controls the source's direct
-/// occlusion footprint; it does not yet widen spatial audio rendering.
+/// Extent is also immutable world data. It controls the source's direct
+/// occlusion footprint; `LineSegment` additionally selects the Wave 11 width
+/// renderer, while every other descriptor retains point rendering in v1.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MultiSourceDescriptor {
     pub initial_position_enu: fightbox_api::EnuVector3,
+    initial_forward_enu: fightbox_api::EnuVector3,
+    initial_up_enu: fightbox_api::EnuVector3,
     reference_level: fightbox_api::ReferenceLevel,
     directivity: fightbox_api::Directivity,
     extent: fightbox_api::ExtentDescriptor,
@@ -922,10 +927,24 @@ impl MultiSourceDescriptor {
     pub const fn at(initial_position_enu: fightbox_api::EnuVector3) -> Self {
         Self {
             initial_position_enu,
+            initial_forward_enu: fightbox_api::EnuVector3::new(0.0, 1.0, 0.0),
+            initial_up_enu: fightbox_api::EnuVector3::new(0.0, 0.0, 1.0),
             reference_level: fightbox_api::ReferenceLevel::CreativeDb { db: 0.0 },
             directivity: fightbox_api::Directivity::OMNIDIRECTIONAL,
             extent: fightbox_api::ExtentDescriptor::Point,
         }
+    }
+
+    /// Seeds a complete pose before the first simulation update.
+    ///
+    /// This matters for a stationary `LineSegment`: its local forward axis, not
+    /// its velocity, defines the endpoint directions used by width rendering.
+    #[must_use]
+    pub const fn with_initial_pose(mut self, pose: fightbox_api::Pose) -> Self {
+        self.initial_position_enu = pose.position;
+        self.initial_forward_enu = pose.forward;
+        self.initial_up_enu = pose.up;
+        self
     }
 
     /// Attaches the declared source level used for audibility ranking.
@@ -970,6 +989,15 @@ impl MultiSourceDescriptor {
             self.reference_level,
             fightbox_api::ReferenceLevel::SplAtOneMeter { .. }
         )
+    }
+
+    #[cfg(feature = "linked-sdk")]
+    pub(crate) const fn initial_pose(self) -> fightbox_api::Pose {
+        fightbox_api::Pose {
+            position: self.initial_position_enu,
+            forward: self.initial_forward_enu,
+            up: self.initial_up_enu,
+        }
     }
 }
 

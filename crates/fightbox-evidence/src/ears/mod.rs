@@ -13,6 +13,8 @@
 
 mod dsp;
 mod extractors;
+mod pitch;
+mod width;
 
 pub mod corpus;
 #[cfg(test)]
@@ -21,4 +23,15 @@ mod gate0;
 pub use extractors::{
     AnalysisError, COHERENCE_BANDS_HZ, ExtractorMetrics, Pcm, SchroederDecay, analyze,
     schroeder_decay,
+};
+pub use pitch::{PitchTrack, PitchTrackConfig, PitchWindow, windowed_pitch_track};
+pub use width::{
+    WidthProfile, WidthProfileConfig, WidthTrack, WidthWindow, windowed_width_profile,
+};
+
+// The crate-level `metrics` module predates `ears` and remains private. Re-export
+// the Wave 11 capture comparison here so later evidence lanes have one public,
+// percept-oriented namespace without changing the crate-root API surface.
+pub use crate::metrics::{
+    StereoReferenceMovingNotchReport, stereo_reference_moving_spectral_notches,
 };

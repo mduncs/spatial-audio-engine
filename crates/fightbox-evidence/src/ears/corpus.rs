@@ -7,6 +7,12 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 const DURATION_S: usize = 3;
 const SAMPLE_COUNT: usize = SAMPLE_RATE_HZ as usize * DURATION_S;
 
+/// FFT window used by [`moving_notch_orbit`] and its moving-notch proof.
+pub const MOVING_NOTCH_WINDOW_FRAMES: usize = 16_384;
+const MOVING_NOTCH_WINDOW_COUNT: usize = 8;
+const HRTF_DELAYS: [usize; MOVING_NOTCH_WINDOW_COUNT] = [96, 128, 160, 192, 112, 176, 144, 208];
+const PATH_DELAYS: [usize; MOVING_NOTCH_WINDOW_COUNT] = [224, 160, 240, 176, 208, 144, 192, 128];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Corruption {
     SlapbackEcho,
@@ -54,6 +60,77 @@ impl Stereo {
             right: &self.right,
             sample_rate_hz: SAMPLE_RATE_HZ,
         }
+    }
+}
+
+/// Matched synthetic captures for reference-differenced moving-notch tests.
+///
+/// The “HRTF” here is deliberately adversarial rather than physiological: a
+/// deep regular notch family changes spacing in every analysis window. That
+/// makes the old source-referenced detector false-positive deterministically
+/// and proves that a matched point capture removes direction-dependent transfer
+/// structure. `honest_width` is an exact magnitude-preserving Hilbert phase
+/// rotation of Gate 0's center signal behind that common transfer.
+/// `coherent_path_sweep` adds a second, independently moving coherent delay
+/// family before the same transfer, modeling the prohibited satellite
+/// path-length sweep.
+#[derive(Debug, Clone)]
+pub struct MovingNotchOrbit {
+    /// Exact mono program before the synthetic moving HRTF.
+    pub source_mono: Vec<f32>,
+    /// Point-shaped dual-mono input through the moving HRTF.
+    pub point_reference: Stereo,
+    /// Gate 0's honest wide capture through the same moving HRTF.
+    pub honest_width: Stereo,
+    /// Point input plus a walking coherent copy through the same moving HRTF.
+    pub coherent_path_sweep: Stereo,
+}
+
+/// Generate the deterministic Wave 11 HRTF-versus-comb discrimination corpus.
+///
+/// Filters are circular within each [`MOVING_NOTCH_WINDOW_FRAMES`] block so
+/// the known transfer functions are stationary inside an FFT window. The final
+/// partial block is copied unchanged and is intentionally outside the eight
+/// complete proof windows.
+pub fn moving_notch_orbit() -> MovingNotchOrbit {
+    let wide = clean();
+    let source_mono = wide
+        .left
+        .iter()
+        .zip(&wide.right)
+        .map(|(&left, &right)| 0.5 * (left + right))
+        .collect::<Vec<_>>();
+    let point_input = Stereo {
+        left: source_mono.clone(),
+        right: source_mono.clone(),
+    };
+    let quadrature = windowed_quadrature(&source_mono);
+    let angle = 35.0_f64.to_radians();
+    let honest_input = Stereo {
+        left: source_mono
+            .iter()
+            .zip(&quadrature)
+            .map(|(&center, &quadrature)| {
+                (angle.cos() * f64::from(center) + angle.sin() * f64::from(quadrature)) as f32
+            })
+            .collect(),
+        right: source_mono
+            .iter()
+            .zip(&quadrature)
+            .map(|(&center, &quadrature)| {
+                (angle.cos() * f64::from(center) - angle.sin() * f64::from(quadrature)) as f32
+            })
+            .collect(),
+    };
+    let point_reference = map_windowed_delays(&point_input, &HRTF_DELAYS, 0.995);
+    let honest_width = map_windowed_delays(&honest_input, &HRTF_DELAYS, 0.995);
+    let walking_path = map_windowed_delays(&point_input, &PATH_DELAYS, 0.98);
+    let coherent_path_sweep = map_windowed_delays(&walking_path, &HRTF_DELAYS, 0.995);
+    MovingNotchOrbit {
+        source_mono,
+        point_reference,
+        honest_width,
+        coherent_path_sweep,
     }
 }
 
@@ -164,6 +241,120 @@ fn delay_add(mut signal: Stereo, delay: usize, gain: f32) -> Stereo {
         signal.right[index] += gain * dry.right[index - delay];
     }
     signal
+}
+
+fn map_windowed_delays(signal: &Stereo, delays: &[usize], gain: f32) -> Stereo {
+    Stereo {
+        left: windowed_delay_add(&signal.left, delays, gain),
+        right: windowed_delay_add(&signal.right, delays, gain),
+    }
+}
+
+fn windowed_delay_add(signal: &[f32], delays: &[usize], gain: f32) -> Vec<f32> {
+    let mut output = signal.to_vec();
+    for (window, &delay) in delays.iter().enumerate() {
+        let start = window * MOVING_NOTCH_WINDOW_FRAMES;
+        let end = start + MOVING_NOTCH_WINDOW_FRAMES;
+        if end > signal.len() || delay == 0 || delay >= MOVING_NOTCH_WINDOW_FRAMES {
+            break;
+        }
+        for offset in 0..MOVING_NOTCH_WINDOW_FRAMES {
+            let delayed_offset =
+                (offset + MOVING_NOTCH_WINDOW_FRAMES - delay) % MOVING_NOTCH_WINDOW_FRAMES;
+            output[start + offset] = signal[start + offset] + gain * signal[start + delayed_offset];
+        }
+    }
+    output
+}
+
+fn windowed_quadrature(signal: &[f32]) -> Vec<f32> {
+    let mut output = vec![0.0; signal.len()];
+    for window in 0..MOVING_NOTCH_WINDOW_COUNT {
+        let start = window * MOVING_NOTCH_WINDOW_FRAMES;
+        let end = start + MOVING_NOTCH_WINDOW_FRAMES;
+        if end > signal.len() {
+            break;
+        }
+        let mut real = signal[start..end]
+            .iter()
+            .map(|sample| f64::from(*sample))
+            .collect::<Vec<_>>();
+        let mut imaginary = vec![0.0; MOVING_NOTCH_WINDOW_FRAMES];
+        fft_in_place(&mut real, &mut imaginary);
+        real[0] = 0.0;
+        imaginary[0] = 0.0;
+        real[MOVING_NOTCH_WINDOW_FRAMES / 2] = 0.0;
+        imaginary[MOVING_NOTCH_WINDOW_FRAMES / 2] = 0.0;
+        for bin in 1..MOVING_NOTCH_WINDOW_FRAMES / 2 {
+            let old_real = real[bin];
+            real[bin] = imaginary[bin];
+            imaginary[bin] = -old_real;
+        }
+        for bin in MOVING_NOTCH_WINDOW_FRAMES / 2 + 1..MOVING_NOTCH_WINDOW_FRAMES {
+            let old_real = real[bin];
+            real[bin] = -imaginary[bin];
+            imaginary[bin] = old_real;
+        }
+        inverse_fft_in_place(&mut real, &mut imaginary);
+        for (target, value) in output[start..end].iter_mut().zip(real) {
+            *target = value as f32;
+        }
+    }
+    output
+}
+
+fn inverse_fft_in_place(real: &mut [f64], imaginary: &mut [f64]) {
+    for value in imaginary.iter_mut() {
+        *value = -*value;
+    }
+    fft_in_place(real, imaginary);
+    let scale = 1.0 / real.len() as f64;
+    for (real, imaginary) in real.iter_mut().zip(imaginary) {
+        *real *= scale;
+        *imaginary *= -scale;
+    }
+}
+
+fn fft_in_place(real: &mut [f64], imaginary: &mut [f64]) {
+    let length = real.len();
+    debug_assert!(length.is_power_of_two() && imaginary.len() == length);
+    let mut target = 0;
+    for source in 1..length {
+        let mut bit = length >> 1;
+        while target & bit != 0 {
+            target ^= bit;
+            bit >>= 1;
+        }
+        target ^= bit;
+        if source < target {
+            real.swap(source, target);
+            imaginary.swap(source, target);
+        }
+    }
+    let mut butterfly_length = 2;
+    while butterfly_length <= length {
+        let angle = -std::f64::consts::TAU / butterfly_length as f64;
+        let step_real = angle.cos();
+        let step_imaginary = angle.sin();
+        for start in (0..length).step_by(butterfly_length) {
+            let mut twiddle_real = 1.0;
+            let mut twiddle_imaginary = 0.0;
+            for offset in 0..butterfly_length / 2 {
+                let even = start + offset;
+                let odd = even + butterfly_length / 2;
+                let odd_real = real[odd] * twiddle_real - imaginary[odd] * twiddle_imaginary;
+                let odd_imaginary = real[odd] * twiddle_imaginary + imaginary[odd] * twiddle_real;
+                real[odd] = real[even] - odd_real;
+                imaginary[odd] = imaginary[even] - odd_imaginary;
+                real[even] += odd_real;
+                imaginary[even] += odd_imaginary;
+                let next_real = twiddle_real * step_real - twiddle_imaginary * step_imaginary;
+                twiddle_imaginary = twiddle_real * step_imaginary + twiddle_imaginary * step_real;
+                twiddle_real = next_real;
+            }
+        }
+        butterfly_length *= 2;
+    }
 }
 
 fn map_gain(mut signal: Stereo, gain: impl Fn(usize) -> f32) -> Stereo {

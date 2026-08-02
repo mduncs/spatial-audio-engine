@@ -1,7 +1,8 @@
 //! Backend-private, fixed-capacity Steam Audio publication layout.
 
+use crate::width_render::{DECLARED_LATENCY_SAMPLES, WIDTH_RENDERER_REVISION};
 use crate::{BackendError, EnuVector3, SteamVector3, enu_to_steam};
-use fightbox_api::EnuVector3 as ApiEnuVector3;
+use fightbox_api::{EnuVector3 as ApiEnuVector3, ExtentDescriptor};
 use fightbox_runtime::backend::MAX_ACTIVE_SOURCES;
 
 pub(crate) const MAX_PATH_SH_COEFFS: usize = 16;
@@ -25,11 +26,40 @@ pub(crate) struct SteamReflectionParams {
     pub(crate) tan_slot: i32,
 }
 
+/// Additive Wave 11 state for diagnostics and future workbench publication.
+///
+/// In v1 only `LineSegment` has non-zero geometric and phase controls. Keeping
+/// the original descriptor here makes the structural bypass for all other
+/// extents observable without changing the frozen runtime seam.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SteamWidthState {
+    pub(crate) descriptor: ExtentDescriptor,
+    pub(crate) geometric_k: f32,
+    pub(crate) phi_eff_radians: f32,
+    pub(crate) declared_latency_samples: u32,
+    pub(crate) renderer_revision: &'static str,
+}
+
+impl Default for SteamWidthState {
+    fn default() -> Self {
+        Self {
+            descriptor: ExtentDescriptor::Point,
+            geometric_k: 0.0,
+            phi_eff_radians: 0.0,
+            declared_latency_samples: DECLARED_LATENCY_SAMPLES,
+            renderer_revision: WIDTH_RENDERER_REVISION,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SteamSourcePropagation {
     pub(crate) active: bool,
     pub(crate) source_position: SteamVector3,
+    pub(crate) source_forward: SteamVector3,
+    pub(crate) source_up: SteamVector3,
     pub(crate) linear_velocity_mps: SteamVector3,
+    pub(crate) width: SteamWidthState,
     pub(crate) direct: SteamDirectParams,
     pub(crate) path_eq: [f32; 3],
     pub(crate) path_sh: [f32; MAX_PATH_SH_COEFFS],
@@ -42,7 +72,10 @@ impl Default for SteamSourcePropagation {
         Self {
             active: false,
             source_position: SteamVector3::default(),
+            source_forward: SteamVector3::new(0.0, 0.0, -1.0),
+            source_up: SteamVector3::new(0.0, 1.0, 0.0),
             linear_velocity_mps: SteamVector3::default(),
+            width: SteamWidthState::default(),
             direct: SteamDirectParams {
                 distance_attenuation: 1.0,
                 air_absorption: [1.0; 3],
@@ -136,5 +169,22 @@ mod tests {
         assert_eq!(snapshot.sources.len(), MAX_ACTIVE_SOURCES);
         assert_eq!(snapshot.sources[0].path_sh.len(), MAX_PATH_SH_COEFFS);
         assert_eq!(path_coefficient_count(3), Some(MAX_PATH_SH_COEFFS));
+        assert_eq!(
+            snapshot.sources[0].width.descriptor,
+            ExtentDescriptor::Point
+        );
+        assert_eq!(
+            snapshot.sources[0].width.geometric_k.to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert_eq!(
+            snapshot.sources[0].width.phi_eff_radians.to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert_eq!(snapshot.sources[0].width.declared_latency_samples, 0);
+        assert_eq!(
+            snapshot.sources[0].width.renderer_revision,
+            WIDTH_RENDERER_REVISION
+        );
     }
 }

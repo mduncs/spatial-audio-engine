@@ -669,6 +669,25 @@ pub struct MovingSpectralNotchReport {
     pub max_moving_notch_depth_db: f32,
 }
 
+/// Added moving-notch evidence relative to a matched stereo point render.
+///
+/// Every channel report analyzes the transfer `test / point_reference`; an
+/// HRTF notch shared by the same trajectory is therefore removed before notch
+/// families are classified. `maximum_added_moving_notch_depth_db` is the
+/// maximum of the left-ear, right-ear, and mono-sum reports and is the scalar a
+/// gate normally compares with [`DEFAULT_MOVING_NOTCH_THRESHOLD_DB`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoReferenceMovingNotchReport {
+    /// Added moving regular-notch families in the left ear.
+    pub left: MovingSpectralNotchReport,
+    /// Added moving regular-notch families in the right ear.
+    pub right: MovingSpectralNotchReport,
+    /// Added moving regular-notch families after `(L + R) / 2` summation.
+    pub mono_sum: MovingSpectralNotchReport,
+    /// Deepest added moving-notch family found in any analyzed channel.
+    pub maximum_added_moving_notch_depth_db: f32,
+}
+
 /// Detect moving regularly spaced spectral notches on the summed output.
 ///
 /// `reference_mono` is the exact point-source program sent to the renderer. It
@@ -688,38 +707,133 @@ pub fn time_varying_spectral_notches(
     if summed_stereo.len() % 2 != 0 || summed_stereo.len() / 2 != reference_mono.len() {
         return Err(MetricError::FrameChannelMismatch);
     }
-    if window_frames < 256
-        || !window_frames.is_power_of_two()
-        || hop_frames == 0
-        || reference_mono.len() < window_frames
-    {
-        return Err(MetricError::InvalidWindow);
-    }
-    if summed_stereo
-        .iter()
-        .chain(reference_mono)
-        .any(|sample| !sample.is_finite())
-    {
-        return Err(MetricError::InvalidWindow);
-    }
-
     let mono = summed_stereo
         .chunks_exact(2)
         .map(|frame| 0.5 * (frame[0] + frame[1]))
         .collect::<Vec<_>>();
-    let first_bin =
-        ((200.0 * window_frames as f64 / spec.sample_rate_hz as f64).ceil() as usize).max(1);
-    let last_bin = ((8_000.0 * window_frames as f64 / spec.sample_rate_hz as f64).floor() as usize)
+    moving_spectral_notches(
+        spec.sample_rate_hz,
+        &mono,
+        reference_mono,
+        window_frames,
+        hop_frames,
+    )
+}
+
+/// Detect renderer-added moving notch families against a matched point render.
+///
+/// `test_stereo` and `point_reference_stereo` must be sample-aligned renders of
+/// the same program, listener/source trajectory, propagation, room, and HRTF;
+/// only source-extent rendering should differ. The detector evaluates left,
+/// right, and mono sum independently over 200 Hz–8 kHz. It excludes bins whose
+/// point-reference magnitude is more than 45 dB below that window's reference
+/// peak and otherwise retains [`time_varying_spectral_notches`]' regular-family
+/// and motion rules. `window_frames` must be a power of two.
+///
+/// This differencing deliberately cannot reveal coloration already present in
+/// both captures. It can also miss an added notch hidden under an excluded deep
+/// reference notch, stationary/fewer-than-five notches, artifacts outside the
+/// analyzed band, or events shorter than the window. Timing, gain, HRTF,
+/// program, or stochastic-room mismatches can instead appear as false residual
+/// structure, so provenance matching is part of the gate contract.
+pub fn stereo_reference_moving_spectral_notches(
+    spec: WavSpec,
+    test_stereo: &[f32],
+    point_reference_stereo: &[f32],
+    window_frames: usize,
+    hop_frames: usize,
+) -> Result<StereoReferenceMovingNotchReport, MetricError> {
+    validate_spec(spec).map_err(|_| MetricError::BadSpec)?;
+    if spec.channels != 2 {
+        return Err(MetricError::StereoRequired);
+    }
+    if !test_stereo.len().is_multiple_of(2) || test_stereo.len() != point_reference_stereo.len() {
+        return Err(MetricError::FrameChannelMismatch);
+    }
+    let frame_count = test_stereo.len() / 2;
+    let mut test_left = Vec::with_capacity(frame_count);
+    let mut test_right = Vec::with_capacity(frame_count);
+    let mut test_sum = Vec::with_capacity(frame_count);
+    let mut reference_left = Vec::with_capacity(frame_count);
+    let mut reference_right = Vec::with_capacity(frame_count);
+    let mut reference_sum = Vec::with_capacity(frame_count);
+    for (test, reference) in test_stereo
+        .chunks_exact(2)
+        .zip(point_reference_stereo.chunks_exact(2))
+    {
+        test_left.push(test[0]);
+        test_right.push(test[1]);
+        test_sum.push(0.5 * (test[0] + test[1]));
+        reference_left.push(reference[0]);
+        reference_right.push(reference[1]);
+        reference_sum.push(0.5 * (reference[0] + reference[1]));
+    }
+    let left = moving_spectral_notches(
+        spec.sample_rate_hz,
+        &test_left,
+        &reference_left,
+        window_frames,
+        hop_frames,
+    )?;
+    let right = moving_spectral_notches(
+        spec.sample_rate_hz,
+        &test_right,
+        &reference_right,
+        window_frames,
+        hop_frames,
+    )?;
+    let mono_sum = moving_spectral_notches(
+        spec.sample_rate_hz,
+        &test_sum,
+        &reference_sum,
+        window_frames,
+        hop_frames,
+    )?;
+    let maximum_added_moving_notch_depth_db = left
+        .max_moving_notch_depth_db
+        .max(right.max_moving_notch_depth_db)
+        .max(mono_sum.max_moving_notch_depth_db);
+    Ok(StereoReferenceMovingNotchReport {
+        left,
+        right,
+        mono_sum,
+        maximum_added_moving_notch_depth_db,
+    })
+}
+
+fn moving_spectral_notches(
+    sample_rate_hz: u32,
+    output: &[f32],
+    reference: &[f32],
+    window_frames: usize,
+    hop_frames: usize,
+) -> Result<MovingSpectralNotchReport, MetricError> {
+    if output.len() != reference.len() {
+        return Err(MetricError::FrameChannelMismatch);
+    }
+    if window_frames < 256
+        || !window_frames.is_power_of_two()
+        || hop_frames == 0
+        || reference.len() < window_frames
+        || output
+            .iter()
+            .chain(reference)
+            .any(|sample| !sample.is_finite())
+    {
+        return Err(MetricError::InvalidWindow);
+    }
+    let first_bin = ((200.0 * window_frames as f64 / sample_rate_hz as f64).ceil() as usize).max(1);
+    let last_bin = ((8_000.0 * window_frames as f64 / sample_rate_hz as f64).floor() as usize)
         .min(window_frames / 2 - 1);
     if last_bin <= first_bin + 8 {
         return Err(MetricError::InvalidWindow);
     }
 
     let mut families = Vec::<Option<NotchFamily>>::new();
-    for start in (0..=reference_mono.len() - window_frames).step_by(hop_frames) {
-        let output_spectrum = windowed_magnitude_spectrum(&mono[start..start + window_frames]);
+    for start in (0..=reference.len() - window_frames).step_by(hop_frames) {
+        let output_spectrum = windowed_magnitude_spectrum(&output[start..start + window_frames]);
         let reference_spectrum =
-            windowed_magnitude_spectrum(&reference_mono[start..start + window_frames]);
+            windowed_magnitude_spectrum(&reference[start..start + window_frames]);
         let reference_peak = reference_spectrum[first_bin..=last_bin]
             .iter()
             .copied()
@@ -1366,6 +1480,87 @@ mod tests {
             "{comb_report:?}"
         );
         assert!(comb_report.moving_window_pair_count >= 1);
+    }
+
+    #[test]
+    fn stereo_reference_cancels_moving_hrtf_but_catches_walking_comb() {
+        use crate::ears::corpus::{MOVING_NOTCH_WINDOW_FRAMES, Stereo, moving_notch_orbit};
+
+        fn interleave(stereo: &Stereo) -> Vec<f32> {
+            stereo
+                .left
+                .iter()
+                .zip(&stereo.right)
+                .flat_map(|(&left, &right)| [left, right])
+                .collect()
+        }
+
+        let corpus = moving_notch_orbit();
+        let point = interleave(&corpus.point_reference);
+        let honest = interleave(&corpus.honest_width);
+        let corrupt = interleave(&corpus.coherent_path_sweep);
+        let raw_hrtf = time_varying_spectral_notches(
+            spec(2),
+            &point,
+            &corpus.source_mono,
+            MOVING_NOTCH_WINDOW_FRAMES,
+            MOVING_NOTCH_WINDOW_FRAMES,
+        )
+        .unwrap();
+        let point_shaped = stereo_reference_moving_spectral_notches(
+            spec(2),
+            &point,
+            &point,
+            MOVING_NOTCH_WINDOW_FRAMES,
+            MOVING_NOTCH_WINDOW_FRAMES,
+        )
+        .unwrap();
+        let honest_report = stereo_reference_moving_spectral_notches(
+            spec(2),
+            &honest,
+            &point,
+            MOVING_NOTCH_WINDOW_FRAMES,
+            MOVING_NOTCH_WINDOW_FRAMES,
+        )
+        .unwrap();
+        let corrupt_report = stereo_reference_moving_spectral_notches(
+            spec(2),
+            &corrupt,
+            &point,
+            MOVING_NOTCH_WINDOW_FRAMES,
+            MOVING_NOTCH_WINDOW_FRAMES,
+        )
+        .unwrap();
+        eprintln!(
+            "moving-notch ground truth: raw_hrtf={:.3} dB, point_added={:.3} dB, honest_width_added={:.3} dB, walking_comb_added={:.3} dB (L={:.3}, R={:.3}, sum={:.3})",
+            raw_hrtf.max_moving_notch_depth_db,
+            point_shaped.maximum_added_moving_notch_depth_db,
+            honest_report.maximum_added_moving_notch_depth_db,
+            corrupt_report.maximum_added_moving_notch_depth_db,
+            corrupt_report.left.max_moving_notch_depth_db,
+            corrupt_report.right.max_moving_notch_depth_db,
+            corrupt_report.mono_sum.max_moving_notch_depth_db,
+        );
+
+        assert!(
+            raw_hrtf.max_moving_notch_depth_db > DEFAULT_MOVING_NOTCH_THRESHOLD_DB,
+            "the source-referenced detector must reproduce the HRTF false positive"
+        );
+        assert_eq!(
+            point_shaped.maximum_added_moving_notch_depth_db, 0.0,
+            "an honest point compared with itself must be point-shaped"
+        );
+        assert!(
+            honest_report.maximum_added_moving_notch_depth_db < 3.0,
+            "matched-HRTF honest width must pass: {honest_report:?}"
+        );
+        assert!(
+            corrupt_report.maximum_added_moving_notch_depth_db > DEFAULT_MOVING_NOTCH_THRESHOLD_DB,
+            "the walking coherent path must fail behind the HRTF: {corrupt_report:?}"
+        );
+        assert!(corrupt_report.left.moving_window_pair_count > 0);
+        assert!(corrupt_report.right.moving_window_pair_count > 0);
+        assert!(corrupt_report.mono_sum.moving_window_pair_count > 0);
     }
 
     #[test]
