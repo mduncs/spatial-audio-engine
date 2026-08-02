@@ -626,6 +626,79 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::*;
 
+    const FIXTURE_SCHEMA: &str = include_str!("../../../fixtures/fixture.schema.json");
+    const MEGABLOCK: &str = include_str!("../../../fixtures/city/megablock/fixture.json");
+
+    fn schema_accepts_directivity(value: Option<&serde_json::Value>) -> bool {
+        let schema: serde_json::Value =
+            serde_json::from_str(FIXTURE_SCHEMA).expect("fixture schema must be valid JSON");
+        let source_schema = &schema["$defs"]["source"];
+        let source_required = source_schema["required"]
+            .as_array()
+            .expect("source.required must be an array");
+
+        let Some(value) = value else {
+            return !source_required
+                .iter()
+                .any(|field| field.as_str() == Some("directivity"));
+        };
+
+        let directivity_schema = &source_schema["properties"]["directivity"];
+        if directivity_schema["type"] != "object" {
+            return false;
+        }
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        let properties = directivity_schema["properties"]
+            .as_object()
+            .expect("directivity.properties must be an object");
+        let required = directivity_schema["required"]
+            .as_array()
+            .expect("directivity.required must be an array");
+        if required
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|field| !object.contains_key(field))
+        {
+            return false;
+        }
+        if directivity_schema["additionalProperties"] == false
+            && object.keys().any(|field| !properties.contains_key(field))
+        {
+            return false;
+        }
+
+        properties.iter().all(|(field, field_schema)| {
+            let Some(value) = object.get(field) else {
+                return true;
+            };
+            if field_schema["type"] != "number" || !value.is_number() {
+                return false;
+            }
+            let Some(number) = value.as_f64() else {
+                return false;
+            };
+            let minimum = field_schema["minimum"]
+                .as_f64()
+                .expect("directivity minimum must be numeric");
+            let maximum = field_schema["maximum"]
+                .as_f64()
+                .expect("directivity maximum must be numeric");
+            (minimum..=maximum).contains(&number)
+        })
+    }
+
+    fn s0_with_directivity(directivity: Option<&serde_json::Value>) -> String {
+        let Some(directivity) = directivity else {
+            return test_fixtures::S0.to_owned();
+        };
+        test_fixtures::S0.replace(
+            r#""asset_id": "s0-calibrated-pink""#,
+            &format!(r#""asset_id": "s0-calibrated-pink", "directivity": {directivity}"#),
+        )
+    }
+
     #[test]
     fn parses_repo_fixtures() {
         let s0 = test_fixtures::s0();
@@ -658,6 +731,94 @@ mod tests {
         let encoded = serde_json::to_string(&parsed).unwrap();
         let reparsed = Fixture::parse(&encoded).unwrap();
         assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn json_schema_and_rust_parser_have_directivity_parity() {
+        for (case, directivity, expected) in [
+            ("absent", None, true),
+            (
+                "valid mid-range",
+                Some(serde_json::json!({
+                    "dipole_weight": 0.7,
+                    "dipole_power": 2.0,
+                })),
+                true,
+            ),
+            (
+                "inclusive upper boundaries",
+                Some(serde_json::json!({
+                    "dipole_weight": 1.0,
+                    "dipole_power": 16.0,
+                })),
+                true,
+            ),
+            (
+                "weight above maximum",
+                Some(serde_json::json!({
+                    "dipole_weight": 1.1,
+                    "dipole_power": 2.0,
+                })),
+                false,
+            ),
+            (
+                "power below minimum",
+                Some(serde_json::json!({
+                    "dipole_weight": 0.7,
+                    "dipole_power": 0.2,
+                })),
+                false,
+            ),
+            (
+                "missing power",
+                Some(serde_json::json!({"dipole_weight": 0.7})),
+                false,
+            ),
+            (
+                "unknown nested field",
+                Some(serde_json::json!({
+                    "dipole_weight": 0.7,
+                    "dipole_power": 2.0,
+                    "axis": "north",
+                })),
+                false,
+            ),
+        ] {
+            let schema_accepts = schema_accepts_directivity(directivity.as_ref());
+            let parser_accepts = Fixture::parse(&s0_with_directivity(directivity.as_ref())).is_ok();
+            assert_eq!(schema_accepts, expected, "JSON Schema outcome for {case}");
+            assert_eq!(parser_accepts, expected, "Rust parser outcome for {case}");
+            assert_eq!(schema_accepts, parser_accepts, "parity for {case}");
+        }
+    }
+
+    #[test]
+    fn megablock_directivity_matches_schema_and_rust_parser_contract() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(MEGABLOCK).expect("megablock fixture must be valid JSON");
+        let sources = fixture["sources"]
+            .as_array()
+            .expect("megablock sources must be an array");
+        let siren = sources
+            .iter()
+            .find(|source| source["id"] == "siren-circling-center-block")
+            .expect("megablock siren source must exist");
+        let directivity = &siren["directivity"];
+
+        assert!(schema_accepts_directivity(Some(directivity)));
+        let parsed: Directivity =
+            serde_json::from_value(directivity.clone()).expect("directivity shape must parse");
+        parsed.validate().expect("directivity range must validate");
+        assert_eq!(
+            parsed,
+            Directivity {
+                dipole_weight: 0.75,
+                dipole_power: 2.0,
+            }
+        );
+        assert!(sources.iter().all(|source| {
+            source["id"] == "siren-circling-center-block" || source.get("directivity").is_none()
+        }));
     }
 
     #[test]

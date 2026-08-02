@@ -48,6 +48,10 @@
         "mode": "SplAtOneMeter",
         "db_spl": 118
       },
+      "directivity": {
+        "dipole_weight": 0.75,
+        "dipole_power": 2.0
+      },
       "trajectory": {
         "waypoints_m": [
           [245.0, 245.0, 1.5],

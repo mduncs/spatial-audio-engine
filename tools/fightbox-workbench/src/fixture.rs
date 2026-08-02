@@ -465,9 +465,17 @@ mod tests {
         assert_eq!(fixture.sources.len(), 4);
         assert!(fixture.sources[0].default_enabled);
         assert_eq!(fixture.sources[0].reference_level.db_spl, 105.0);
+        assert_eq!(
+            fixture.sources[0].directivity,
+            FixtureDirectivity::default()
+        );
         assert_eq!(fixture.sources[1].asset_id, "artillery-impact");
         assert_eq!(fixture.sources[1].reference_level.db_spl, 155.0);
         assert!(!fixture.sources[1].default_enabled);
+        assert_eq!(
+            fixture.sources[1].directivity,
+            FixtureDirectivity::default()
+        );
         assert_eq!(
             fixture.sources[1].initial_position().unwrap(),
             EnuVector3::new(102.5, 102.5, 1.5)
@@ -475,6 +483,13 @@ mod tests {
         assert_eq!(fixture.sources[2].asset_id, "ff-siren");
         assert_eq!(fixture.sources[2].reference_level.db_spl, 118.0);
         assert!(!fixture.sources[2].default_enabled);
+        assert_eq!(
+            fixture.sources[2].directivity,
+            FixtureDirectivity {
+                dipole_weight: 0.75,
+                dipole_power: 2.0,
+            }
+        );
         assert_eq!(
             fixture.sources[2].initial_position().unwrap(),
             EnuVector3::new(245.0, 245.0, 1.5)
@@ -486,6 +501,10 @@ mod tests {
         assert_eq!(fixture.sources[3].asset_id, "church-bells");
         assert_eq!(fixture.sources[3].reference_level.db_spl, 115.0);
         assert!(!fixture.sources[3].default_enabled);
+        assert_eq!(
+            fixture.sources[3].directivity,
+            FixtureDirectivity::default()
+        );
         assert_eq!(
             fixture.sources[3].initial_position().unwrap(),
             EnuVector3::new(482.5, 292.5, 1.5)
