@@ -1971,6 +1971,10 @@ fn create_source_render_state(
 #[path = "multi_source_teleport_tests.rs"]
 mod teleport_tests;
 
+#[cfg(test)] #[allow(unsafe_code)] #[path = "reflection_budget_diagnostics.rs"] mod reflection_budget_diagnostics;
+
+#[cfg(test)] #[allow(unsafe_code)] #[path = "width_binaural_prototype.rs"] mod width_binaural_prototype;
+
 #[cfg(test)]
 mod tests {
     use super::*;
