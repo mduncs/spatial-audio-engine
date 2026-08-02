@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     AcousticMaterial, BakedProbeBatch, PROBE_BATCH_METADATA_SCHEMA, ProbeBatchMetadata,
-    STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION,
+    S3BakeRequest, STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION, bake_s3,
 };
 use fightbox_runtime::backend::{BackendSourceBlock, SourceMotion};
 use std::env;
@@ -125,6 +125,97 @@ fn retained_reflections_respond_to_nearby_masonry_wall() {
     assert!(
         *near_stem / *open_stem > 5.0,
         "reflection energy did not respond materially to wall distance: {energies:?}"
+    );
+}
+
+#[test]
+fn teleport_during_path_gate_hold_bypasses_the_counter_and_only_leaves_the_smoother_tail() {
+    let mesh = SceneMesh::controlled_s3_corner();
+    let baked = bake_s3(&S3BakeRequest {
+        mesh: mesh.clone(),
+        ..S3BakeRequest::default()
+    })
+    .expect("bake teleport path-gate scene");
+    let audio = AudioConfig {
+        sample_rate_hz: SAMPLE_RATE,
+        frame_size: BLOCK_FRAMES,
+    };
+    let source = ApiEnuVector3::new(2.0, 3.0, 1.5);
+    let listener = ApiEnuVector3::new(4.0, 6.0, 1.5);
+    let descriptors = [crate::MultiSourceDescriptor::at(source)];
+    let (mut simulation, mut render) = build_multi_source_session(
+        &mesh,
+        &baked,
+        audio,
+        S3SimulationConfig::default(),
+        &descriptors,
+    )
+    .expect("build teleport path-gate session");
+    simulation.update_inputs(&one_source_update(source, listener));
+    simulation.run_direct().expect("prime direct simulation");
+
+    let mut held_sh = [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS];
+    held_sh[..4].copy_from_slice(&[0.75, -0.25, 0.125, 0.0625]);
+    let held_eq = [0.8, 0.6, 0.4];
+    simulation.path_gates[0].resolve(&mut simulation.snapshot.sources[0], held_eq, held_sh);
+    assert!(!simulation.path_gates[0].miss(&mut simulation.snapshot.sources[0]));
+    assert!(!simulation.path_gates[0].miss(&mut simulation.snapshot.sources[0]));
+    assert_eq!(simulation.path_gates[0].consecutive_misses, 2);
+    simulation.snapshot.sequence = simulation.snapshot.sequence.wrapping_add(1);
+    simulation.publication.publish(simulation.snapshot);
+
+    let zeros = vec![0.0; BLOCK_FRAMES as usize];
+    render_one_source_block(&mut render, &zeros);
+    let initial_applied = render.sources[0].propagation_smoother.applied();
+    assert_eq!(
+        initial_applied.path_sh.map(f32::to_bits),
+        held_sh.map(f32::to_bits)
+    );
+    let initial_energy = energy(initial_applied.path_sh);
+    assert!(initial_energy > 0.0);
+
+    let teleported_source = ApiEnuVector3::new(source.east_m + 25.0, source.north_m, source.up_m);
+    simulation.update_inputs(&one_source_update(teleported_source, listener));
+    assert_eq!(simulation.path_gates[0].consecutive_misses, 0);
+    assert_eq!(
+        simulation.snapshot.sources[0].path_sh,
+        [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS]
+    );
+
+    let retention = render.propagation_block_retention;
+    let maximum_fractional_step = 1.0 - retention;
+    // Render before any SDK pass. `update_inputs` must already have published
+    // the invalidated target, so a blocking simulation call cannot extend the
+    // two-miss hold by one callback block.
+    render_one_source_block(&mut render, &zeros);
+    let first_faded = render.sources[0].propagation_smoother.applied();
+    let first_step = initial_applied.path_sh[0] - first_faded.path_sh[0];
+    assert!(first_step > 0.0 && first_step <= maximum_fractional_step + f32::EPSILON);
+    simulation
+        .run_direct()
+        .expect("publish post-teleport direct result");
+
+    // A one-pole has no exact finite endpoint. Eight time constants is the
+    // suite's established operational settle window: by then the old SH
+    // energy is at most exp(-16), and it must keep decreasing afterward.
+    let fade_blocks = smoothing_settle_blocks(audio);
+    for _ in 1..fade_blocks {
+        render_one_source_block(&mut render, &zeros);
+    }
+    let settled_energy = energy(render.sources[0].propagation_smoother.applied().path_sh);
+    let maximum_settled_fraction = (-16.0_f32).exp() * 1.01;
+    assert!(
+        settled_energy / initial_energy <= maximum_settled_fraction,
+        "teleport retained old path beyond the 8-tau fade: initial={initial_energy:.9e} settled={settled_energy:.9e} bound_fraction={maximum_settled_fraction:.9e}"
+    );
+    render_one_source_block(&mut render, &zeros);
+    let after_window_energy = energy(render.sources[0].propagation_smoother.applied().path_sh);
+    assert!(after_window_energy < settled_energy);
+    eprintln!(
+        "path_gate_teleport hold_misses=2 reset_misses={} fade_blocks={fade_blocks} fade_ms={:.3} retention={retention:.9} first_step={first_step:.9} settled_energy_fraction={:.9e}",
+        simulation.path_gates[0].consecutive_misses,
+        fade_blocks as f32 * BLOCK_FRAMES as f32 * 1_000.0 / SAMPLE_RATE as f32,
+        settled_energy / initial_energy,
     );
 }
 

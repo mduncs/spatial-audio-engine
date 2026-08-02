@@ -1,185 +1,319 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fightbox.dev/schema/fixture-workbench-1.json",
-  "title": "Fightbox workbench fixture profile",
-  "description": "Fixture fields consumed by the lenient fightbox-workbench loader. Scene geometry and bake metadata are loaded from the package and baked directory, so richer fixture metadata may remain alongside this profile without becoming a workbench parser requirement.",
+  "title": "Fightbox workbench consumed fixture format",
+  "description": "Only fields read by tools/fightbox-workbench. Additional properties are ignored by the Rust loader and reported as warnings by tools/validate.py.",
   "type": "object",
-  "required": ["schema_version", "sources", "listener", "simulation"],
+  "additionalProperties": false,
+  "required": ["sources", "listener", "simulation"],
   "properties": {
-    "schema_version": {"const": "fightbox.fixture.workbench.v1"},
-    "fixture_id": {"type": "string"},
-    "sources": {"$ref": "#/$defs/sources"},
-    "listener": {"$ref": "#/$defs/listener"},
-    "simulation": {"$ref": "#/$defs/simulation"}
+    "fixture_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "listener": {
+      "$ref": "#/$defs/listener"
+    },
+    "simulation": {
+      "$ref": "#/$defs/simulation"
+    }
   },
-  "additionalProperties": true,
   "$defs": {
     "vec3": {
       "type": "array",
-      "items": {"type": "number"},
       "minItems": 3,
-      "maxItems": 3
+      "maxItems": 3,
+      "items": {
+        "type": "number",
+        "minimum": -3.4028234663852886e+38,
+        "maximum": 3.4028234663852886e+38
+      }
     },
-    "extent": {
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind"],
-          "properties": {"kind": {"const": "point"}}
+    "reference_level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "db_spl"],
+      "properties": {
+        "mode": {
+          "const": "SplAtOneMeter"
         },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "count"],
-          "properties": {
-            "kind": {"const": "multi_point"},
-            "count": {"type": "integer", "minimum": 1, "maximum": 255}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "length_m"],
-          "properties": {
-            "kind": {"const": "line_segment"},
-            "length_m": {
-              "type": "number",
-              "exclusiveMinimum": 0,
-              "maximum": 3.4028234663852886e38
-            }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["kind", "width_m"],
-          "properties": {
-            "kind": {"const": "stereo_image"},
-            "width_m": {
-              "type": "number",
-              "exclusiveMinimum": 0,
-              "maximum": 3.4028234663852886e38
-            }
-          }
+        "db_spl": {
+          "type": "number",
+          "minimum": -3.4028234663852886e+38,
+          "maximum": 3.4028234663852886e+38
         }
-      ]
+      }
     },
     "directivity": {
       "type": "object",
       "additionalProperties": false,
       "required": ["dipole_weight", "dipole_power"],
       "properties": {
-        "dipole_weight": {"type": "number", "minimum": 0, "maximum": 1},
-        "dipole_power": {"type": "number", "minimum": 0.25, "maximum": 16}
+        "dipole_weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "dipole_power": {
+          "type": "number",
+          "minimum": 0.25,
+          "maximum": 16
+        }
       }
     },
-    "reference_level": {
+    "point_extent": {
       "type": "object",
-      "required": ["db_spl"],
+      "additionalProperties": false,
+      "required": ["kind"],
       "properties": {
-        "mode": {"type": "string"},
-        "db_spl": {"type": "number"}
-      },
-      "additionalProperties": true
+        "kind": {
+          "const": "point"
+        }
+      }
+    },
+    "multi_point_extent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "count"],
+      "properties": {
+        "kind": {
+          "const": "multi_point"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 255
+        }
+      }
+    },
+    "line_extent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "length_m"],
+      "properties": {
+        "kind": {
+          "const": "line_segment"
+        },
+        "length_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3.4028234663852886e+38
+        }
+      }
+    },
+    "stereo_extent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "width_m"],
+      "properties": {
+        "kind": {
+          "const": "stereo_image"
+        },
+        "width_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3.4028234663852886e+38
+        }
+      }
+    },
+    "extent": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/point_extent"
+        },
+        {
+          "$ref": "#/$defs/multi_point_extent"
+        },
+        {
+          "$ref": "#/$defs/line_extent"
+        },
+        {
+          "$ref": "#/$defs/stereo_extent"
+        }
+      ]
     },
     "trajectory": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["waypoints_m", "speed_mps"],
       "properties": {
         "waypoints_m": {
           "type": "array",
-          "items": {"$ref": "#/$defs/vec3"},
-          "minItems": 2
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/vec3"
+          }
         },
         "speed_mps": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "maximum": 3.4028234663852886e38
+          "maximum": 3.4028234663852886e+38
         },
         "max_speed_mps": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "maximum": 3.4028234663852886e38
+          "maximum": 3.4028234663852886e+38
         }
       },
-      "additionalProperties": true,
       "$comment": "The Rust loader additionally enforces speed_mps <= max_speed_mps when max_speed_mps is present."
     },
     "source": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["id", "asset_id", "reference_level"],
       "properties": {
-        "id": {"type": "string"},
-        "asset_id": {"type": "string"},
-        "reference_level": {"$ref": "#/$defs/reference_level"},
-        "default_enabled": {"type": "boolean"},
-        "directivity": {"$ref": "#/$defs/directivity"},
-        "extent": {"$ref": "#/$defs/extent"},
-        "position_m": {"$ref": "#/$defs/vec3"},
-        "trajectory": {"$ref": "#/$defs/trajectory"}
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "asset_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reference_level": {
+          "$ref": "#/$defs/reference_level"
+        },
+        "default_enabled": {
+          "type": "boolean"
+        },
+        "directivity": {
+          "$ref": "#/$defs/directivity"
+        },
+        "extent": {
+          "$ref": "#/$defs/extent"
+        },
+        "position_m": {
+          "$ref": "#/$defs/vec3"
+        },
+        "trajectory": {
+          "$ref": "#/$defs/trajectory"
+        }
       },
-      "additionalProperties": true,
-      "oneOf": [
-        {"required": ["position_m"]},
-        {"required": ["trajectory"]}
+      "anyOf": [
+        {
+          "required": ["position_m"]
+        },
+        {
+          "required": ["trajectory"]
+        }
       ]
-    },
-    "sources": {
-      "type": "array",
-      "items": {"$ref": "#/$defs/source"},
-      "minItems": 1,
-      "maxItems": 8
     },
     "listener": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["forward_enu"],
       "properties": {
-        "position_m": {"$ref": "#/$defs/vec3"},
-        "trajectory": {"$ref": "#/$defs/trajectory"},
-        "forward_enu": {"$ref": "#/$defs/vec3"}
+        "position_m": {
+          "$ref": "#/$defs/vec3"
+        },
+        "trajectory": {
+          "$ref": "#/$defs/trajectory"
+        },
+        "forward_enu": {
+          "$ref": "#/$defs/vec3"
+        }
       },
-      "additionalProperties": true,
-      "oneOf": [
-        {"required": ["position_m"]},
-        {"required": ["trajectory"]}
+      "anyOf": [
+        {
+          "required": ["position_m"]
+        },
+        {
+          "required": ["trajectory"]
+        }
       ]
+    },
+    "direct": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "occlusion_samples": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      }
+    },
+    "reflections": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rays": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "bounces": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "duration_s": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3.4028234663852886e+38
+        }
+      }
+    },
+    "pathing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "order": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "validation": {
+          "type": "boolean"
+        },
+        "alternate_paths": {
+          "type": "boolean"
+        },
+        "visibility_range_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 3.4028234663852886e+38
+        }
+      }
+    },
+    "probe_volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spacing_m"],
+      "properties": {
+        "spacing_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1.3611293865541155e+38
+        }
+      }
     },
     "simulation": {
       "type": "object",
-      "required": ["direct", "reflections", "pathing"],
+      "additionalProperties": false,
+      "required": ["direct", "reflections", "pathing", "probe_volume"],
       "properties": {
         "direct": {
-          "type": "object",
-          "properties": {
-            "occlusion_samples": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 4294967295
-            }
-          },
-          "additionalProperties": true
+          "$ref": "#/$defs/direct"
         },
         "reflections": {
-          "type": "object",
-          "properties": {
-            "rays": {"type": "integer", "minimum": 0, "maximum": 4294967295},
-            "bounces": {"type": "integer", "minimum": 0, "maximum": 4294967295},
-            "duration_s": {"type": "number"}
-          },
-          "additionalProperties": true
+          "$ref": "#/$defs/reflections"
         },
         "pathing": {
-          "type": "object",
-          "properties": {
-            "order": {"type": "integer", "minimum": 0, "maximum": 4294967295},
-            "validation": {"type": "boolean"},
-            "alternate_paths": {"type": "boolean"}
-          },
-          "additionalProperties": true
+          "$ref": "#/$defs/pathing"
+        },
+        "probe_volume": {
+          "$ref": "#/$defs/probe_volume"
         }
-      },
-      "additionalProperties": true
+      }
     }
   }
 }

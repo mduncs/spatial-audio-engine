@@ -15,6 +15,7 @@
 mod backend_snapshot;
 mod elevated_probes;
 mod governor;
+mod impulse_shaping;
 #[cfg(any(feature = "linked-sdk", test))]
 mod motion_smoothing;
 mod probe_influence;
@@ -30,7 +31,7 @@ pub use governor::{
     DeliveredReflectionQuality, GovernorSimulationPass, GovernorTransitionReason, PathQualityLevel,
     QualityGovernorTelemetry, REVERB_RUNG_CAPABILITIES, ReflectionQualityLevel,
     ReflectionSettingAvailability, ReverbRungAvailability, ReverbRungCapability, ReverbStrategy,
-    SourceQualityLevel, SourceQualityTelemetry,
+    SourcePriorityClass, SourceQualityLevel, SourceQualityTelemetry,
 };
 pub use status::{
     CapabilityStatus, GateStatus, RuntimeStatus, runtime_status, steam_audio_provenance,
@@ -912,6 +913,8 @@ pub struct S3SimulationConfig {
 /// Extent is also immutable world data. It controls the source's direct
 /// occlusion footprint; `LineSegment` additionally selects the Wave 11 width
 /// renderer, while every other descriptor retains point rendering in v1.
+/// Impulse shaping is immutable source classification; the default is the
+/// structural bypass used by every source predating Wave 12.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MultiSourceDescriptor {
     pub initial_position_enu: fightbox_api::EnuVector3,
@@ -920,6 +923,7 @@ pub struct MultiSourceDescriptor {
     reference_level: fightbox_api::ReferenceLevel,
     directivity: fightbox_api::Directivity,
     extent: fightbox_api::ExtentDescriptor,
+    impulse_class: fightbox_api::ImpulseClass,
 }
 
 impl MultiSourceDescriptor {
@@ -932,6 +936,7 @@ impl MultiSourceDescriptor {
             reference_level: fightbox_api::ReferenceLevel::CreativeDb { db: 0.0 },
             directivity: fightbox_api::Directivity::OMNIDIRECTIONAL,
             extent: fightbox_api::ExtentDescriptor::Point,
+            impulse_class: fightbox_api::ImpulseClass::None,
         }
     }
 
@@ -972,6 +977,13 @@ impl MultiSourceDescriptor {
     #[must_use]
     pub const fn with_extent(mut self, extent: fightbox_api::ExtentDescriptor) -> Self {
         self.extent = extent;
+        self
+    }
+
+    /// Attaches the opt-in distance-keyed impulse-shaping family.
+    #[must_use]
+    pub const fn with_impulse_class(mut self, impulse_class: fightbox_api::ImpulseClass) -> Self {
+        self.impulse_class = impulse_class;
         self
     }
 

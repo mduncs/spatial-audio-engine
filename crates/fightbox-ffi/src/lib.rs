@@ -1093,6 +1093,10 @@ mod tests {
             ambisonic_order: 0,
             reverb: ReverbStrategy::ShortIrLowerOrder,
             reflection_output_gain: 1.0,
+            boot_reflection_level: ReflectionQualityLevel::Reduced,
+            boot_predicted_cost_ns: 0,
+            boot_p99_budget_ns: 0,
+            boot_cost_limit_ns: 0,
             sources: [fightbox_steam_audio::SourceQualityTelemetry::default(); MAX_ACTIVE_SOURCES],
             source_count: 1,
             memory: fightbox_steam_audio::SessionMemoryTelemetry {

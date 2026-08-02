@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
 use fightbox_api::{
-    EngineConfig, EnuVector3, ListenerState, OutputSafetyConfig, Pose, ReferenceLevel,
-    SceneCalibration, SourceId, SourceProfile,
+    EngineConfig, EnuVector3, ListenerState, OutputSafetyConfig, Pose, SceneCalibration, SourceId,
+    SourceProfile,
 };
 use fightbox_runtime::backend::{SimulationUpdate, SourceMotion};
 use fightbox_runtime::{
@@ -22,7 +22,8 @@ use fightbox_world::{AcousticMesh, read_package};
 use crate::LaunchArgs;
 use crate::acoustic_state::{
     AcousticTelemetry, AcousticTelemetryTap, BadgeTone, ProbeCoverageQuery, SourceAcousticInputs,
-    SourceAcousticState, probe_text, probe_tone, stage_chips,
+    SourceAcousticState, path_diagnostics_text, probe_text, probe_tone, quality_text, quality_tone,
+    stage_chips,
 };
 use crate::asset::load_asset;
 use crate::capture::{
@@ -31,7 +32,9 @@ use crate::capture::{
     WorldPackageProvenance, default_capture_root, git_identity, json_string_field,
     reveal_in_finder, scan_capture_bundles, sha256_file, utc_timestamp_now,
 };
-use crate::fixture::{Fixture, Trajectory, load_baked, scene_mesh};
+use crate::fixture::{
+    Fixture, Trajectory, VisibilityRangeAdoption, load_baked, occlusion_mode_for_extent, scene_mesh,
+};
 use crate::pose::{ListenerControl, PoseMailbox};
 
 const BLOCK_SIZE: u32 = 128;
@@ -72,6 +75,7 @@ pub struct Workbench {
     source_height_levels: SourceHeightLevels,
     probe_coverage: ProbeCoverageQuery,
     acoustic_telemetry: SnapshotReader<AcousticTelemetry>,
+    visibility_range: VisibilityRangeAdoption,
     startup_started: Instant,
     reflection_warmup_started: Instant,
     reflection_warmup_reported: bool,
@@ -90,6 +94,7 @@ struct SourceView {
     height: SourceHeight,
     trajectory: Option<SourceTrajectory>,
     acoustic: SourceAcousticState,
+    occlusion_mode: DirectOcclusionMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +288,16 @@ impl Workbench {
         );
         let initial_listener = listener.listener_state(EnuVector3::default());
         let (pose_mailbox, pose_reader) = PoseMailbox::new(initial_listener);
+        let visibility_range = fixture.visibility_range_adoption();
+        if visibility_range.rebaselined {
+            eprintln!(
+                "!!! [startup] PATH VISIBILITY RANGE RE-BASELINED: configured {:.2} m is below 2.5 x {:.2} m probe spacing ({:.2} m); adopting {:.2} m. Session telemetry and captures are flagged re-baselined.",
+                visibility_range.configured_m,
+                visibility_range.probe_spacing_m,
+                visibility_range.minimum_for_spacing_m,
+                visibility_range.effective_m,
+            );
+        }
         let simulation_config = fixture.simulation_config();
         let fixture_id = fixture.fixture_id.clone().unwrap_or_else(|| {
             args.fixture
@@ -315,7 +330,7 @@ impl Workbench {
                 bake_manifest_sha256: sha256_file(&bake_manifest_path),
                 probe_batch_content_sha256: baked.metadata.content_sha256.clone(),
             },
-            quality: capture_quality(simulation_config),
+            quality: capture_quality(simulation_config, visibility_range),
             engine_config: CaptureEngineConfig {
                 sample_rate_hz: SAMPLE_RATE,
                 block_size_frames: BLOCK_SIZE,
@@ -344,9 +359,7 @@ impl Workbench {
                 SourceProfile {
                     id: SourceId::new(&source.id),
                     pose,
-                    reference_level: ReferenceLevel::SplAtOneMeter {
-                        db_spl: source.reference_level.db_spl as f32,
-                    },
+                    reference_level: source.reference_level.to_api(),
                     asset_analysis: asset.analysis,
                     extent: source.extent,
                     directivity: source.directivity.to_api(),
@@ -377,12 +390,14 @@ impl Workbench {
                 height: SourceHeight::Street,
                 trajectory,
                 acoustic: SourceAcousticState::UNKNOWN,
+                occlusion_mode: occlusion_mode_for_extent(simulation_config, source.extent),
             });
         }
         let descriptors = prepared_sources
             .iter()
             .map(|(profile, _)| {
                 MultiSourceDescriptor::at(profile.pose.position)
+                    .with_reference_level(profile.reference_level)
                     .with_directivity(profile.directivity)
                     .with_extent(profile.extent)
             })
@@ -548,6 +563,7 @@ impl Workbench {
             source_height_levels,
             probe_coverage,
             acoustic_telemetry,
+            visibility_range,
             startup_started,
             reflection_warmup_started,
             reflection_warmup_reported: false,
@@ -798,12 +814,28 @@ impl Workbench {
             sources: self
                 .sources
                 .iter()
-                .map(|source| CaptureSourceState {
-                    id: source.id.clone(),
-                    asset_id: source.asset_id.clone(),
-                    enabled: source.enabled,
-                    muted: source.muted,
-                    soloed: source.soloed,
+                .map(|source| {
+                    let (occlusion_mode, occlusion_radius_m, occlusion_samples) =
+                        match source.occlusion_mode {
+                            DirectOcclusionMode::Raycast => ("raycast".into(), None, None),
+                            DirectOcclusionMode::Volumetric {
+                                radius_m,
+                                sample_count,
+                            } => ("volumetric".into(), Some(radius_m), Some(sample_count)),
+                        };
+                    CaptureSourceState {
+                        id: source.id.clone(),
+                        asset_id: source.asset_id.clone(),
+                        reference_level_mode: "SplAtOneMeter".into(),
+                        reference_level_db_spl: source.declared_spl_at_one_meter_db,
+                        governor_physically_calibrated: source.acoustic.physically_calibrated,
+                        occlusion_mode,
+                        occlusion_radius_m,
+                        occlusion_samples,
+                        enabled: source.enabled,
+                        muted: source.muted,
+                        soloed: source.soloed,
+                    }
                 })
                 .collect(),
             stages: self.stage_mix.into(),
@@ -1084,7 +1116,7 @@ impl Workbench {
                     ui.monospace(format!("{resulting_height_m:.1} m z"));
                 });
             });
-            acoustic_badge_row(ui, source.acoustic);
+            acoustic_badge_row(ui, source.acoustic, source.occlusion_mode);
         }
         if let Some((index, height)) = source_height_changed {
             self.apply_source_height(index, height);
@@ -1179,6 +1211,64 @@ impl Workbench {
             simulation.pathing.failures,
             simulation.reflections.failures
         ));
+        let acoustic = self.acoustic_telemetry.read();
+        match acoustic.governor {
+            Some(governor) => {
+                ui.monospace(format!(
+                    "governor rung {}  {:?}  last {:?}",
+                    governor.ladder_position, governor.reflection_level, governor.reason
+                ));
+                #[cfg(fightbox_governor_boot_telemetry)]
+                ui.monospace(format!(
+                    "boot decision {:?}  predicted {:.3} ms / {:.3} ms admission  p99 budget {:.3} ms",
+                    governor.boot_reflection_level,
+                    governor.boot_predicted_cost_ns as f64 / 1_000_000.0,
+                    governor.boot_cost_limit_ns as f64 / 1_000_000.0,
+                    governor.boot_p99_budget_ns as f64 / 1_000_000.0,
+                ));
+                ui.monospace(format!(
+                    "first delivered rung {}  refl {:?}  path {:?}  M{}",
+                    governor.observed_boot_ladder_position,
+                    governor.observed_boot_reflection_level,
+                    governor.observed_boot_pathing,
+                    governor.observed_boot_ambisonic_order,
+                ));
+                ui.monospace(format!(
+                    "reflections {} rays / {} bounces / {:.2} s / cadence ÷{}  gain {:.3}",
+                    governor.reflection_rays,
+                    governor.reflection_bounces,
+                    governor.reflection_ir_duration_s,
+                    governor.reflection_cadence_divisor,
+                    governor.reflection_output_gain,
+                ));
+                ui.monospace(format!(
+                    "path {:?}  ambisonic M{}",
+                    governor.pathing, governor.ambisonic_order
+                ));
+            }
+            None if acoustic.known => {
+                ui.monospace("governor ungoverned for this generation");
+            }
+            None => {
+                ui.monospace("governor telemetry awaiting first direct pass");
+            }
+        }
+        let visibility_text = format!(
+            "visibility {:.2} m configured -> {:.2} m effective  spacing {:.2} m{}",
+            self.visibility_range.configured_m,
+            self.visibility_range.effective_m,
+            self.visibility_range.probe_spacing_m,
+            if self.visibility_range.rebaselined {
+                "  RE-BASELINED"
+            } else {
+                ""
+            },
+        );
+        if self.visibility_range.rebaselined {
+            ui.colored_label(Color32::from_rgb(255, 172, 90), visibility_text);
+        } else {
+            ui.monospace(visibility_text);
+        }
         ui.separator();
         self.capture_panel(ui);
     }
@@ -1256,12 +1346,20 @@ const ACOUSTIC_BADGE_HOVER: &str = concat!(
     "Baked path-probe coverage at this source's current position and at the listener. ",
     "A source outside every probe has no baked path and falls back to direct-only. ",
     "occl is Steam Audio direct occlusion audibility, 1.00 clear to 0.00 fully occluded.\n",
-    "Stage chips: + contributing, - silent, ? not reported by the session.",
+    "Stage chips: + contributing, - silent, ? not reported by the session.\n",
+    "Volumetric parameters are effective per source: point and multi-point default to a 1 m ",
+    "radius; line and stereo extents use half their declared width; n is the fixture sample count.\n",
+    "Quality and calibration come from the governor. Path SH energy and EQ come from the latest ",
+    "per-source simulation snapshot.",
 );
 
 /// One compact row per source: probe coverage, direct occlusion, and the render
 /// stages that can currently contribute.
-fn acoustic_badge_row(ui: &mut egui::Ui, state: SourceAcousticState) {
+fn acoustic_badge_row(
+    ui: &mut egui::Ui,
+    state: SourceAcousticState,
+    occlusion_mode: DirectOcclusionMode,
+) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.add_space(22.0);
@@ -1275,6 +1373,39 @@ fn acoustic_badge_row(ui: &mut egui::Ui, state: SourceAcousticState) {
     })
     .response
     .on_hover_text(ACOUSTIC_BADGE_HOVER);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_space(22.0);
+        ui.colored_label(
+            badge_color(quality_tone(state)),
+            badge_text(quality_text(state)),
+        );
+        ui.colored_label(
+            badge_color(BadgeTone::Ok),
+            badge_text(occlusion_mode_text(occlusion_mode)),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(22.0);
+        ui.colored_label(
+            badge_color(if state.path_sh_energy.is_some() {
+                BadgeTone::Ok
+            } else {
+                BadgeTone::Unknown
+            }),
+            badge_text(path_diagnostics_text(state)),
+        );
+    });
+}
+
+fn occlusion_mode_text(mode: DirectOcclusionMode) -> String {
+    match mode {
+        DirectOcclusionMode::Raycast => "occlusion raycast".to_owned(),
+        DirectOcclusionMode::Volumetric {
+            radius_m,
+            sample_count,
+        } => format!("occlusion volumetric r={radius_m:.2} m n={sample_count}"),
+    }
 }
 
 fn badge_text(text: String) -> egui::RichText {
@@ -1406,12 +1537,23 @@ impl<P: BlockProcessor + ListenerStateSink> BlockProcessor for LateBoundProcesso
     }
 }
 
-fn capture_quality(config: S3SimulationConfig) -> CaptureQualitySettings {
+fn capture_quality(
+    config: S3SimulationConfig,
+    visibility: VisibilityRangeAdoption,
+) -> CaptureQualitySettings {
     let cadences = SimulationCadences::default();
     CaptureQualitySettings {
         direct_occlusion: match config.direct_occlusion {
             DirectOcclusionMode::Raycast => "raycast".into(),
             DirectOcclusionMode::Volumetric { .. } => "volumetric".into(),
+        },
+        direct_occlusion_radius_m: match config.direct_occlusion {
+            DirectOcclusionMode::Raycast => None,
+            DirectOcclusionMode::Volumetric { radius_m, .. } => Some(radius_m),
+        },
+        direct_occlusion_samples: match config.direct_occlusion {
+            DirectOcclusionMode::Raycast => None,
+            DirectOcclusionMode::Volumetric { sample_count, .. } => Some(sample_count),
         },
         max_occlusion_samples: config.max_occlusion_samples,
         reflection_effect: format!("{:?}", config.reflection_effect.effect_type).to_lowercase(),
@@ -1420,6 +1562,10 @@ fn capture_quality(config: S3SimulationConfig) -> CaptureQualitySettings {
         reflection_duration_s: config.reflection_duration_s,
         reflection_order: config.reflection_order,
         pathing_order: config.pathing_order,
+        pathing_visibility_range_configured_m: visibility.configured_m,
+        probe_spacing_m: visibility.probe_spacing_m,
+        pathing_visibility_range_m: visibility.effective_m,
+        pathing_visibility_range_rebaselined: visibility.rebaselined,
         validate_paths: config.validate_paths,
         find_alternate_paths: config.find_alternate_paths,
         direct_simulation_hz: cadences.direct_hz,
@@ -2480,7 +2626,7 @@ mod tests {
                 forward: EnuVector3::new(0.0, 1.0, 0.0),
                 up: EnuVector3::new(0.0, 0.0, 1.0),
             },
-            reference_level: ReferenceLevel::SplAtOneMeter { db_spl: 155.0 },
+            reference_level: fightbox_api::ReferenceLevel::SplAtOneMeter { db_spl: 155.0 },
             asset_analysis: fightbox_api::AssetAnalysis::new(
                 -24.0,
                 -12.0,

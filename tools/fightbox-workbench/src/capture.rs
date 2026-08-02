@@ -31,6 +31,12 @@ const CAPTURE_RING_BLOCKS: usize = 4_096;
 pub struct CaptureSourceState {
     pub id: String,
     pub asset_id: String,
+    pub reference_level_mode: String,
+    pub reference_level_db_spl: f32,
+    pub governor_physically_calibrated: Option<bool>,
+    pub occlusion_mode: String,
+    pub occlusion_radius_m: Option<f32>,
+    pub occlusion_samples: Option<i32>,
     pub enabled: bool,
     pub muted: bool,
     pub soloed: bool,
@@ -76,6 +82,8 @@ impl From<StageMix> for CaptureStageState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CaptureQualitySettings {
     pub direct_occlusion: String,
+    pub direct_occlusion_radius_m: Option<f32>,
+    pub direct_occlusion_samples: Option<i32>,
     pub max_occlusion_samples: i32,
     pub reflection_effect: String,
     pub reflection_rays: i32,
@@ -83,6 +91,10 @@ pub struct CaptureQualitySettings {
     pub reflection_duration_s: f32,
     pub reflection_order: i32,
     pub pathing_order: i32,
+    pub pathing_visibility_range_configured_m: f32,
+    pub probe_spacing_m: f32,
+    pub pathing_visibility_range_m: f32,
+    pub pathing_visibility_range_rebaselined: bool,
     pub validate_paths: bool,
     pub find_alternate_paths: bool,
     pub direct_simulation_hz: u32,
@@ -866,6 +878,12 @@ mod tests {
             sources: vec![CaptureSourceState {
                 id: "source".into(),
                 asset_id: "asset".into(),
+                reference_level_mode: "SplAtOneMeter".into(),
+                reference_level_db_spl: 105.0,
+                governor_physically_calibrated: Some(true),
+                occlusion_mode: "volumetric".into(),
+                occlusion_radius_m: Some(1.0),
+                occlusion_samples: Some(64),
                 enabled: true,
                 muted: false,
                 soloed: true,
@@ -873,6 +891,8 @@ mod tests {
             stages: CaptureStageState::from(StageMix::ALL_ENABLED),
             quality: CaptureQualitySettings {
                 direct_occlusion: "raycast".into(),
+                direct_occlusion_radius_m: None,
+                direct_occlusion_samples: None,
                 max_occlusion_samples: 64,
                 reflection_effect: "convolution".into(),
                 reflection_rays: 4_096,
@@ -880,6 +900,10 @@ mod tests {
                 reflection_duration_s: 1.5,
                 reflection_order: 1,
                 pathing_order: 2,
+                pathing_visibility_range_configured_m: 6.0,
+                probe_spacing_m: 4.0,
+                pathing_visibility_range_m: 10.0,
+                pathing_visibility_range_rebaselined: true,
                 validate_paths: true,
                 find_alternate_paths: true,
                 direct_simulation_hz: 60,
@@ -911,6 +935,24 @@ mod tests {
         assert_eq!(
             decoded
                 .pointer("/workbench_capture/sources/0/soloed")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            decoded
+                .pointer("/workbench_capture/sources/0/governor_physically_calibrated")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            decoded
+                .pointer("/workbench_capture/quality/pathing_visibility_range_m")
+                .and_then(Value::as_f64),
+            Some(10.0)
+        );
+        assert_eq!(
+            decoded
+                .pointer("/workbench_capture/quality/pathing_visibility_range_rebaselined",)
                 .and_then(Value::as_bool),
             Some(true)
         );

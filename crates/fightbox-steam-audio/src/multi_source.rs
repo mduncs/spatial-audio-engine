@@ -16,9 +16,10 @@ use crate::governor::{
     GovernorRenderSnapshot, GovernorSimulationPass, QualityGovernor, QualityGovernorTelemetry,
     ReverbStrategy, SourceQualityLevel,
 };
+use crate::impulse_shaping::ImpulseShaper;
 use crate::motion_smoothing::{
-    PROPAGATION_SLEW_TIME_SECONDS, SourcePropagationSmoother, maximum_propagation_delay_samples,
-    propagation_delay_samples,
+    PROPAGATION_SLEW_TIME_SECONDS, SPEED_OF_SOUND_METERS_PER_SECOND, SourcePropagationSmoother,
+    maximum_propagation_delay_samples, propagation_delay_samples,
 };
 use crate::probe_influence::SerializedProbeInfluences;
 use crate::propagation_delay::{PropagationDelayLine, TELEPORT_DELAY_STEP_SECONDS};
@@ -65,6 +66,62 @@ struct SimulationFrame {
     sources: [SteamPose; MAX_ACTIVE_SOURCES],
     source_linear_velocities_mps: [SteamVector3; MAX_ACTIVE_SOURCES],
     active: [bool; MAX_ACTIVE_SOURCES],
+}
+
+const PATH_GATE_MISS_THRESHOLD: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PathGateState {
+    consecutive_misses: u8,
+}
+
+impl PathGateState {
+    fn resolve(
+        &mut self,
+        propagation: &mut SteamSourcePropagation,
+        path_eq: [f32; 3],
+        path_sh: [f32; crate::backend_snapshot::MAX_PATH_SH_COEFFS],
+    ) {
+        self.consecutive_misses = 0;
+        propagation.path_eq = path_eq;
+        propagation.path_sh = path_sh;
+    }
+
+    /// Holds the last valid path for two misses, then publishes the silent
+    /// target consumed by `SourcePropagationSmoother` on the third.
+    fn miss(&mut self, propagation: &mut SteamSourcePropagation) -> bool {
+        self.consecutive_misses = self
+            .consecutive_misses
+            .saturating_add(1)
+            .min(PATH_GATE_MISS_THRESHOLD);
+        if self.consecutive_misses < PATH_GATE_MISS_THRESHOLD {
+            return false;
+        }
+        silence_path(propagation);
+        true
+    }
+
+    /// Bypasses miss hysteresis for discontinuities whose old path is no
+    /// longer spatially meaningful. The target becomes silent immediately;
+    /// an initialized render graph removes the residual through its existing
+    /// 80 ms propagation smoother.
+    fn invalidate(&mut self, propagation: &mut SteamSourcePropagation) {
+        self.consecutive_misses = 0;
+        silence_path(propagation);
+    }
+}
+
+fn silence_path(propagation: &mut SteamSourcePropagation) {
+    propagation.path_eq = [1.0; 3];
+    propagation.path_sh = [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS];
+}
+
+fn endpoint_teleported(previous: SteamVector3, current: SteamVector3) -> bool {
+    let x = current.x - previous.x;
+    let y = current.y - previous.y;
+    let z = current.z - previous.z;
+    let threshold_m = TELEPORT_DELAY_STEP_SECONDS * SPEED_OF_SOUND_METERS_PER_SECOND;
+    x * x + y * y + z * z > threshold_m * threshold_m
 }
 
 fn default_api_pose(position: ApiEnuVector3) -> Pose {
@@ -201,6 +258,7 @@ pub(crate) struct MultiSourceSimulation {
     reflection_cadence_tick: u64,
     last_pass_started_ns: [Option<u64>; 3],
     last_direct_frame: Option<SimulationFrame>,
+    path_gates: [PathGateState; MAX_ACTIVE_SOURCES],
     started: Instant,
 }
 
@@ -309,6 +367,25 @@ impl MultiSourceSimulation {
             sources[index] = pose;
             source_linear_velocities_mps[index] = api_enu_to_steam(motion.linear_velocity_mps);
             active[index] = motion.active;
+        }
+        let listener_teleported =
+            endpoint_teleported(self.frame.listener.position, listener.position);
+        let mut path_invalidated = false;
+        for index in 0..self.world.source_count {
+            let source_teleported =
+                endpoint_teleported(self.frame.sources[index].position, sources[index].position);
+            let activation_changed = self.frame.active[index] != active[index];
+            if listener_teleported || source_teleported || activation_changed {
+                self.path_gates[index].invalidate(&mut self.snapshot.sources[index]);
+                path_invalidated = true;
+            }
+        }
+        if path_invalidated {
+            // Publish the zero target before a potentially blocking SDK pass.
+            // Endpoint poses and acoustic results remain the preceding coherent
+            // simulation frame until that pass publishes their replacements.
+            self.snapshot.sequence = self.snapshot.sequence.wrapping_add(1);
+            self.publication.publish(self.snapshot);
         }
         self.frame = SimulationFrame {
             listener,
@@ -476,7 +553,9 @@ impl MultiSourceSimulation {
                     // retained output when an occluded endpoint has no
                     // influencing probe. The public result has no success bit,
                     // so mirror that exact precondition from the serialized
-                    // probe spheres and replace the stale target with silence.
+                    // probe spheres. Brief coverage misses retain the last
+                    // valid target; the third consecutive miss publishes
+                    // silence for the existing propagation smoother to fade.
                     //
                     // A line-of-sight path is valid without probes. Only trust
                     // raycast direct occlusion for this purpose when it was
@@ -501,13 +580,15 @@ impl MultiSourceSimulation {
                             .world
                             .has_influencing_probe(self.frame.sources[index].position);
                     if direct_line_of_sight || endpoints_have_probes {
-                        source_snapshot.path_eq = outputs.pathing.eqCoeffs;
-                        source_snapshot.path_sh = fixed_path_sh(self.config.pathing_order, &copied)
+                        let path_sh = fixed_path_sh(self.config.pathing_order, &copied)
                             .map_err(|_| SimulationError::KernelFailure)?;
+                        self.path_gates[index].resolve(
+                            source_snapshot,
+                            outputs.pathing.eqCoeffs,
+                            path_sh,
+                        );
                     } else {
-                        source_snapshot.path_eq = [1.0; 3];
-                        source_snapshot.path_sh =
-                            [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS];
+                        self.path_gates[index].miss(source_snapshot);
                     }
                     source_snapshot.configured_pathing_order = self.config.pathing_order as u8;
                 }
@@ -615,6 +696,17 @@ fn radial_velocity_mps(
         + relative_velocity.z * offset.z)
         * inverse_distance;
     if radial.is_finite() { radial } else { 0.0 }
+}
+
+fn smoothed_source_distance_m(
+    source_position: SteamVector3,
+    listener_position: SteamVector3,
+) -> f32 {
+    let x = source_position.x - listener_position.x;
+    let y = source_position.y - listener_position.y;
+    let z = source_position.z - listener_position.z;
+    let distance = (x * x + y * y + z * z).sqrt();
+    if distance.is_finite() { distance } else { 0.0 }
 }
 
 fn direct_is_finite(direct: SteamDirectParams) -> bool {
@@ -796,6 +888,7 @@ struct SourceRenderState {
     path_stereo: OwnedAudioBuffer,
     reflection_scratch: OwnedAudioBuffer,
     propagation_smoother: SourcePropagationSmoother,
+    impulse_shaper: Option<ImpulseShaper>,
     propagation_delay: PropagationDelayLine,
     last_propagation_observation: Option<(u64, u32, u32)>,
     rendered_since_reset: bool,
@@ -893,6 +986,9 @@ impl MultiSourceRenderGraph {
         for (index, state) in self.sources.iter_mut().enumerate() {
             if !snapshot.sources[index].active {
                 state.propagation_smoother.reset();
+                if let Some(shaper) = &mut state.impulse_shaper {
+                    shaper.reset();
+                }
                 if state.rendered_since_reset {
                     state.guard_reactivation_history = true;
                 }
@@ -1052,21 +1148,47 @@ impl MultiSourceRenderGraph {
             }
             state.last_propagation_observation = Some(observation);
         }
-        for (frame, input) in source_block.input_mono.iter().copied().enumerate() {
-            let delayed = state.propagation_delay.process_sample(input);
-            if state.guard_reactivation_history {
-                state.reactivation_epoch_samples =
-                    state.reactivation_epoch_samples.saturating_add(1);
-                if state.reactivation_epoch_samples as f32
-                    <= state.propagation_delay.current_delay_samples().ceil() + 2.0
-                {
-                    self.mono_work[frame] = 0.0;
+        if let Some(shaper) = &mut state.impulse_shaper {
+            let distance_m =
+                smoothed_source_distance_m(smoothed.source_position, smoothed.listener_position);
+            let parameters = shaper.parameters_at_distance(distance_m);
+            for (frame, input) in source_block.input_mono.iter().copied().enumerate() {
+                let shaped = shaper.process_sample(input, parameters);
+                let delayed = state.propagation_delay.process_sample(shaped);
+                if state.guard_reactivation_history {
+                    state.reactivation_epoch_samples =
+                        state.reactivation_epoch_samples.saturating_add(1);
+                    if state.reactivation_epoch_samples as f32
+                        <= state.propagation_delay.current_delay_samples().ceil() + 2.0
+                    {
+                        self.mono_work[frame] = 0.0;
+                    } else {
+                        state.guard_reactivation_history = false;
+                        self.mono_work[frame] = delayed;
+                    }
                 } else {
-                    state.guard_reactivation_history = false;
                     self.mono_work[frame] = delayed;
                 }
-            } else {
-                self.mono_work[frame] = delayed;
+            }
+        } else {
+            // Structural Wave 12 bypass: existing and explicitly `None`
+            // sources execute the pre-change dry-to-delay loop bit-for-bit.
+            for (frame, input) in source_block.input_mono.iter().copied().enumerate() {
+                let delayed = state.propagation_delay.process_sample(input);
+                if state.guard_reactivation_history {
+                    state.reactivation_epoch_samples =
+                        state.reactivation_epoch_samples.saturating_add(1);
+                    if state.reactivation_epoch_samples as f32
+                        <= state.propagation_delay.current_delay_samples().ceil() + 2.0
+                    {
+                        self.mono_work[frame] = 0.0;
+                    } else {
+                        state.guard_reactivation_history = false;
+                        self.mono_work[frame] = delayed;
+                    }
+                } else {
+                    self.mono_work[frame] = delayed;
+                }
             }
         }
         state.rendered_since_reset = true;
@@ -1551,6 +1673,7 @@ pub(crate) fn build_multi_source_generation(
         reflection_cadence_tick: 0,
         last_pass_started_ns: [None; 3],
         last_direct_frame: None,
+        path_gates: [PathGateState::default(); MAX_ACTIVE_SOURCES],
         started: Instant::now(),
     };
     Ok((simulation, render))
@@ -1964,6 +2087,7 @@ fn create_render_graph(
             maximum_delay_samples,
             initial_delay_samples,
             descriptors[index].extent,
+            descriptors[index].impulse_class,
         )?);
     }
     let applied_governor_quality = governor_quality.read();
@@ -2059,6 +2183,7 @@ fn create_source_render_state(
     maximum_delay_samples: usize,
     initial_delay_samples: f32,
     extent: ExtentDescriptor,
+    impulse_class: fightbox_api::ImpulseClass,
 ) -> Result<SourceRenderState, BackendError> {
     let line_length_m = match extent {
         ExtentDescriptor::LineSegment { length_m } => Some(length_m),
@@ -2160,6 +2285,7 @@ fn create_source_render_state(
             audio_settings.frameSize,
         )?,
         propagation_smoother: SourcePropagationSmoother::default(),
+        impulse_shaper: ImpulseShaper::new(impulse_class, audio_settings.samplingRate),
         // The 2,048 m physical cap converted at the graph's sample rate: the
         // whole ring is allocated here so the render callback never does.
         propagation_delay: {
@@ -2184,6 +2310,14 @@ fn create_source_render_state(
 mod teleport_tests;
 
 #[cfg(test)]
+#[path = "megablock_corner_diagnostic.rs"]
+mod megablock_corner_diagnostic;
+
+#[cfg(test)]
+#[path = "wave13_corner_gate.rs"]
+mod wave13_corner_gate;
+
+#[cfg(test)]
 #[allow(unsafe_code)]
 #[path = "reflection_budget_diagnostics.rs"]
 mod reflection_budget_diagnostics;
@@ -2192,6 +2326,10 @@ mod reflection_budget_diagnostics;
 #[allow(unsafe_code)]
 #[path = "width_binaural_prototype.rs"]
 mod width_binaural_prototype;
+
+#[cfg(test)]
+#[path = "impulse_strip_prototype.rs"]
+mod impulse_strip_prototype;
 
 #[cfg(test)]
 mod tests {
@@ -2275,6 +2413,242 @@ mod tests {
             })
             .unwrap();
         (left, right)
+    }
+
+    fn path_terms(seed: f32) -> ([f32; 3], [f32; crate::backend_snapshot::MAX_PATH_SH_COEFFS]) {
+        (
+            [seed, seed + 0.125, seed + 0.25],
+            std::array::from_fn(|index| seed + index as f32 * 0.03125),
+        )
+    }
+
+    #[test]
+    fn path_gate_holds_two_misses_trips_on_third_and_resolve_resets() {
+        let mut gate = PathGateState::default();
+        let mut propagation = SteamSourcePropagation::default();
+        let (initial_eq, initial_sh) = path_terms(0.25);
+        gate.resolve(&mut propagation, initial_eq, initial_sh);
+
+        for expected_misses in 1..PATH_GATE_MISS_THRESHOLD {
+            assert!(!gate.miss(&mut propagation));
+            assert_eq!(gate.consecutive_misses, expected_misses);
+            assert_eq!(
+                propagation.path_eq.map(f32::to_bits),
+                initial_eq.map(f32::to_bits)
+            );
+            assert_eq!(
+                propagation.path_sh.map(f32::to_bits),
+                initial_sh.map(f32::to_bits)
+            );
+        }
+
+        assert!(gate.miss(&mut propagation));
+        assert_eq!(gate.consecutive_misses, PATH_GATE_MISS_THRESHOLD);
+        assert_eq!(propagation.path_eq, [1.0; 3]);
+        assert_eq!(
+            propagation.path_sh,
+            [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS]
+        );
+
+        let (recovered_eq, recovered_sh) = path_terms(0.75);
+        gate.resolve(&mut propagation, recovered_eq, recovered_sh);
+        assert_eq!(gate.consecutive_misses, 0);
+        assert_eq!(
+            propagation.path_eq.map(f32::to_bits),
+            recovered_eq.map(f32::to_bits)
+        );
+        assert_eq!(
+            propagation.path_sh.map(f32::to_bits),
+            recovered_sh.map(f32::to_bits)
+        );
+        assert!(!gate.miss(&mut propagation));
+        assert_eq!(gate.consecutive_misses, 1);
+        assert_eq!(
+            propagation.path_sh.map(f32::to_bits),
+            recovered_sh.map(f32::to_bits)
+        );
+        gate.invalidate(&mut propagation);
+        assert_eq!(gate.consecutive_misses, 0);
+        assert_eq!(propagation.path_eq, [1.0; 3]);
+        assert_eq!(
+            propagation.path_sh,
+            [0.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS]
+        );
+        eprintln!(
+            "path_gate miss_1=hold miss_2=hold miss_3=fade resolve_reset_misses={}",
+            gate.consecutive_misses
+        );
+    }
+
+    #[test]
+    fn probe_valid_path_gate_is_bit_identical_to_direct_publication() {
+        let (path_eq, path_sh) = path_terms(0.375);
+        let mut expected = SteamSourcePropagation::default();
+        expected.path_eq = path_eq;
+        expected.path_sh = path_sh;
+        let mut gated = SteamSourcePropagation::default();
+        let mut gate = PathGateState::default();
+
+        for _ in 0..8 {
+            gate.resolve(&mut gated, path_eq, path_sh);
+            assert_eq!(gate.consecutive_misses, 0);
+            assert_eq!(
+                gated.path_eq.map(f32::to_bits),
+                expected.path_eq.map(f32::to_bits)
+            );
+            assert_eq!(
+                gated.path_sh.map(f32::to_bits),
+                expected.path_sh.map(f32::to_bits)
+            );
+        }
+    }
+
+    #[test]
+    fn probe_valid_path_gate_render_is_bit_identical_to_the_pre_gate_assignment() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let baked = bake_s3(&S3BakeRequest {
+            mesh: mesh.clone(),
+            ..S3BakeRequest::default()
+        })
+        .unwrap();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let config = test_config();
+        let source = ApiEnuVector3::new(2.0, 3.0, 1.5);
+        let listener = ApiEnuVector3::new(4.0, 6.0, 1.5);
+        let descriptors = [crate::MultiSourceDescriptor::at(source)];
+        let (mut gated_simulation, mut gated_render) =
+            build_multi_source_session(&mesh, &baked, audio, config, &descriptors).unwrap();
+        let (mut baseline_simulation, mut baseline_render) =
+            build_multi_source_session(&mesh, &baked, audio, config, &descriptors).unwrap();
+        let update = one_source_update(true, source, listener);
+        gated_simulation.update_inputs(&update);
+        baseline_simulation.update_inputs(&update);
+        gated_simulation.run_direct().unwrap();
+        baseline_simulation.run_direct().unwrap();
+        gated_simulation.run_pathing().unwrap();
+
+        assert!(
+            gated_simulation
+                .world
+                .has_influencing_probe(gated_simulation.frame.listener.position)
+        );
+        assert!(
+            gated_simulation
+                .world
+                .has_influencing_probe(gated_simulation.frame.sources[0].position)
+        );
+        assert_eq!(gated_simulation.path_gates[0].consecutive_misses, 0);
+        let valid_path = gated_simulation.snapshot.sources[0];
+        assert!(
+            valid_path
+                .path_sh
+                .iter()
+                .any(|coefficient| *coefficient != 0.0)
+        );
+
+        // This is the old happy-path operation: copy the already validated
+        // SDK terms directly into the otherwise equivalent published frame.
+        let mut baseline_snapshot = baseline_simulation.snapshot;
+        baseline_snapshot.sequence = baseline_snapshot.sequence.wrapping_add(1);
+        baseline_snapshot.sources[0].path_eq = valid_path.path_eq;
+        baseline_snapshot.sources[0].path_sh = valid_path.path_sh;
+        baseline_snapshot.sources[0].configured_pathing_order = valid_path.configured_pathing_order;
+        baseline_simulation.snapshot = baseline_snapshot;
+        baseline_simulation.publication.publish(baseline_snapshot);
+
+        let path_only = StageOutputGains {
+            direct: 0.0,
+            pathing: 1.0,
+            reflections: 0.0,
+        };
+        gated_render
+            .take_stage_output_gain_writer()
+            .unwrap()
+            .publish(path_only);
+        baseline_render
+            .take_stage_output_gain_writer()
+            .unwrap()
+            .publish(path_only);
+        let mut gated_samples = Vec::new();
+        let mut baseline_samples = Vec::new();
+        let mut global_frame = 0_usize;
+        for _ in 0..16 {
+            let input = (0..audio.frame_size)
+                .map(|_| {
+                    let sample = (TAU * 617.0 * global_frame as f32 / audio.sample_rate_hz as f32)
+                        .sin()
+                        * 0.1;
+                    global_frame += 1;
+                    sample
+                })
+                .collect::<Vec<_>>();
+            let (gated_left, gated_right) = render_one_source_block(&mut gated_render, &input);
+            let (baseline_left, baseline_right) =
+                render_one_source_block(&mut baseline_render, &input);
+            gated_samples.extend(
+                gated_left
+                    .into_iter()
+                    .zip(gated_right)
+                    .flat_map(|(left, right)| [left, right]),
+            );
+            baseline_samples.extend(
+                baseline_left
+                    .into_iter()
+                    .zip(baseline_right)
+                    .flat_map(|(left, right)| [left, right]),
+            );
+        }
+        assert_samples_bit_equal(
+            &gated_samples,
+            &baseline_samples,
+            "probe-valid hysteresis path changed pre-gate PCM",
+        );
+        assert!(gated_samples.iter().any(|sample| sample.abs() > 1.0e-8));
+    }
+
+    #[test]
+    fn path_gate_trip_and_recovery_reuse_the_bounded_propagation_slew() {
+        let block_seconds = 128.0 / 48_000.0;
+        let retention = (-block_seconds / PROPAGATION_SLEW_TIME_SECONDS).exp();
+        let maximum_fractional_step = 1.0 - retention;
+        let listener = SteamVector3::default();
+        let mut gate = PathGateState::default();
+        let mut propagation = SteamSourcePropagation::default();
+        let path_eq = [1.0; 3];
+        let path_sh = [1.0; crate::backend_snapshot::MAX_PATH_SH_COEFFS];
+        gate.resolve(&mut propagation, path_eq, path_sh);
+        let mut smoother = SourcePropagationSmoother::default();
+        let initial = smoother
+            .advance(propagation, listener, retention)
+            .endpoint();
+
+        assert!(!gate.miss(&mut propagation));
+        assert!(!gate.miss(&mut propagation));
+        assert!(gate.miss(&mut propagation));
+        let faded = smoother
+            .advance(propagation, listener, retention)
+            .endpoint();
+        let trip_step = initial.path_sh[0] - faded.path_sh[0];
+        assert!(faded.path_sh[0] > 0.0 && faded.path_sh[0] < initial.path_sh[0]);
+        assert!(trip_step <= maximum_fractional_step + f32::EPSILON);
+
+        for _ in 0..119 {
+            smoother.advance(propagation, listener, retention);
+        }
+        let before_recovery = smoother.applied();
+        gate.resolve(&mut propagation, path_eq, path_sh);
+        let recovered = smoother
+            .advance(propagation, listener, retention)
+            .endpoint();
+        let recovery_step = recovered.path_sh[0] - before_recovery.path_sh[0];
+        assert!(recovery_step > 0.0);
+        assert!(recovery_step <= maximum_fractional_step + f32::EPSILON);
+        eprintln!(
+            "path_gate_slew retention={retention:.9} max_fractional_step={maximum_fractional_step:.9} trip_step={trip_step:.9} recovery_step={recovery_step:.9}"
+        );
     }
 
     fn wall_mesh(wall: AcousticMaterial) -> SceneMesh {
@@ -2598,6 +2972,15 @@ mod tests {
         source_forward: ApiEnuVector3,
         extent: Option<ExtentDescriptor>,
     ) -> (Vec<f32>, SteamDirectParams) {
+        directivity_capture_with_impulse(directivity, source_forward, extent, None)
+    }
+
+    fn directivity_capture_with_impulse(
+        directivity: Option<Directivity>,
+        source_forward: ApiEnuVector3,
+        extent: Option<ExtentDescriptor>,
+        impulse_class: Option<fightbox_api::ImpulseClass>,
+    ) -> (Vec<f32>, SteamDirectParams) {
         let mesh = SceneMesh::controlled_s3_corner();
         let audio = AudioConfig {
             sample_rate_hz: 48_000,
@@ -2611,6 +2994,9 @@ mod tests {
         }
         if let Some(extent) = extent {
             descriptor = descriptor.with_extent(extent);
+        }
+        if let Some(impulse_class) = impulse_class {
+            descriptor = descriptor.with_impulse_class(impulse_class);
         }
         let descriptors = [descriptor];
         let (mut simulation, mut render) = build_multi_source_generation(
@@ -2671,6 +3057,209 @@ mod tests {
             .sum()
     }
 
+    struct ImpulseTestCapture {
+        interleaved: Vec<f32>,
+        delayed_mono: Vec<f32>,
+        width_presentation: Option<Vec<f32>>,
+        source_count: usize,
+        has_impulse_shaper: bool,
+        has_width: bool,
+        width_declared_latency_samples: u32,
+    }
+
+    fn impulse_test_floor_scene() -> SceneMesh {
+        SceneMesh {
+            vertices_enu_m: vec![
+                EnuVector3::new(-1_024.0, -1_024.0, 0.0),
+                EnuVector3::new(1_024.0, -1_024.0, 0.0),
+                EnuVector3::new(1_024.0, 1_024.0, 0.0),
+                EnuVector3::new(-1_024.0, 1_024.0, 0.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 3], [2, 1, 0], [3, 2, 0]],
+            material_indices: vec![0; 4],
+            materials: vec![AcousticMaterial::GROUND],
+        }
+    }
+
+    fn impulse_test_capture(
+        distance_m: f32,
+        extent: ExtentDescriptor,
+        impulse_class: Option<fightbox_api::ImpulseClass>,
+        input: &[f32],
+    ) -> ImpulseTestCapture {
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        assert_eq!(input.len() % audio.frame_size as usize, 0);
+        let source_position = ApiEnuVector3::new(0.0, distance_m, 1.5);
+        let listener_position = ApiEnuVector3::new(0.0, 0.0, 1.5);
+        let source_pose = Pose {
+            position: source_position,
+            forward: ApiEnuVector3::new(1.0, 0.0, 0.0),
+            up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+        };
+        let mut descriptor = crate::MultiSourceDescriptor::at(source_position)
+            .with_initial_pose(source_pose)
+            .with_extent(extent);
+        if let Some(impulse_class) = impulse_class {
+            descriptor = descriptor.with_impulse_class(impulse_class);
+        }
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &impulse_test_floor_scene(),
+            None,
+            audio,
+            test_config(),
+            &[descriptor],
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        let mut source_update = one_source_update(true, source_position, listener_position);
+        source_update.sources[0].pose = source_pose;
+        simulation.update_inputs(&source_update);
+        simulation.run_direct().unwrap();
+        let mut stage_gains = render.take_stage_output_gain_writer().unwrap();
+        stage_gains.publish(StageOutputGains {
+            direct: 1.0,
+            pathing: 0.0,
+            reflections: 0.0,
+        });
+
+        let mut interleaved = Vec::with_capacity(input.len() * 2);
+        let mut delayed_mono = Vec::with_capacity(input.len());
+        let mut width_presentation = render.sources[0]
+            .width
+            .as_ref()
+            .map(|_| Vec::with_capacity(input.len() * 3));
+        for block in input.chunks_exact(audio.frame_size as usize) {
+            let (left, right) = render_one_source_block(&mut render, block);
+            interleaved.extend(
+                left.into_iter()
+                    .zip(right)
+                    .flat_map(|(left, right)| [left, right]),
+            );
+            delayed_mono.extend_from_slice(&render.mono_work);
+            if let (Some(captured), Some(width)) =
+                (&mut width_presentation, &mut render.sources[0].width)
+            {
+                let mut presentation = vec![0.0; audio.frame_size as usize * 3];
+                width.presentation.read_interleaved(&mut presentation);
+                captured.extend_from_slice(&presentation);
+            }
+        }
+
+        ImpulseTestCapture {
+            interleaved,
+            delayed_mono,
+            width_presentation,
+            source_count: render.sources.len(),
+            has_impulse_shaper: render.sources[0].impulse_shaper.is_some(),
+            has_width: render.sources[0].width.is_some(),
+            width_declared_latency_samples: simulation.snapshot.sources[0]
+                .width
+                .declared_latency_samples,
+        }
+    }
+
+    fn padded_to_block(mut samples: Vec<f32>) -> Vec<f32> {
+        const BLOCK_FRAMES: usize = 128;
+        let padded = samples.len().div_ceil(BLOCK_FRAMES) * BLOCK_FRAMES;
+        samples.resize(padded, 0.0);
+        samples
+    }
+
+    fn reference_artillery_program() -> Vec<f32> {
+        const PROGRAM_FRAMES: usize = 96_000;
+        const FADE_FRAMES: usize = 2_400;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/assets/music/artillery-impact-48k-mono.wav");
+        let bytes = std::fs::read(path).expect("read signed artillery reference");
+        let decoded = decode_pcm16_mono(&bytes);
+        let peak = decoded
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        let onset = decoded
+            .iter()
+            .position(|sample| sample.abs() >= peak * 1.0e-3)
+            .expect("signed artillery onset");
+        let mut program = decoded[onset..onset + PROGRAM_FRAMES].to_vec();
+        let fade_start = program.len() - FADE_FRAMES;
+        for (offset, sample) in program[fade_start..].iter_mut().enumerate() {
+            let phase = std::f64::consts::PI * 0.5 * offset as f64 / FADE_FRAMES as f64;
+            *sample *= phase.cos().powi(2) as f32;
+        }
+        program
+    }
+
+    fn decode_pcm16_mono(bytes: &[u8]) -> Vec<f32> {
+        assert!(bytes.len() >= 12);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let mut position = 12;
+        let mut format = None;
+        let mut data = None;
+        while position + 8 <= bytes.len() {
+            let id = &bytes[position..position + 4];
+            let size =
+                u32::from_le_bytes(bytes[position + 4..position + 8].try_into().unwrap()) as usize;
+            position += 8;
+            let end = position.checked_add(size).expect("WAV chunk size overflow");
+            assert!(end <= bytes.len(), "truncated source WAV chunk");
+            if id == b"fmt " {
+                assert!(size >= 16);
+                format = Some((
+                    u16::from_le_bytes(bytes[position..position + 2].try_into().unwrap()),
+                    u16::from_le_bytes(bytes[position + 2..position + 4].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[position + 4..position + 8].try_into().unwrap()),
+                    u16::from_le_bytes(bytes[position + 14..position + 16].try_into().unwrap()),
+                ));
+            } else if id == b"data" {
+                data = Some(&bytes[position..end]);
+            }
+            position = end + (size & 1);
+        }
+        assert_eq!(format, Some((1, 1, 48_000, 16)));
+        data.expect("source WAV data chunk")
+            .chunks_exact(2)
+            .map(|sample| f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32_768.0)
+            .collect()
+    }
+
+    fn stereo_frequency_magnitude(samples: &[f32], frequency_hz: f64) -> f64 {
+        assert_eq!(samples.len() % 2, 0);
+        let frames = samples.len() / 2;
+        let omega = std::f64::consts::TAU * frequency_hz / 48_000.0;
+        let mut channel_power = 0.0_f64;
+        for channel in 0..2 {
+            let (real, imaginary) = (0..frames).fold((0.0_f64, 0.0_f64), |sum, frame| {
+                let phase = omega * frame as f64;
+                let sample = f64::from(samples[frame * 2 + channel]);
+                (sum.0 + sample * phase.cos(), sum.1 - sample * phase.sin())
+            });
+            channel_power += real * real + imaginary * imaginary;
+        }
+        channel_power.sqrt()
+    }
+
+    fn assert_samples_bit_equal(left: &[f32], right: &[f32], message: &str) {
+        assert_eq!(left.len(), right.len(), "{message}: sample count");
+        if let Some((index, (left, right))) = left
+            .iter()
+            .zip(right)
+            .enumerate()
+            .find(|(_, (left, right))| left.to_bits() != right.to_bits())
+        {
+            panic!(
+                "{message}: first mismatch at sample {index}: {:08x} != {:08x}",
+                left.to_bits(),
+                right.to_bits()
+            );
+        }
+    }
+
     #[test]
     fn weight_zero_direct_render_is_bit_identical_to_the_prechange_fingerprint() {
         let toward = ApiEnuVector3::new(2.0, 3.0, 0.0);
@@ -2682,10 +3271,21 @@ mod tests {
             toward,
             Some(ExtentDescriptor::Point),
         );
+        let (explicit_impulse_none, impulse_none_direct) = directivity_capture_with_impulse(
+            Some(Directivity::OMNIDIRECTIONAL),
+            toward,
+            Some(ExtentDescriptor::Point),
+            Some(fightbox_api::ImpulseClass::None),
+        );
         assert_eq!(sample_bits(&explicit_omni), sample_bits(&legacy_default));
         assert_eq!(sample_bits(&explicit_point), sample_bits(&legacy_default));
+        assert_eq!(
+            sample_bits(&explicit_impulse_none),
+            sample_bits(&legacy_default)
+        );
         assert_eq!(explicit_direct, legacy_direct);
         assert_eq!(point_direct, legacy_direct);
+        assert_eq!(impulse_none_direct, legacy_direct);
 
         // Captured before directivity was plumbed through `source_inputs`: this
         // pins the same deterministic scene, tone, direct effect, and HRTF PCM.
@@ -2698,6 +3298,221 @@ mod tests {
             "omni_prechange_sha256={hash} energy={:.12e} samples={}",
             energy(&explicit_omni),
             explicit_omni.len()
+        );
+    }
+
+    #[test]
+    fn impulse_makeup_preserves_signed_reference_energy_through_the_real_chain() {
+        let reference = reference_artillery_program();
+        for distance_m in [5.0_f32, 50.0, 200.0, 500.0] {
+            let tail_frames = (distance_m * 48_000.0 / 343.0).ceil() as usize + 8_192;
+            let mut input = reference.clone();
+            input.resize(input.len() + tail_frames, 0.0);
+            let input = padded_to_block(input);
+            let plain = impulse_test_capture(distance_m, ExtentDescriptor::Point, None, &input);
+            let shaped = impulse_test_capture(
+                distance_m,
+                ExtentDescriptor::Point,
+                Some(fightbox_api::ImpulseClass::ArtilleryThunder),
+                &input,
+            );
+            let delta_db =
+                10.0 * (energy(&shaped.interleaved) / energy(&plain.interleaved)).log10();
+            assert!(
+                delta_db.abs() <= 0.1,
+                "{distance_m} m signed reference energy changed by {delta_db:+.6} dB"
+            );
+            eprintln!("impulse_energy distance_m={distance_m:.0} delta_db={delta_db:+.9}");
+        }
+    }
+
+    #[test]
+    fn impulse_residual_curve_matches_signed_knots_through_steam_air_and_hrtf() {
+        const WINDOW_FRAMES: usize = 12_288;
+        const MID_HZ: f64 = 2_000.0;
+        const HIGH_HZ: f64 = 10_000.0;
+        for distance_m in [5.0_f32, 50.0, 200.0, 500.0] {
+            let delay_frames = (distance_m * 48_000.0 / 343.0).ceil() as usize;
+            let frame_count = (delay_frames + WINDOW_FRAMES * 3).div_ceil(128) * 128;
+            let input = (0..frame_count)
+                .map(|frame| {
+                    let time = frame as f64 / 48_000.0;
+                    (0.1 * ((std::f64::consts::TAU * MID_HZ * time).sin()
+                        + (std::f64::consts::TAU * HIGH_HZ * time).sin()))
+                        as f32
+                })
+                .collect::<Vec<_>>();
+            let plain = impulse_test_capture(distance_m, ExtentDescriptor::Point, None, &input);
+            let shaped = impulse_test_capture(
+                distance_m,
+                ExtentDescriptor::Point,
+                Some(fightbox_api::ImpulseClass::ArtilleryThunder),
+                &input,
+            );
+            let window_start = (frame_count - WINDOW_FRAMES) * 2;
+            let plain_window = &plain.interleaved[window_start..];
+            let shaped_window = &shaped.interleaved[window_start..];
+            let shaper =
+                ImpulseShaper::new(fightbox_api::ImpulseClass::ArtilleryThunder, 48_000).unwrap();
+            let parameters = shaper.parameters_at_distance(distance_m);
+            for frequency_hz in [MID_HZ, HIGH_HZ] {
+                let plain_magnitude = stereo_frequency_magnitude(plain_window, frequency_hz);
+                let shaped_magnitude = stereo_frequency_magnitude(shaped_window, frequency_hz);
+                assert!(plain_magnitude > 1.0e-12 && shaped_magnitude > 0.0);
+                let measured_db = 20.0 * (shaped_magnitude / plain_magnitude).log10();
+                let expected_db =
+                    20.0 * parameters.residual_gain_at(frequency_hz, 48_000.0).log10();
+                assert!(
+                    (measured_db - expected_db).abs() <= 0.5,
+                    "{distance_m} m at {frequency_hz} Hz measured {measured_db:.6} dB, expected signed residual {expected_db:.6} dB"
+                );
+                eprintln!(
+                    "impulse_curve distance_m={distance_m:.0} frequency_hz={frequency_hz:.0} measured_db={measured_db:.6} expected_db={expected_db:.6}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn line_width_consumes_the_shaped_then_delayed_mono_without_interaction() {
+        const DISTANCE_M: f32 = 50.0;
+        const LINE_LENGTH_M: f32 = 6.0;
+        let mut random = 0x243f_6a88_85a3_08d3_u64;
+        let raw = (0..32_768)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                ((random >> 40) as f32 / (1_u32 << 24) as f32 - 0.5) * 0.2
+            })
+            .collect::<Vec<_>>();
+        let mut offline_shaper =
+            ImpulseShaper::new(fightbox_api::ImpulseClass::ArtilleryThunder, 48_000).unwrap();
+        let parameters = offline_shaper.parameters_at_distance(DISTANCE_M);
+        let pre_shaped = raw
+            .iter()
+            .copied()
+            .map(|sample| offline_shaper.process_sample(sample, parameters))
+            .collect::<Vec<_>>();
+        let extent = ExtentDescriptor::LineSegment {
+            length_m: LINE_LENGTH_M,
+        };
+        let integrated = impulse_test_capture(
+            DISTANCE_M,
+            extent,
+            Some(fightbox_api::ImpulseClass::ArtilleryThunder),
+            &raw,
+        );
+        let sequential = impulse_test_capture(DISTANCE_M, extent, None, &pre_shaped);
+
+        assert_eq!(integrated.source_count, 1);
+        assert!(integrated.has_impulse_shaper && integrated.has_width);
+        assert_eq!(integrated.width_declared_latency_samples, 0);
+        assert_samples_bit_equal(
+            &integrated.delayed_mono,
+            &sequential.delayed_mono,
+            "integrated stage was not shaping before the one shared delay",
+        );
+        assert_samples_bit_equal(
+            integrated.width_presentation.as_ref().unwrap(),
+            sequential.width_presentation.as_ref().unwrap(),
+            "Wave 11 width did not consume the shaped delayed mono",
+        );
+        assert_samples_bit_equal(
+            &integrated.interleaved,
+            &sequential.interleaved,
+            "shaping and width interacted in the direct C-arm output",
+        );
+
+        let source = api_enu_to_steam(ApiEnuVector3::new(0.0, DISTANCE_M, 1.5));
+        let listener = api_enu_to_steam(ApiEnuVector3::new(0.0, 0.0, 1.5));
+        let forward = api_enu_to_steam(ApiEnuVector3::new(1.0, 0.0, 0.0));
+        let geometry = line_geometry(source, forward, listener, LINE_LENGTH_M);
+        let mut width = LineWidthRenderer::new(48_000);
+        let mut expected_presentation = Vec::with_capacity(integrated.delayed_mono.len() * 3);
+        let mut block_output = vec![0.0; 128 * 3];
+        for block in integrated.delayed_mono.chunks_exact(128) {
+            width.render_presentation(block, geometry.k, false, &mut block_output);
+            expected_presentation.extend_from_slice(&block_output);
+        }
+        assert_samples_bit_equal(
+            integrated.width_presentation.as_ref().unwrap(),
+            &expected_presentation,
+            "captured C-arm presentation differed from shaping -> delay -> width",
+        );
+    }
+
+    #[test]
+    fn smoothed_distance_crosses_impulse_knots_without_a_block_discontinuity() {
+        fn crossing(start_m: f32, end_m: f32) -> f32 {
+            let audio = AudioConfig {
+                sample_rate_hz: 48_000,
+                frame_size: 128,
+            };
+            let listener = ApiEnuVector3::new(0.0, 0.0, 1.5);
+            let start = ApiEnuVector3::new(start_m, 0.0, 1.5);
+            let descriptor = [crate::MultiSourceDescriptor::at(start)
+                .with_impulse_class(fightbox_api::ImpulseClass::ArtilleryThunder)];
+            let (mut simulation, mut render) = build_multi_source_generation(
+                &SceneMesh::controlled_s3_corner(),
+                None,
+                audio,
+                test_config(),
+                &descriptor,
+                1,
+                QualityTier::Desktop,
+            )
+            .unwrap();
+            simulation.update_inputs(&one_source_update(true, start, listener));
+            simulation.run_direct().unwrap();
+            let constant = vec![0.25; audio.frame_size as usize];
+            let warmup_blocks =
+                (start_m * 48_000.0 / 343.0 / audio.frame_size as f32).ceil() as usize + 100;
+            for _ in 0..warmup_blocks {
+                render_one_source_block(&mut render, &constant);
+            }
+
+            let mut snapshot = simulation.snapshot;
+            snapshot.sequence = snapshot.sequence.wrapping_add(1);
+            snapshot.sources[0].source_position =
+                api_enu_to_steam(ApiEnuVector3::new(end_m, 0.0, 1.5));
+            simulation.publication.publish(snapshot);
+            let mut captured = Vec::with_capacity(160 * audio.frame_size as usize);
+            let mut crossed = false;
+            let knot = (start_m + end_m) * 0.5;
+            for _ in 0..160 {
+                render_one_source_block(&mut render, &constant);
+                captured.extend_from_slice(&render.mono_work);
+                let applied = render.sources[0].propagation_smoother.applied();
+                let distance =
+                    smoothed_source_distance_m(applied.source_position, applied.listener_position);
+                crossed |= distance >= knot;
+            }
+            assert!(crossed, "smoothed distance never crossed the {knot} m knot");
+
+            let mut maximum_boundary_ratio = 0.0_f32;
+            for boundary in
+                (audio.frame_size as usize..captured.len()).step_by(audio.frame_size as usize)
+            {
+                let step = (captured[boundary] - captured[boundary - 1]).abs();
+                let local_peak = captured[boundary - 64..boundary + 64]
+                    .iter()
+                    .copied()
+                    .map(f32::abs)
+                    .fold(0.0_f32, f32::max);
+                maximum_boundary_ratio = maximum_boundary_ratio.max(step / local_peak.max(1.0e-12));
+            }
+            assert!(
+                maximum_boundary_ratio <= 1.0,
+                "{start_m}->{end_m} m exceeded the existing click bound: {maximum_boundary_ratio}"
+            );
+            maximum_boundary_ratio
+        }
+
+        let at_50_m = crossing(45.0, 55.0);
+        let at_200_m = crossing(195.0, 205.0);
+        eprintln!(
+            "impulse_slew max_boundary_ratio_50m={at_50_m:.9} max_boundary_ratio_200m={at_200_m:.9} bound=1.0"
         );
     }
 
@@ -3741,11 +4556,23 @@ mod tests {
         ))];
         let (mut simulation, mut render) =
             build_multi_source_session(&mesh, &baked, audio, test_config(), &descriptors).unwrap();
+        // Boot policy is intentionally allowed to start this audible source at
+        // Full. Drive the governor to the quality state this integration test
+        // names instead of coupling the path invariant to startup policy.
+        for _ in 0..16 {
+            if simulation.quality_governor_telemetry().sources[0].quality
+                == SourceQualityLevel::DirectOnly
+            {
+                break;
+            }
+            simulation.observe_render_timing(10_000_000);
+            simulation.observe_render_timing(100_000);
+            simulation.observe_render_timing(100_000);
+        }
         assert_eq!(
             simulation.quality_governor_telemetry().sources[0].quality,
             SourceQualityLevel::DirectOnly
         );
-        assert_eq!(render.sources[0].quality_gains, [1.0, 1.0, 0.0]);
 
         let mut stage_gains = render.take_stage_output_gain_writer().unwrap();
         stage_gains.publish(StageOutputGains {

@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ballistics;
+
 /// A position or direction in right-handed local ENU metres.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EnuVector3 {
@@ -526,6 +528,20 @@ impl Default for Directivity {
     }
 }
 
+/// Optional distance-keyed shaping family for impulsive source material.
+///
+/// The default is a structural bypass. `ArtilleryThunder` selects the signed
+/// Wave 12 snap-to-thump curve; the backend owns that curve's transfer
+/// coefficients so this vendor-neutral API carries only the perceptual class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImpulseClass {
+    /// Preserve the dry source samples bit-for-bit before propagation.
+    #[default]
+    None,
+    /// Two-pole residual morph signed for artillery and thunder-like impulses.
+    ArtilleryThunder,
+}
+
 /// Validation failures for a source directivity descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectivityError {
@@ -546,6 +562,38 @@ pub struct SourceProfile {
     /// Source-radiation lobe; [`Directivity::default`] preserves an omni source.
     pub directivity: Directivity,
     pub max_speed_mps: f32,
+}
+
+/// An opt-in impulse classification attached to an otherwise unchanged source profile.
+///
+/// `SourceProfile` predates builders and remains publicly constructible with a
+/// struct literal. Keeping this additive wrapper separate preserves every
+/// existing construction site while allowing new callers to opt in through
+/// [`SourceProfile::with_impulse_class`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassifiedSourceProfile {
+    source: SourceProfile,
+    impulse_class: ImpulseClass,
+}
+
+impl ClassifiedSourceProfile {
+    /// The original vendor-neutral source declaration.
+    #[must_use]
+    pub const fn source(&self) -> &SourceProfile {
+        &self.source
+    }
+
+    /// The selected impulse-shaping family.
+    #[must_use]
+    pub const fn impulse_class(&self) -> ImpulseClass {
+        self.impulse_class
+    }
+
+    /// Recovers the original source declaration for existing source pipelines.
+    #[must_use]
+    pub fn into_source(self) -> SourceProfile {
+        self.source
+    }
 }
 
 /// Listener state supplied to simulation workers.
@@ -603,6 +651,19 @@ impl EngineConfig {
 }
 
 impl SourceProfile {
+    /// Opts this source into a distance-keyed impulse-shaping family.
+    ///
+    /// The returned wrapper keeps the classification private and default-free;
+    /// an unwrapped `SourceProfile` is exactly equivalent to
+    /// [`ImpulseClass::None`].
+    #[must_use]
+    pub const fn with_impulse_class(self, impulse_class: ImpulseClass) -> ClassifiedSourceProfile {
+        ClassifiedSourceProfile {
+            source: self,
+            impulse_class,
+        }
+    }
+
     /// Validation keeps calibrated SPL vocabulary explicit without inventing an output-ear SPL.
     pub fn validate(&self) -> Result<(), SourceError> {
         if self.id.0.is_empty() {
@@ -690,6 +751,23 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn impulse_class_defaults_to_structural_bypass() {
+        assert_eq!(ImpulseClass::default(), ImpulseClass::None);
+    }
+
+    #[test]
+    fn source_profile_impulse_builder_preserves_the_original_profile() {
+        let profile = source_profile_with_directivity(Directivity::default());
+        let classified = profile
+            .clone()
+            .with_impulse_class(ImpulseClass::ArtilleryThunder);
+
+        assert_eq!(classified.source(), &profile);
+        assert_eq!(classified.impulse_class(), ImpulseClass::ArtilleryThunder);
+        assert_eq!(classified.into_source(), profile);
     }
 
     #[test]

@@ -1,10 +1,12 @@
 use std::path::Path;
 
-use fightbox_api::{Directivity, EnuVector3, ExtentDescriptor, ExtentError};
+use fightbox_api::{Directivity, EnuVector3, ExtentDescriptor, ExtentError, ReferenceLevel};
 use fightbox_steam_audio::{
-    AcousticMaterial, BakedProbeBatch, DirectOcclusionMode, PROBE_BATCH_METADATA_SCHEMA,
-    ProbeBatchMetadata, ReflectionEffectConfig, S3SimulationConfig, STEAM_AUDIO_UPSTREAM_COMMIT,
-    STEAM_AUDIO_VERSION, SceneMesh,
+    AcousticMaterial, BakedProbeBatch, DEFAULT_OCCLUSION_SAMPLE_COUNT,
+    DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS, DirectOcclusionMode,
+    MAX_EXTENT_OCCLUSION_RADIUS_METERS, MIN_EXTENT_OCCLUSION_RADIUS_METERS,
+    PROBE_BATCH_METADATA_SCHEMA, ProbeBatchMetadata, ReflectionEffectConfig, S3SimulationConfig,
+    STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION, SceneMesh,
 };
 use fightbox_world::LoadedPackage;
 use serde::Deserialize;
@@ -140,9 +142,34 @@ fn validate_extent(extent: ExtentDescriptor, source_id: &str) -> Result<(), Stri
     })
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+enum FixtureReferenceLevelMode {
+    SplAtOneMeter,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FixtureReferenceLevel {
+    mode: FixtureReferenceLevelMode,
     pub db_spl: f64,
+}
+
+impl FixtureReferenceLevel {
+    pub fn to_api(self) -> ReferenceLevel {
+        debug_assert_eq!(self.mode, FixtureReferenceLevelMode::SplAtOneMeter);
+        ReferenceLevel::SplAtOneMeter {
+            db_spl: self.db_spl as f32,
+        }
+    }
+
+    fn validate(self, source_id: &str) -> Result<(), String> {
+        if !self.db_spl.is_finite() || !(self.db_spl as f32).is_finite() {
+            return Err(format!(
+                "source {source_id} reference_level.db_spl must be finite and representable as f32"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -164,6 +191,7 @@ pub struct FixtureSimulation {
     pub direct: FixtureDirect,
     pub reflections: FixtureReflections,
     pub pathing: FixturePathing,
+    pub probe_volume: FixtureProbeVolume,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -183,6 +211,22 @@ pub struct FixturePathing {
     pub order: Option<u32>,
     pub validation: Option<bool>,
     pub alternate_paths: Option<bool>,
+    pub visibility_range_m: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct FixtureProbeVolume {
+    pub spacing_m: f64,
+}
+
+/// Workbench path-range evidence carried into status output and captures.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VisibilityRangeAdoption {
+    pub configured_m: f32,
+    pub probe_spacing_m: f32,
+    pub minimum_for_spacing_m: f32,
+    pub effective_m: f32,
+    pub rebaselined: bool,
 }
 
 impl Fixture {
@@ -203,6 +247,7 @@ impl Fixture {
         fixture.initial_listener_position()?;
         for source in &fixture.sources {
             source.initial_position()?;
+            source.reference_level.validate(&source.id)?;
             source.directivity.validate(&source.id)?;
             validate_extent(source.extent, &source.id)?;
             if let Some(trajectory) = &source.trajectory {
@@ -212,6 +257,7 @@ impl Fixture {
         if let Some(trajectory) = &fixture.listener.trajectory {
             trajectory.validate("listener")?;
         }
+        fixture.validate_simulation()?;
         Ok(fixture)
     }
 
@@ -221,22 +267,167 @@ impl Fixture {
     }
 
     pub fn simulation_config(&self) -> S3SimulationConfig {
+        let visibility = self.visibility_range_adoption();
+        let max_occlusion_samples = self.simulation.direct.occlusion_samples.unwrap_or(64) as i32;
+        let occlusion_samples = self
+            .simulation
+            .direct
+            .occlusion_samples
+            .map_or(DEFAULT_OCCLUSION_SAMPLE_COUNT, |samples| samples as i32)
+            .clamp(1, max_occlusion_samples);
         S3SimulationConfig {
-            max_occlusion_samples: self.simulation.direct.occlusion_samples.unwrap_or(64) as i32,
+            max_occlusion_samples,
             direct_occlusion: DirectOcclusionMode::Volumetric {
-                radius_m: 1.0,
-                sample_count: 32,
+                // Point sources retain the documented live-session footprint.
+                // Non-point descriptors replace this radius inside the backend.
+                radius_m: DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS,
+                sample_count: occlusion_samples,
             },
             reflection_rays: self.simulation.reflections.rays.unwrap_or(4_096) as i32,
             reflection_bounces: self.simulation.reflections.bounces.unwrap_or(2) as i32,
             reflection_duration_s: self.simulation.reflections.duration_s.unwrap_or(1.0) as f32,
             reflection_effect: ReflectionEffectConfig::CONVOLUTION,
             pathing_order: self.simulation.pathing.order.unwrap_or(2) as i32,
+            pathing_visibility_range_m: visibility.effective_m,
             validate_paths: self.simulation.pathing.validation.unwrap_or(true),
             find_alternate_paths: self.simulation.pathing.alternate_paths.unwrap_or(true),
             trace_path_validation: false,
             ..S3SimulationConfig::default()
         }
+    }
+
+    /// Pairs runtime path visibility with the fixture's actual probe spacing.
+    ///
+    /// An absent configured range means the backend's existing 6 m default;
+    /// the same 2.5x-spacing floor is then applied, so absence cannot silently
+    /// recreate an under-ranged workbench session.
+    pub fn visibility_range_adoption(&self) -> VisibilityRangeAdoption {
+        let defaults = S3SimulationConfig::default();
+        let configured_m =
+            self.simulation
+                .pathing
+                .visibility_range_m
+                .unwrap_or(f64::from(defaults.pathing_visibility_range_m)) as f32;
+        let probe_spacing_m = self.simulation.probe_volume.spacing_m as f32;
+        let minimum_for_spacing_m = probe_spacing_m * 2.5;
+        let effective_m = configured_m.max(minimum_for_spacing_m);
+        VisibilityRangeAdoption {
+            configured_m,
+            probe_spacing_m,
+            minimum_for_spacing_m,
+            effective_m,
+            rebaselined: effective_m > configured_m,
+        }
+    }
+
+    fn validate_simulation(&self) -> Result<(), String> {
+        fn fits_i32(value: u32) -> bool {
+            value <= i32::MAX as u32
+        }
+
+        if self
+            .simulation
+            .direct
+            .occlusion_samples
+            .is_some_and(|samples| samples == 0 || !fits_i32(samples))
+        {
+            return Err("simulation.direct.occlusion_samples must be in 1..=2147483647".into());
+        }
+        if self
+            .simulation
+            .reflections
+            .rays
+            .is_some_and(|rays| rays == 0 || !fits_i32(rays))
+        {
+            return Err("simulation.reflections.rays must be in 1..=2147483647".into());
+        }
+        if self
+            .simulation
+            .reflections
+            .bounces
+            .is_some_and(|bounces| !fits_i32(bounces))
+        {
+            return Err("simulation.reflections.bounces must be <= 2147483647".into());
+        }
+        if self
+            .simulation
+            .reflections
+            .duration_s
+            .is_some_and(|duration| {
+                !duration.is_finite() || duration <= 0.0 || !(duration as f32).is_finite()
+            })
+        {
+            return Err(
+                "simulation.reflections.duration_s must be finite, positive, and representable as f32"
+                    .into(),
+            );
+        }
+        if self
+            .simulation
+            .pathing
+            .order
+            .is_some_and(|order| !fits_i32(order))
+        {
+            return Err("simulation.pathing.order must be <= 2147483647".into());
+        }
+        if self
+            .simulation
+            .pathing
+            .visibility_range_m
+            .is_some_and(|range| !range.is_finite() || range <= 0.0 || !(range as f32).is_finite())
+        {
+            return Err(
+                "simulation.pathing.visibility_range_m must be finite, positive, and representable as f32"
+                    .into(),
+            );
+        }
+        let spacing = self.simulation.probe_volume.spacing_m;
+        if !spacing.is_finite()
+            || spacing <= 0.0
+            || !(spacing as f32).is_finite()
+            || !((spacing as f32) * 2.5).is_finite()
+        {
+            return Err(
+                "simulation.probe_volume.spacing_m must be finite, positive, and support the 2.5x visibility guard"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Resolves the per-source volumetric request the backend derives from the
+/// descriptor passed by the workbench. Kept here for status/capture truth; the
+/// backend remains authoritative and consumes the same extent independently.
+pub fn occlusion_mode_for_extent(
+    config: S3SimulationConfig,
+    extent: ExtentDescriptor,
+) -> DirectOcclusionMode {
+    let radius_m = match extent {
+        ExtentDescriptor::Point => return config.direct_occlusion,
+        ExtentDescriptor::MultiPoint { count } if count > 0 => {
+            DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS
+        }
+        ExtentDescriptor::LineSegment { length_m }
+        | ExtentDescriptor::StereoImage { width_m: length_m }
+            if length_m.is_finite() && length_m > 0.0 =>
+        {
+            (length_m * 0.5).clamp(
+                MIN_EXTENT_OCCLUSION_RADIUS_METERS,
+                MAX_EXTENT_OCCLUSION_RADIUS_METERS,
+            )
+        }
+        _ => return config.direct_occlusion,
+    };
+    let sample_count = match config.direct_occlusion {
+        DirectOcclusionMode::Raycast => {
+            DEFAULT_OCCLUSION_SAMPLE_COUNT.min(config.max_occlusion_samples.max(1))
+        }
+        DirectOcclusionMode::Volumetric { sample_count, .. } => sample_count,
+    };
+    DirectOcclusionMode::Volumetric {
+        radius_m,
+        sample_count,
     }
 }
 
@@ -586,6 +777,10 @@ mod tests {
         assert!(fixture.sources[0].default_enabled);
         assert_eq!(fixture.sources[0].reference_level.db_spl, 105.0);
         assert_eq!(
+            fixture.sources[0].reference_level.to_api(),
+            ReferenceLevel::SplAtOneMeter { db_spl: 105.0 }
+        );
+        assert_eq!(
             fixture.sources[0].directivity,
             FixtureDirectivity::default()
         );
@@ -638,5 +833,115 @@ mod tests {
         );
         let text = std::fs::read_to_string(fixture_path).unwrap();
         assert!(text.contains("4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843"));
+    }
+
+    #[test]
+    fn fixture_occlusion_samples_drive_point_and_extent_modes() {
+        let fixture = Fixture::read(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/city/megablock/fixture.json"),
+        )
+        .unwrap();
+        let config = fixture.simulation_config();
+        assert_eq!(config.max_occlusion_samples, 64);
+        assert_eq!(
+            config.direct_occlusion,
+            DirectOcclusionMode::Volumetric {
+                radius_m: 1.0,
+                sample_count: 64,
+            }
+        );
+        assert_eq!(
+            occlusion_mode_for_extent(config, ExtentDescriptor::Point),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 1.0,
+                sample_count: 64,
+            }
+        );
+        assert_eq!(
+            occlusion_mode_for_extent(config, ExtentDescriptor::LineSegment { length_m: 6.0 }),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 3.0,
+                sample_count: 64,
+            }
+        );
+        assert_eq!(
+            occlusion_mode_for_extent(config, ExtentDescriptor::StereoImage { width_m: 4.0 }),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 2.0,
+                sample_count: 64,
+            }
+        );
+        assert_eq!(
+            occlusion_mode_for_extent(config, ExtentDescriptor::MultiPoint { count: 4 }),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 1.0,
+                sample_count: 64,
+            }
+        );
+    }
+
+    #[test]
+    fn absent_visibility_range_adopts_two_and_a_half_times_probe_spacing() {
+        let fixture = Fixture::read(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/city/megablock/fixture.json"),
+        )
+        .unwrap();
+        let adoption = fixture.visibility_range_adoption();
+        assert_eq!(adoption.configured_m, 6.0);
+        assert_eq!(adoption.probe_spacing_m, 4.0);
+        assert_eq!(adoption.minimum_for_spacing_m, 10.0);
+        assert_eq!(adoption.effective_m, 10.0);
+        assert!(adoption.rebaselined);
+        assert_eq!(fixture.simulation_config().pathing_visibility_range_m, 10.0);
+    }
+
+    #[test]
+    fn explicit_visibility_range_is_kept_or_adopted_against_the_same_floor() {
+        let original = include_str!("../../../fixtures/city/megablock/fixture.json");
+        for (configured, expected, rebaselined) in [(12.0, 12.0, false), (5.0, 10.0, true)] {
+            let text = original.replace(
+                r#""alternate_paths": true,"#,
+                &format!(
+                    r#""alternate_paths": true,
+      "visibility_range_m": {configured},"#
+                ),
+            );
+            let fixture = Fixture::parse(text.as_bytes(), "visibility-test").unwrap();
+            let adoption = fixture.visibility_range_adoption();
+            assert_eq!(adoption.configured_m, configured as f32);
+            assert_eq!(adoption.effective_m, expected);
+            assert_eq!(adoption.rebaselined, rebaselined);
+        }
+    }
+
+    #[test]
+    fn fixture_rejects_invalid_reference_and_simulation_ranges() {
+        let original = include_str!("../../../fixtures/city/megablock/fixture.json");
+        for (text, expected) in [
+            (
+                original.replacen("SplAtOneMeter", "CreativeDb", 1),
+                "unknown variant `CreativeDb`",
+            ),
+            (
+                original.replacen("\"occlusion_samples\": 64", "\"occlusion_samples\": 0", 1),
+                "occlusion_samples must be in 1..=2147483647",
+            ),
+            (
+                original.replace(
+                    r#""alternate_paths": true,"#,
+                    r#""alternate_paths": true,
+      "visibility_range_m": 0,"#,
+                ),
+                "visibility_range_m must be finite, positive",
+            ),
+        ] {
+            let error = Fixture::parse(text.as_bytes(), "invalid-range-test").unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in fixture error, got: {error}"
+            );
+        }
     }
 }

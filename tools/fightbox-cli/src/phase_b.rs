@@ -2245,6 +2245,7 @@ mod tests {
             physically_calibrated: true,
             below_hearing_threshold: false,
             transport_advances: true,
+            ..Default::default()
         };
         sources[1] = fightbox_steam_audio::SourceQualityTelemetry {
             source_index: 1,
@@ -2253,6 +2254,7 @@ mod tests {
             physically_calibrated: true,
             below_hearing_threshold: false,
             transport_advances: true,
+            ..Default::default()
         };
         sources[2] = fightbox_steam_audio::SourceQualityTelemetry {
             source_index: 2,
@@ -2261,6 +2263,7 @@ mod tests {
             physically_calibrated: true,
             below_hearing_threshold: true,
             transport_advances: true,
+            ..Default::default()
         };
         let telemetry = QualityGovernorTelemetry {
             quality_tier: QualityTier::Desktop,
@@ -2289,6 +2292,10 @@ mod tests {
             ambisonic_order: 1,
             reverb: ReverbStrategy::ShortIrLowerOrder,
             reflection_output_gain: 1.0,
+            boot_reflection_level: ReflectionQualityLevel::Reduced,
+            boot_predicted_cost_ns: 0,
+            boot_p99_budget_ns: 0,
+            boot_cost_limit_ns: 0,
             sources,
             source_count: 3,
             memory: SessionMemoryTelemetry::default(),

@@ -10,7 +10,10 @@ use fightbox_api::EnuVector3;
 use fightbox_runtime::MAX_ACTIVE_SOURCES;
 use fightbox_runtime::backend::{SimulationError, SimulationRunner, SimulationUpdate};
 use fightbox_runtime::{SnapshotPublication, SnapshotReader, SnapshotWriter};
-use fightbox_steam_audio::{SourceQualityLevel, StageOutputGains, SteamAudioSimulationRunner};
+use fightbox_steam_audio::{
+    GovernorTransitionReason, PathQualityLevel, ReflectionQualityLevel, SourceQualityLevel,
+    StageOutputGains, SteamAudioSimulationRunner,
+};
 
 /// Whether a queried position sits inside an influencing baked probe.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,10 +79,16 @@ impl ProbeCoverageQuery {
 /// not heard from the simulation thread yet: without a governor no source can be
 /// demoted or virtualized, so every stage still runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SourceQuality {
+pub(crate) enum SourceQuality {
     Unknown,
     Ungoverned,
     Governed(SourceQualityLevel),
+}
+
+impl Default for SourceQuality {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
 
 impl SourceQuality {
@@ -110,9 +119,51 @@ pub(crate) struct AcousticTelemetry {
     /// The governor reports nothing for an unbaked generation.
     pub(crate) governor_available: bool,
     pub(crate) source_quality: [SourceQualityLevel; MAX_ACTIVE_SOURCES],
+    pub(crate) source_physically_calibrated: [bool; MAX_ACTIVE_SOURCES],
+    pub(crate) source_predicted_audibility_db: [f32; MAX_ACTIVE_SOURCES],
     /// Per-source Steam Audio direct occlusion, an audibility fraction:
     /// `1.0` fully clear, `0.0` fully occluded. `None` for inactive slots.
     pub(crate) source_occlusion: [Option<f32>; MAX_ACTIVE_SOURCES],
+    pub(crate) source_path_eq: [Option<[f32; 3]>; MAX_ACTIVE_SOURCES],
+    pub(crate) source_path_sh_energy: [Option<f32>; MAX_ACTIVE_SOURCES],
+    pub(crate) governor: Option<GovernorAcousticTelemetry>,
+}
+
+/// Delivered governor state copied into the workbench's wait-free telemetry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GovernorAcousticTelemetry {
+    pub(crate) ladder_position: u16,
+    pub(crate) reason: GovernorTransitionReason,
+    pub(crate) reflection_level: ReflectionQualityLevel,
+    pub(crate) reflection_rays: i32,
+    pub(crate) reflection_bounces: i32,
+    pub(crate) reflection_ir_duration_s: f32,
+    pub(crate) reflection_cadence_divisor: u8,
+    pub(crate) reflection_output_gain: f32,
+    pub(crate) pathing: PathQualityLevel,
+    pub(crate) ambisonic_order: i32,
+    /// First governor state observed after session construction. This remains
+    /// fixed so later degradation cannot rewrite the displayed boot decision.
+    pub(crate) observed_boot_ladder_position: u16,
+    pub(crate) observed_boot_reflection_level: ReflectionQualityLevel,
+    pub(crate) observed_boot_pathing: PathQualityLevel,
+    pub(crate) observed_boot_ambisonic_order: i32,
+    #[cfg(fightbox_governor_boot_telemetry)]
+    pub(crate) boot_reflection_level: ReflectionQualityLevel,
+    #[cfg(fightbox_governor_boot_telemetry)]
+    pub(crate) boot_predicted_cost_ns: u64,
+    #[cfg(fightbox_governor_boot_telemetry)]
+    pub(crate) boot_p99_budget_ns: u64,
+    #[cfg(fightbox_governor_boot_telemetry)]
+    pub(crate) boot_cost_limit_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ObservedGovernorBoot {
+    ladder_position: u16,
+    reflection_level: ReflectionQualityLevel,
+    pathing: PathQualityLevel,
+    ambisonic_order: i32,
 }
 
 impl AcousticTelemetry {
@@ -121,7 +172,12 @@ impl AcousticTelemetry {
         baked_pathing: false,
         governor_available: false,
         source_quality: [SourceQualityLevel::Full; MAX_ACTIVE_SOURCES],
+        source_physically_calibrated: [false; MAX_ACTIVE_SOURCES],
+        source_predicted_audibility_db: [0.0; MAX_ACTIVE_SOURCES],
         source_occlusion: [None; MAX_ACTIVE_SOURCES],
+        source_path_eq: [None; MAX_ACTIVE_SOURCES],
+        source_path_sh_energy: [None; MAX_ACTIVE_SOURCES],
+        governor: None,
     };
 
     fn baked_pathing(self) -> Option<bool> {
@@ -145,6 +201,33 @@ impl AcousticTelemetry {
     fn occlusion(self, source_index: usize) -> Option<f32> {
         self.source_occlusion.get(source_index).copied().flatten()
     }
+
+    fn physically_calibrated(self, source_index: usize) -> Option<bool> {
+        (self.known && self.governor_available)
+            .then(|| self.source_physically_calibrated.get(source_index).copied())
+            .flatten()
+    }
+
+    fn predicted_audibility_db(self, source_index: usize) -> Option<f32> {
+        (self.known && self.governor_available)
+            .then(|| {
+                self.source_predicted_audibility_db
+                    .get(source_index)
+                    .copied()
+            })
+            .flatten()
+    }
+
+    fn path_eq(self, source_index: usize) -> Option<[f32; 3]> {
+        self.source_path_eq.get(source_index).copied().flatten()
+    }
+
+    fn path_sh_energy(self, source_index: usize) -> Option<f32> {
+        self.source_path_sh_energy
+            .get(source_index)
+            .copied()
+            .flatten()
+    }
 }
 
 /// Wraps the retained session's simulation half so the UI can observe delivered
@@ -157,6 +240,7 @@ impl AcousticTelemetry {
 pub(crate) struct AcousticTelemetryTap {
     runner: SteamAudioSimulationRunner,
     writer: SnapshotWriter<AcousticTelemetry>,
+    observed_boot: Option<ObservedGovernorBoot>,
 }
 
 impl AcousticTelemetryTap {
@@ -164,7 +248,14 @@ impl AcousticTelemetryTap {
         runner: SteamAudioSimulationRunner,
     ) -> (Self, SnapshotReader<AcousticTelemetry>) {
         let (writer, reader) = SnapshotPublication::new(AcousticTelemetry::UNKNOWN);
-        (Self { runner, writer }, reader)
+        (
+            Self {
+                runner,
+                writer,
+                observed_boot: None,
+            },
+            reader,
+        )
     }
 
     fn publish(&mut self) {
@@ -175,18 +266,59 @@ impl AcousticTelemetryTap {
             baked_pathing: capabilities.baked_pathing,
             governor_available: governor.is_some(),
             source_quality: [SourceQualityLevel::Full; MAX_ACTIVE_SOURCES],
+            source_physically_calibrated: [false; MAX_ACTIVE_SOURCES],
+            source_predicted_audibility_db: [0.0; MAX_ACTIVE_SOURCES],
             source_occlusion: [None; MAX_ACTIVE_SOURCES],
+            source_path_eq: [None; MAX_ACTIVE_SOURCES],
+            source_path_sh_energy: [None; MAX_ACTIVE_SOURCES],
+            governor: None,
         };
         for index in 0..MAX_ACTIVE_SOURCES {
-            telemetry.source_occlusion[index] = self
+            if let Some(diagnostics) = self
                 .runner
                 .source_diagnostics(index)
                 .filter(|diagnostics| diagnostics.active)
-                .map(|diagnostics| diagnostics.occlusion);
+            {
+                telemetry.source_occlusion[index] = Some(diagnostics.occlusion);
+                telemetry.source_path_eq[index] = Some(diagnostics.path_eq);
+                telemetry.source_path_sh_energy[index] = Some(diagnostics.path_sh_energy);
+            }
         }
         if let Some(governor) = governor {
+            let observed_boot = *self.observed_boot.get_or_insert(ObservedGovernorBoot {
+                ladder_position: governor.ladder_position,
+                reflection_level: governor.reflections.level,
+                pathing: governor.pathing,
+                ambisonic_order: governor.ambisonic_order,
+            });
+            telemetry.governor = Some(GovernorAcousticTelemetry {
+                ladder_position: governor.ladder_position,
+                reason: governor.reason,
+                reflection_level: governor.reflections.level,
+                reflection_rays: governor.reflections.rays,
+                reflection_bounces: governor.reflections.bounces,
+                reflection_ir_duration_s: governor.reflections.ir_duration_s,
+                reflection_cadence_divisor: governor.reflections.cadence_divisor,
+                reflection_output_gain: governor.reflection_output_gain,
+                pathing: governor.pathing,
+                ambisonic_order: governor.ambisonic_order,
+                observed_boot_ladder_position: observed_boot.ladder_position,
+                observed_boot_reflection_level: observed_boot.reflection_level,
+                observed_boot_pathing: observed_boot.pathing,
+                observed_boot_ambisonic_order: observed_boot.ambisonic_order,
+                #[cfg(fightbox_governor_boot_telemetry)]
+                boot_reflection_level: governor.boot_reflection_level,
+                #[cfg(fightbox_governor_boot_telemetry)]
+                boot_predicted_cost_ns: governor.boot_predicted_cost_ns,
+                #[cfg(fightbox_governor_boot_telemetry)]
+                boot_p99_budget_ns: governor.boot_p99_budget_ns,
+                #[cfg(fightbox_governor_boot_telemetry)]
+                boot_cost_limit_ns: governor.boot_cost_limit_ns,
+            });
             for (index, source) in governor.sources.iter().enumerate() {
                 telemetry.source_quality[index] = source.quality;
+                telemetry.source_physically_calibrated[index] = source.physically_calibrated;
+                telemetry.source_predicted_audibility_db[index] = source.predicted_audibility_db;
             }
         }
         self.writer.publish(telemetry);
@@ -222,6 +354,11 @@ pub(crate) struct SourceAcousticState {
     pub(crate) direct: StageAudibility,
     pub(crate) path: StageAudibility,
     pub(crate) reflections: StageAudibility,
+    pub(crate) quality: SourceQuality,
+    pub(crate) physically_calibrated: Option<bool>,
+    pub(crate) predicted_audibility_db: Option<f32>,
+    pub(crate) path_eq: Option<[f32; 3]>,
+    pub(crate) path_sh_energy: Option<f32>,
 }
 
 /// Resolved inputs for one source, kept explicit so the decision stays pure.
@@ -242,6 +379,11 @@ impl SourceAcousticState {
         direct: StageAudibility::Unknown,
         path: StageAudibility::Unknown,
         reflections: StageAudibility::Unknown,
+        quality: SourceQuality::Unknown,
+        physically_calibrated: None,
+        predicted_audibility_db: None,
+        path_eq: None,
+        path_sh_energy: None,
     };
 
     pub(crate) fn evaluate(
@@ -283,6 +425,11 @@ impl SourceAcousticState {
                     SourceQuality::Governed(_) => StageAudibility::Silent,
                 },
             ),
+            quality,
+            physically_calibrated: telemetry.physically_calibrated(source_index),
+            predicted_audibility_db: telemetry.predicted_audibility_db(source_index),
+            path_eq: telemetry.path_eq(source_index),
+            path_sh_energy: telemetry.path_sh_energy(source_index),
         }
     }
 }
@@ -364,6 +511,49 @@ pub(crate) fn stage_chips(state: SourceAcousticState) -> [(String, BadgeTone); 3
     ]
 }
 
+pub(crate) fn quality_text(state: SourceAcousticState) -> String {
+    let quality = match state.quality {
+        SourceQuality::Unknown => "quality —",
+        SourceQuality::Ungoverned => "quality ungoverned",
+        SourceQuality::Governed(SourceQualityLevel::Full) => "quality Full",
+        SourceQuality::Governed(SourceQualityLevel::DirectOnly) => "quality DirectOnly",
+        SourceQuality::Governed(SourceQualityLevel::Virtualized) => "quality Virtualized",
+    };
+    let calibration = match state.physically_calibrated {
+        Some(true) => "calibrated",
+        Some(false) => "UNCALIBRATED",
+        None => "calibration —",
+    };
+    match state.predicted_audibility_db {
+        Some(predicted) if state.physically_calibrated == Some(true) => {
+            format!("{quality}   {calibration}   predicted {predicted:.1} dB SPL")
+        }
+        Some(predicted) => format!("{quality}   {calibration}   predicted {predicted:.1} dB"),
+        None => format!("{quality}   {calibration}"),
+    }
+}
+
+pub(crate) fn quality_tone(state: SourceAcousticState) -> BadgeTone {
+    match (state.quality, state.physically_calibrated) {
+        (SourceQuality::Unknown, _) => BadgeTone::Unknown,
+        (_, Some(false)) | (SourceQuality::Governed(SourceQualityLevel::DirectOnly), _) => {
+            BadgeTone::Warn
+        }
+        (SourceQuality::Governed(SourceQualityLevel::Virtualized), _) => BadgeTone::Off,
+        _ => BadgeTone::Ok,
+    }
+}
+
+pub(crate) fn path_diagnostics_text(state: SourceAcousticState) -> String {
+    match (state.path_sh_energy, state.path_eq) {
+        (Some(energy), Some(eq)) => format!(
+            "path SH {energy:.3e}   EQ {:.3}/{:.3}/{:.3}",
+            eq[0], eq[1], eq[2]
+        ),
+        _ => "path SH —   EQ —/—/—".to_owned(),
+    }
+}
+
 fn stage_chip(name: &str, audibility: StageAudibility) -> (String, BadgeTone) {
     match audibility {
         StageAudibility::Audible => (format!("+{name}"), BadgeTone::Ok),
@@ -405,6 +595,7 @@ mod tests {
             known: true,
             baked_pathing: true,
             governor_available: true,
+            source_physically_calibrated: [true; MAX_ACTIVE_SOURCES],
             ..AcousticTelemetry::UNKNOWN
         }
     }
@@ -563,6 +754,36 @@ mod tests {
         assert_eq!(virtualized.direct, StageAudibility::Silent);
         assert_eq!(virtualized.path, StageAudibility::Silent);
         assert_eq!(virtualized.reflections, StageAudibility::Silent);
+    }
+
+    #[test]
+    fn source_status_reports_quality_calibration_and_path_proof_values() {
+        let mut source_predicted_audibility_db = [0.0; MAX_ACTIVE_SOURCES];
+        source_predicted_audibility_db[0] = 92.25;
+        let mut source_path_eq = [None; MAX_ACTIVE_SOURCES];
+        source_path_eq[0] = Some([0.626, 0.272, 0.151]);
+        let mut source_path_sh_energy = [None; MAX_ACTIVE_SOURCES];
+        source_path_sh_energy[0] = Some(1.25e-5);
+        let state = SourceAcousticState::evaluate(
+            inputs(),
+            AcousticTelemetry {
+                source_predicted_audibility_db,
+                source_path_eq,
+                source_path_sh_energy,
+                ..telemetry()
+            },
+            0,
+        );
+
+        assert_eq!(
+            quality_text(state),
+            "quality Full   calibrated   predicted 92.2 dB SPL"
+        );
+        assert_eq!(quality_tone(state), BadgeTone::Ok);
+        assert_eq!(
+            path_diagnostics_text(state),
+            "path SH 1.250e-5   EQ 0.626/0.272/0.151"
+        );
     }
 
     #[test]
