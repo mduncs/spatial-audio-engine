@@ -698,6 +698,7 @@ fn source_profile() -> SourceProfile {
         )
         .unwrap(),
         extent: ExtentDescriptor::Point,
+        directivity: fightbox_api::Directivity::default(),
         max_speed_mps: SPEED_MPS,
     }
 }

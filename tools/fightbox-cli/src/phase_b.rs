@@ -1651,6 +1651,7 @@ fn prepare_fixture(
                 },
                 asset_analysis: analysis.analysis().clone(),
                 extent: ExtentDescriptor::Point,
+                directivity: fightbox_api::Directivity::default(),
                 max_speed_mps: source
                     .trajectory
                     .as_ref()

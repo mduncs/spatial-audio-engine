@@ -18,7 +18,9 @@ pub const S3_TRAJECTORY_METRICS: &str = "fightbox.s3-trajectory-metrics.v1";
 /// Verify command result JSON (`verify --bundle ...`).
 pub const VERIFY_RESULT: &str = "fightbox.verify-result.v1";
 
-/// The fixture schema version this CLI accepts (mirrors `fixture.schema.json`).
+/// The fixture schema version this CLI accepts (mirrors the frozen
+/// `fixture.schema.json`; optional source directivity is a backward-compatible,
+/// strictly validated parser extension under the same version).
 pub const FIXTURE: &str = "fightbox.fixture.v1";
 /// The asset descriptor schema version this CLI accepts.
 pub const ASSET_DESCRIPTOR: &str = "fightbox.asset-descriptor.v1";

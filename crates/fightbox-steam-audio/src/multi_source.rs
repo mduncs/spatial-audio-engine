@@ -23,7 +23,7 @@ use crate::motion_smoothing::{
 use crate::probe_influence::SerializedProbeInfluences;
 use crate::propagation_delay::PropagationDelayLine;
 use crate::{MemoryTrackingStatus, QualityTier, SessionMemoryTelemetry};
-use fightbox_api::{EnuVector3 as ApiEnuVector3, Pose};
+use fightbox_api::{Directivity, EnuVector3 as ApiEnuVector3, Pose};
 use fightbox_runtime::SnapshotPublication;
 use fightbox_runtime::backend::{
     BackendRenderError, BackendSourceBlock, ListenerOrientation, MAX_ACTIVE_SOURCES,
@@ -188,6 +188,7 @@ pub(crate) struct MultiSourceSimulation {
     world: Arc<WorldGeneration>,
     audio: AudioConfig,
     config: S3SimulationConfig,
+    source_directivities: [Directivity; MAX_ACTIVE_SOURCES],
     frame: SimulationFrame,
     valid_update: bool,
     snapshot: SteamPropagationSnapshot,
@@ -381,6 +382,7 @@ impl MultiSourceSimulation {
         for index in 0..self.world.source_count {
             let mut inputs = source_inputs(
                 self.frame.sources[index],
+                self.source_directivities[index],
                 self.world.probe_batch(),
                 self.config,
                 quality,
@@ -629,6 +631,7 @@ fn shared_inputs(
 
 fn source_inputs(
     source: SteamPose,
+    directivity: Directivity,
     probe_batch: ffi::IPLProbeBatch,
     config: S3SimulationConfig,
     quality: GovernorRenderSnapshot,
@@ -645,8 +648,8 @@ fn source_inputs(
         distanceAttenuationModel: default_distance_model(),
         airAbsorptionModel: default_air_absorption_model(),
         directivity: ffi::IPLDirectivity {
-            dipoleWeight: 0.0,
-            dipolePower: 1.0,
+            dipoleWeight: directivity.dipole_weight,
+            dipolePower: directivity.dipole_power,
             callback: None,
             userData: core::ptr::null_mut(),
         },
@@ -1349,12 +1352,14 @@ pub(crate) fn build_multi_source_generation(
         forward: SteamVector3::new(0.0, 0.0, -1.0),
         up: SteamVector3::new(0.0, 1.0, 0.0),
     }; MAX_ACTIVE_SOURCES];
+    let mut source_directivities = [Directivity::OMNIDIRECTIONAL; MAX_ACTIVE_SOURCES];
     let mut active = [false; MAX_ACTIVE_SOURCES];
     for (index, descriptor) in descriptors.iter().enumerate() {
         source_poses[index] =
             SteamPose::from_api(default_api_pose(descriptor.initial_position_enu)).ok_or(
                 BackendError::InvalidInput("multi-source descriptor position must be finite"),
             )?;
+        source_directivities[index] = descriptor.directivity;
         active[index] = true;
         initial.sources[index].active = true;
         initial.sources[index].source_position = source_poses[index].position;
@@ -1380,6 +1385,7 @@ pub(crate) fn build_multi_source_generation(
         world,
         audio,
         config,
+        source_directivities,
         frame: SimulationFrame {
             listener,
             listener_linear_velocity_mps: SteamVector3::default(),
@@ -1422,6 +1428,14 @@ fn validate_multi_source_config(
     }) {
         return Err(BackendError::InvalidInput(
             "multi-source descriptor positions and reference levels must be finite",
+        ));
+    }
+    if descriptors
+        .iter()
+        .any(|descriptor| descriptor.directivity.validate().is_err())
+    {
+        return Err(BackendError::InvalidInput(
+            "multi-source descriptor directivity is outside the validated ranges",
         ));
     }
     if config.max_occlusion_samples <= 0
@@ -2201,6 +2215,185 @@ mod tests {
             }
         }
         ((energy / measured as f64).sqrt() as f32, direct)
+    }
+
+    fn directivity_capture(
+        directivity: Option<Directivity>,
+        source_forward: ApiEnuVector3,
+    ) -> (Vec<f32>, SteamDirectParams) {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let source_position = ApiEnuVector3::new(2.0, 3.0, 1.5);
+        let listener_position = ApiEnuVector3::new(4.0, 6.0, 1.5);
+        let mut descriptor = crate::MultiSourceDescriptor::at(source_position);
+        if let Some(directivity) = directivity {
+            descriptor = descriptor.with_directivity(directivity);
+        }
+        let descriptors = [descriptor];
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        let mut update = one_source_update(true, source_position, listener_position);
+        update.sources[0].pose.forward = source_forward;
+        simulation.update_inputs(&update);
+        simulation.run_direct().unwrap();
+        let direct = simulation.snapshot.sources[0].direct;
+
+        let mut captured = Vec::new();
+        let mut interleaved = vec![0.0; audio.frame_size as usize * 2];
+        let mut global_frame = 0_usize;
+        for block in 0..24 {
+            let input = (0..audio.frame_size)
+                .map(|_| {
+                    let sample = (TAU * 731.0 * global_frame as f32 / audio.sample_rate_hz as f32)
+                        .sin()
+                        * 0.125;
+                    global_frame += 1;
+                    sample
+                })
+                .collect::<Vec<_>>();
+            render_one_source_block(&mut render, &input);
+            if block >= 12 {
+                render.sources[0]
+                    .direct_stereo
+                    .read_interleaved(&mut interleaved);
+                captured.extend_from_slice(&interleaved);
+            }
+        }
+        (captured, direct)
+    }
+
+    fn sample_bits(samples: &[f32]) -> Vec<u32> {
+        samples.iter().map(|sample| sample.to_bits()).collect()
+    }
+
+    fn sample_bytes(samples: &[f32]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn energy(samples: &[f32]) -> f64 {
+        samples
+            .iter()
+            .map(|sample| f64::from(sample * sample))
+            .sum()
+    }
+
+    #[test]
+    fn weight_zero_direct_render_is_bit_identical_to_the_prechange_fingerprint() {
+        let toward = ApiEnuVector3::new(2.0, 3.0, 0.0);
+        let (legacy_default, legacy_direct) = directivity_capture(None, toward);
+        let (explicit_omni, explicit_direct) =
+            directivity_capture(Some(Directivity::OMNIDIRECTIONAL), toward);
+        assert_eq!(sample_bits(&explicit_omni), sample_bits(&legacy_default));
+        assert_eq!(explicit_direct, legacy_direct);
+
+        // Captured before directivity was plumbed through `source_inputs`: this
+        // pins the same deterministic scene, tone, direct effect, and HRTF PCM.
+        let hash = crate::sha256_hex(&sample_bytes(&explicit_omni));
+        assert_eq!(
+            hash,
+            "e43a455e6eda686dbea905e16c434474406f55bf7db6356f2d145d24137a27ef"
+        );
+        eprintln!(
+            "omni_prechange_sha256={hash} energy={:.12e} samples={}",
+            energy(&explicit_omni),
+            explicit_omni.len()
+        );
+    }
+
+    #[test]
+    fn directional_source_outputs_less_direct_energy_when_facing_away() {
+        let directivity = Directivity {
+            dipole_weight: 0.7,
+            dipole_power: 2.0,
+        };
+        let toward_axis = ApiEnuVector3::new(2.0, 3.0, 0.0);
+        let away_axis = ApiEnuVector3::new(-2.0, -3.0, 0.0);
+        let (toward, toward_direct) = directivity_capture(Some(directivity), toward_axis);
+        let (away, away_direct) = directivity_capture(Some(directivity), away_axis);
+        let toward_energy = energy(&toward);
+        let away_energy = energy(&away);
+
+        assert!(toward_energy > 0.0);
+        assert!(
+            away_energy < toward_energy * 0.1,
+            "away energy {away_energy:.12e} was not measurably below toward energy {toward_energy:.12e}"
+        );
+        assert!(away_direct.directivity < toward_direct.directivity);
+        assert!(predicted_direct_gain(away_direct) < predicted_direct_gain(toward_direct));
+        eprintln!(
+            "directivity_energy toward={toward_energy:.12e} away={away_energy:.12e} ratio={:.12e} toward_gain={:.9} away_gain={:.9}",
+            away_energy / toward_energy,
+            toward_direct.directivity,
+            away_direct.directivity,
+        );
+    }
+
+    #[test]
+    fn directivity_is_source_local_within_one_retained_session() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let source_position = ApiEnuVector3::new(2.0, 3.0, 1.5);
+        let listener_position = ApiEnuVector3::new(4.0, 6.0, 1.5);
+        let descriptors = [
+            crate::MultiSourceDescriptor::at(source_position).with_directivity(Directivity {
+                dipole_weight: 0.7,
+                dipole_power: 2.0,
+            }),
+            crate::MultiSourceDescriptor::at(source_position),
+        ];
+        let (mut simulation, _render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        let mut sources = [SourceMotion::default(); MAX_ACTIVE_SOURCES];
+        let away_pose = Pose {
+            position: source_position,
+            forward: ApiEnuVector3::new(-2.0, -3.0, 0.0),
+            up: ApiEnuVector3::new(0.0, 0.0, 1.0),
+        };
+        for source in &mut sources[..2] {
+            *source = SourceMotion {
+                active: true,
+                pose: away_pose,
+                linear_velocity_mps: ApiEnuVector3::default(),
+            };
+        }
+        simulation.update_inputs(&SimulationUpdate {
+            listener: fightbox_api::ListenerState {
+                pose: default_api_pose(listener_position),
+                linear_velocity_mps: ApiEnuVector3::default(),
+            },
+            sources,
+        });
+        simulation.run_direct().unwrap();
+
+        let directional = simulation.snapshot.sources[0].direct.directivity;
+        let omni = simulation.snapshot.sources[1].direct.directivity;
+        assert!(directional < 0.2, "directional gain was {directional}");
+        assert!((omni - 1.0).abs() < 1.0e-5, "omni gain was {omni}");
     }
 
     #[test]

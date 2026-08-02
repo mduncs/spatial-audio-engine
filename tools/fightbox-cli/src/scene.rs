@@ -25,6 +25,8 @@ pub struct FixtureScene {
     pub mesh: SceneMesh,
     pub audio: AudioConfig,
     pub source_position_enu: EnuVector3,
+    /// Validated source-local dipole model; orientation comes from its pose.
+    pub source_directivity: fightbox_api::Directivity,
     pub listener: ListenerPose,
     pub calibrated: CalibratedSource,
     pub input_mono: Vec<f32>,
@@ -42,6 +44,7 @@ impl FixtureScene {
             frame_size: 128,
         };
         let source_position_enu = to_enu(fixture.source.position_m);
+        let source_directivity = fixture.source.directivity.to_api();
         let listener = ListenerPose {
             position_enu: to_enu(fixture.listener.position_m),
             ahead_enu: to_enu(fixture.listener.forward_enu),
@@ -64,6 +67,7 @@ impl FixtureScene {
             mesh,
             audio,
             source_position_enu,
+            source_directivity,
             listener,
             calibrated,
             input_mono,
@@ -314,7 +318,28 @@ mod tests {
         assert_eq!(masonry.transmission, [0.0, 0.0, 0.0]);
         // Source/listener map to the exact ADR 0003 ENU positions.
         assert_eq!(scene.source_position_enu, EnuVector3::new(-4.0, 6.0, 1.5));
+        assert_eq!(
+            scene.source_directivity,
+            fightbox_api::Directivity::OMNIDIRECTIONAL
+        );
         assert_eq!(scene.listener.position_enu, EnuVector3::new(6.0, -4.0, 1.5));
+    }
+
+    #[test]
+    fn fixture_scene_carries_present_source_directivity() {
+        let mut fixture = test_fixtures::s3();
+        fixture.source.directivity = crate::fixture::Directivity {
+            dipole_weight: 0.7,
+            dipole_power: 2.0,
+        };
+        let scene = FixtureScene::build(fixture, &resolve_s3_pink()).unwrap();
+        assert_eq!(
+            scene.source_directivity,
+            fightbox_api::Directivity {
+                dipole_weight: 0.7,
+                dipole_power: 2.0,
+            }
+        );
     }
 
     #[test]

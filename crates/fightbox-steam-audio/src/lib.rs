@@ -853,10 +853,13 @@ pub struct S3SimulationConfig {
 /// Descriptor order is the stable `source_index` used by the frozen runtime
 /// seam. The initial position seeds simulation before the first
 /// [`fightbox_runtime::backend::SimulationRunner::update_inputs`] call.
+/// Directivity is immutable world data; its lobe follows the forward axis in
+/// the source pose supplied through that runtime update.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MultiSourceDescriptor {
     pub initial_position_enu: fightbox_api::EnuVector3,
     reference_level: fightbox_api::ReferenceLevel,
+    directivity: fightbox_api::Directivity,
 }
 
 impl MultiSourceDescriptor {
@@ -865,6 +868,7 @@ impl MultiSourceDescriptor {
         Self {
             initial_position_enu,
             reference_level: fightbox_api::ReferenceLevel::CreativeDb { db: 0.0 },
+            directivity: fightbox_api::Directivity::OMNIDIRECTIONAL,
         }
     }
 
@@ -879,6 +883,13 @@ impl MultiSourceDescriptor {
         reference_level: fightbox_api::ReferenceLevel,
     ) -> Self {
         self.reference_level = reference_level;
+        self
+    }
+
+    /// Attaches the source-local Steam Audio dipole descriptor.
+    #[must_use]
+    pub const fn with_directivity(mut self, directivity: fightbox_api::Directivity) -> Self {
+        self.directivity = directivity;
         self
     }
 

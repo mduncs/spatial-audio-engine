@@ -435,6 +435,69 @@ pub enum ExtentDescriptor {
     },
 }
 
+/// Analytic source-radiation pattern matching Steam Audio's `IPLDirectivity` model.
+///
+/// `dipole_weight` blends an omnidirectional emitter (`0`) toward a pure dipole
+/// (`1`), while `dipole_power` sharpens or broadens the resulting lobe. The
+/// lobe is oriented by [`SourceProfile::pose`]'s forward vector; directivity
+/// does not carry a second orientation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Directivity {
+    /// Omni-to-dipole blend in the inclusive range
+    /// [`Self::MIN_DIPOLE_WEIGHT`]..=[`Self::MAX_DIPOLE_WEIGHT`].
+    pub dipole_weight: f32,
+    /// Lobe exponent in the inclusive range
+    /// [`Self::MIN_DIPOLE_POWER`]..=[`Self::MAX_DIPOLE_POWER`].
+    ///
+    /// The `0.25..=16` bound admits broad through sharply focused lobes while
+    /// excluding non-positive exponents and impractically extreme values.
+    pub dipole_power: f32,
+}
+
+impl Directivity {
+    /// Exact legacy/default omnidirectional source model.
+    pub const OMNIDIRECTIONAL: Self = Self {
+        dipole_weight: 0.0,
+        dipole_power: 1.0,
+    };
+    pub const MIN_DIPOLE_WEIGHT: f32 = 0.0;
+    pub const MAX_DIPOLE_WEIGHT: f32 = 1.0;
+    pub const MIN_DIPOLE_POWER: f32 = 0.25;
+    pub const MAX_DIPOLE_POWER: f32 = 16.0;
+
+    /// Validates the finite parameter ranges accepted by the source contract.
+    pub fn validate(self) -> Result<(), DirectivityError> {
+        if !self.dipole_weight.is_finite() {
+            return Err(DirectivityError::NonFiniteDipoleWeight);
+        }
+        if !(Self::MIN_DIPOLE_WEIGHT..=Self::MAX_DIPOLE_WEIGHT).contains(&self.dipole_weight) {
+            return Err(DirectivityError::InvalidDipoleWeight);
+        }
+        if !self.dipole_power.is_finite() {
+            return Err(DirectivityError::NonFiniteDipolePower);
+        }
+        if !(Self::MIN_DIPOLE_POWER..=Self::MAX_DIPOLE_POWER).contains(&self.dipole_power) {
+            return Err(DirectivityError::InvalidDipolePower);
+        }
+        Ok(())
+    }
+}
+
+impl Default for Directivity {
+    fn default() -> Self {
+        Self::OMNIDIRECTIONAL
+    }
+}
+
+/// Validation failures for a source directivity descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectivityError {
+    NonFiniteDipoleWeight,
+    InvalidDipoleWeight,
+    NonFiniteDipolePower,
+    InvalidDipolePower,
+}
+
 /// A complete vendor-neutral source declaration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceProfile {
@@ -443,6 +506,8 @@ pub struct SourceProfile {
     pub reference_level: ReferenceLevel,
     pub asset_analysis: AssetAnalysis,
     pub extent: ExtentDescriptor,
+    /// Source-radiation lobe; [`Directivity::default`] preserves an omni source.
+    pub directivity: Directivity,
     pub max_speed_mps: f32,
 }
 
@@ -515,6 +580,9 @@ impl SourceProfile {
         if !self.max_speed_mps.is_finite() || self.max_speed_mps < 0.0 {
             return Err(SourceError::InvalidMaxSpeed);
         }
+        self.directivity
+            .validate()
+            .map_err(SourceError::Directivity)?;
         self.asset_analysis
             .validate()
             .map_err(SourceError::Calibration)?;
@@ -530,6 +598,7 @@ pub enum SourceError {
     EmptyId,
     NonFinitePose,
     InvalidMaxSpeed,
+    Directivity(DirectivityError),
     Calibration(CalibrationError),
 }
 
@@ -554,6 +623,110 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    fn source_profile_with_directivity(directivity: Directivity) -> SourceProfile {
+        SourceProfile {
+            id: SourceId::new("directivity-test"),
+            pose: Pose {
+                position: EnuVector3::default(),
+                forward: EnuVector3::new(0.0, 1.0, 0.0),
+                up: EnuVector3::new(0.0, 0.0, 1.0),
+            },
+            reference_level: ReferenceLevel::CreativeDb { db: 0.0 },
+            asset_analysis: measured_asset(-20.0, -1.0),
+            extent: ExtentDescriptor::Point,
+            directivity,
+            max_speed_mps: 0.0,
+        }
+    }
+
+    #[test]
+    fn default_directivity_is_exactly_omnidirectional() {
+        let directivity = Directivity::default();
+        assert_eq!(directivity.dipole_weight.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(directivity.dipole_power.to_bits(), 1.0_f32.to_bits());
+        assert!(
+            source_profile_with_directivity(directivity)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn source_profile_accepts_directivity_range_boundaries() {
+        for directivity in [
+            Directivity {
+                dipole_weight: Directivity::MIN_DIPOLE_WEIGHT,
+                dipole_power: Directivity::MIN_DIPOLE_POWER,
+            },
+            Directivity {
+                dipole_weight: Directivity::MAX_DIPOLE_WEIGHT,
+                dipole_power: Directivity::MAX_DIPOLE_POWER,
+            },
+            Directivity {
+                dipole_weight: 0.7,
+                dipole_power: 2.0,
+            },
+        ] {
+            assert_eq!(
+                source_profile_with_directivity(directivity).validate(),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn source_profile_rejects_nonfinite_and_out_of_range_directivity() {
+        for (directivity, expected) in [
+            (
+                Directivity {
+                    dipole_weight: f32::NAN,
+                    dipole_power: 1.0,
+                },
+                DirectivityError::NonFiniteDipoleWeight,
+            ),
+            (
+                Directivity {
+                    dipole_weight: -f32::EPSILON,
+                    dipole_power: 1.0,
+                },
+                DirectivityError::InvalidDipoleWeight,
+            ),
+            (
+                Directivity {
+                    dipole_weight: 1.0 + f32::EPSILON,
+                    dipole_power: 1.0,
+                },
+                DirectivityError::InvalidDipoleWeight,
+            ),
+            (
+                Directivity {
+                    dipole_weight: 0.5,
+                    dipole_power: f32::INFINITY,
+                },
+                DirectivityError::NonFiniteDipolePower,
+            ),
+            (
+                Directivity {
+                    dipole_weight: 0.5,
+                    dipole_power: Directivity::MIN_DIPOLE_POWER - f32::EPSILON,
+                },
+                DirectivityError::InvalidDipolePower,
+            ),
+            (
+                Directivity {
+                    dipole_weight: 0.5,
+                    dipole_power: Directivity::MAX_DIPOLE_POWER + 0.001,
+                },
+                DirectivityError::InvalidDipolePower,
+            ),
+        ] {
+            assert_eq!(
+                source_profile_with_directivity(directivity).validate(),
+                Err(SourceError::Directivity(expected))
+            );
+        }
     }
 
     #[test]

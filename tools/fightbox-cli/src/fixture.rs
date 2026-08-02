@@ -1,11 +1,14 @@
 //! Strict, serde-backed parsing of the controlled Phase A fixture contract.
 //!
-//! Every container mirrors `fixtures/fixture.schema.json` and denies unknown
-//! fields. The structural `const` constraints the schema expresses (schema
-//! version, coordinate frame, kernel, gate, source mode, probe/path-bake shape)
-//! are checked again here after deserialization so a wrong fixture fails with a
-//! specific message rather than a silent backend default. NaN/infinity cannot
-//! appear in parsed JSON text, but finite reference levels are validated too.
+//! The frozen Phase A containers mirror `fixtures/fixture.schema.json` and deny
+//! unknown fields. This parser also owns the backward-compatible optional
+//! `source.directivity` extension; its nested shape and numeric ranges are just
+//! as strict. The structural `const` constraints the frozen schema expresses
+//! (schema version, coordinate frame, kernel, gate, source mode, probe/path-bake
+//! shape) are checked again here after deserialization so a wrong fixture fails
+//! with a specific message rather than a silent backend default. NaN/infinity
+//! cannot appear in parsed JSON text, but finite reference levels are validated
+//! too.
 //!
 //! This layer only parses and validates; it builds no SDK handles and renders
 //! nothing. Backend construction lives in [`crate::scene`].
@@ -76,6 +79,60 @@ pub struct ReferenceLevel {
     pub db_spl: f64,
 }
 
+/// Optional per-source Steam Audio dipole model in fixture JSON.
+///
+/// Weight blends omni to dipole, power sharpens the lobe, and the source pose's
+/// forward axis supplies its orientation. The absent-field default is exactly
+/// the legacy omni model.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Directivity {
+    pub dipole_weight: f64,
+    pub dipole_power: f64,
+}
+
+impl Directivity {
+    fn validate(self) -> Result<(), String> {
+        if !self.dipole_weight.is_finite() {
+            return Err("source.directivity.dipole_weight must be finite".into());
+        }
+        if !(f64::from(fightbox_api::Directivity::MIN_DIPOLE_WEIGHT)
+            ..=f64::from(fightbox_api::Directivity::MAX_DIPOLE_WEIGHT))
+            .contains(&self.dipole_weight)
+        {
+            return Err("source.directivity.dipole_weight must be in [0,1]".into());
+        }
+        if !self.dipole_power.is_finite() {
+            return Err("source.directivity.dipole_power must be finite".into());
+        }
+        if !(f64::from(fightbox_api::Directivity::MIN_DIPOLE_POWER)
+            ..=f64::from(fightbox_api::Directivity::MAX_DIPOLE_POWER))
+            .contains(&self.dipole_power)
+        {
+            return Err("source.directivity.dipole_power must be in [0.25,16]".into());
+        }
+        Ok(())
+    }
+
+    /// Narrows a validated fixture descriptor to the domain API type.
+    #[must_use]
+    pub fn to_api(self) -> fightbox_api::Directivity {
+        fightbox_api::Directivity {
+            dipole_weight: self.dipole_weight as f32,
+            dipole_power: self.dipole_power as f32,
+        }
+    }
+}
+
+impl Default for Directivity {
+    fn default() -> Self {
+        Self {
+            dipole_weight: 0.0,
+            dipole_power: 1.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -83,6 +140,8 @@ pub struct Source {
     pub position_m: Vec3,
     pub reference_level: ReferenceLevel,
     pub asset_id: String,
+    #[serde(default)]
+    pub directivity: Directivity,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -288,6 +347,7 @@ impl Fixture {
         if !self.source.reference_level.db_spl.is_finite() {
             return Err("source.reference_level.db_spl must be finite".into());
         }
+        self.source.directivity.validate()?;
         // Material property ranges mirror the fixture schema.
         for (name, material) in &self.geometry.materials {
             check_material(name, material)?;
@@ -571,12 +631,62 @@ mod tests {
         let s0 = test_fixtures::s0();
         assert_eq!(s0.gate().unwrap(), Gate::S0);
         assert_eq!(s0.source.asset_id, "s0-calibrated-pink");
+        assert_eq!(s0.source.directivity, Directivity::default());
         assert_eq!(s0.listener.trajectory_m.len(), 6);
 
         let s3 = test_fixtures::s3();
         assert_eq!(s3.gate().unwrap(), Gate::S3);
         assert_eq!(s3.geometry.triangles.len(), 10);
         assert_eq!(s3.simulation.direct.occlusion_samples, Some(64));
+    }
+
+    #[test]
+    fn parses_and_round_trips_present_source_directivity() {
+        let text = test_fixtures::S0.replace(
+            r#""asset_id": "s0-calibrated-pink""#,
+            r#""asset_id": "s0-calibrated-pink", "directivity": {"dipole_weight": 0.7, "dipole_power": 2.0}"#,
+        );
+        let parsed = Fixture::parse(&text).unwrap();
+        assert_eq!(
+            parsed.source.directivity,
+            Directivity {
+                dipole_weight: 0.7,
+                dipole_power: 2.0,
+            }
+        );
+
+        let encoded = serde_json::to_string(&parsed).unwrap();
+        let reparsed = Fixture::parse(&encoded).unwrap();
+        assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn rejects_invalid_or_unknown_shaped_source_directivity() {
+        for (directivity, expected) in [
+            (
+                r#"{"dipole_weight": 1.01, "dipole_power": 2.0}"#,
+                "dipole_weight must be in [0,1]",
+            ),
+            (
+                r#"{"dipole_weight": 0.7, "dipole_power": 0.24}"#,
+                "dipole_power must be in [0.25,16]",
+            ),
+            (
+                r#"{"dipole_weight": 0.7, "dipole_power": 2.0, "cone_angle": 30}"#,
+                "unknown field `cone_angle`",
+            ),
+            (r#"{"dipole_weight": 0.7}"#, "missing field `dipole_power`"),
+        ] {
+            let text = test_fixtures::S0.replace(
+                r#""asset_id": "s0-calibrated-pink""#,
+                &format!(r#""asset_id": "s0-calibrated-pink", "directivity": {directivity}"#),
+            );
+            let error = Fixture::parse(&text).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in directivity error, got: {error}"
+            );
+        }
     }
 
     #[test]

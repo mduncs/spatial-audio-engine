@@ -835,6 +835,7 @@ mod tests {
             )
             .unwrap(),
             extent: ExtentDescriptor::Point,
+            directivity: fightbox_api::Directivity::default(),
             max_speed_mps: 100.0,
         }
     }

@@ -349,6 +349,7 @@ impl Workbench {
                     },
                     asset_analysis: asset.analysis,
                     extent: ExtentDescriptor::Point,
+                    directivity: source.directivity.to_api(),
                     max_speed_mps: source
                         .trajectory
                         .as_ref()
@@ -378,9 +379,12 @@ impl Workbench {
                 acoustic: SourceAcousticState::UNKNOWN,
             });
         }
-        let descriptors = source_views
+        let descriptors = prepared_sources
             .iter()
-            .map(|source| MultiSourceDescriptor::at(source.position))
+            .map(|(profile, _)| {
+                MultiSourceDescriptor::at(profile.pose.position)
+                    .with_directivity(profile.directivity)
+            })
             .collect::<Vec<_>>();
         let audio_config = AudioConfig {
             sample_rate_hz: SAMPLE_RATE as i32,
@@ -2483,6 +2487,7 @@ mod tests {
             )
             .unwrap(),
             extent: ExtentDescriptor::Point,
+            directivity: fightbox_api::Directivity::default(),
             max_speed_mps: 0.0,
         };
         let listener_position = EnuVector3::new(1.0, 0.0, 0.0);

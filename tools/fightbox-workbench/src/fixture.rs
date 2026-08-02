@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use fightbox_api::EnuVector3;
+use fightbox_api::{Directivity, EnuVector3};
 use fightbox_steam_audio::{
     AcousticMaterial, BakedProbeBatch, DirectOcclusionMode, PROBE_BATCH_METADATA_SCHEMA,
     ProbeBatchMetadata, ReflectionEffectConfig, S3SimulationConfig, STEAM_AUDIO_UPSTREAM_COMMIT,
@@ -26,12 +26,69 @@ pub struct FixtureSource {
     pub reference_level: FixtureReferenceLevel,
     #[serde(default = "default_enabled")]
     pub default_enabled: bool,
+    #[serde(default)]
+    pub directivity: FixtureDirectivity,
     pub position_m: Option<[f64; 3]>,
     pub trajectory: Option<Trajectory>,
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+/// Strict JSON shape for a source-local Steam Audio dipole model.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureDirectivity {
+    pub dipole_weight: f64,
+    pub dipole_power: f64,
+}
+
+impl FixtureDirectivity {
+    fn validate(self, source_id: &str) -> Result<(), String> {
+        if !self.dipole_weight.is_finite() {
+            return Err(format!(
+                "source {source_id} directivity.dipole_weight must be finite"
+            ));
+        }
+        if !(f64::from(Directivity::MIN_DIPOLE_WEIGHT)..=f64::from(Directivity::MAX_DIPOLE_WEIGHT))
+            .contains(&self.dipole_weight)
+        {
+            return Err(format!(
+                "source {source_id} directivity.dipole_weight must be in [0,1]"
+            ));
+        }
+        if !self.dipole_power.is_finite() {
+            return Err(format!(
+                "source {source_id} directivity.dipole_power must be finite"
+            ));
+        }
+        if !(f64::from(Directivity::MIN_DIPOLE_POWER)..=f64::from(Directivity::MAX_DIPOLE_POWER))
+            .contains(&self.dipole_power)
+        {
+            return Err(format!(
+                "source {source_id} directivity.dipole_power must be in [0.25,16]"
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn to_api(self) -> Directivity {
+        Directivity {
+            dipole_weight: self.dipole_weight as f32,
+            dipole_power: self.dipole_power as f32,
+        }
+    }
+}
+
+impl Default for FixtureDirectivity {
+    fn default() -> Self {
+        Self {
+            dipole_weight: 0.0,
+            dipole_power: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -83,8 +140,12 @@ impl Fixture {
     pub fn read(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path)
             .map_err(|error| format!("cannot read fixture {}: {error}", path.display()))?;
-        let fixture: Self = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("invalid fixture {}: {error}", path.display()))?;
+        Self::parse(&bytes, &path.display().to_string())
+    }
+
+    fn parse(bytes: &[u8], source: &str) -> Result<Self, String> {
+        let fixture: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid fixture {source}: {error}"))?;
         if fixture.sources.is_empty()
             || fixture.sources.len() > fightbox_runtime::MAX_ACTIVE_SOURCES
         {
@@ -93,6 +154,7 @@ impl Fixture {
         fixture.initial_listener_position()?;
         for source in &fixture.sources {
             source.initial_position()?;
+            source.directivity.validate(&source.id)?;
             if let Some(trajectory) = &source.trajectory {
                 trajectory.validate(&format!("source {}", source.id))?;
             }
@@ -325,6 +387,66 @@ mod tests {
             fixture.sources[0].initial_position().unwrap(),
             EnuVector3::new(12.5, -12.0, 1.5)
         );
+        assert_eq!(
+            fixture.sources[0].directivity,
+            FixtureDirectivity::default()
+        );
+    }
+
+    #[test]
+    fn fixture_source_accepts_present_directivity() {
+        let text = include_str!("../../../fixtures/city/chicago-walk/fixture.json").replace(
+            r#""position_m": [12.5, -12.0, 1.5]"#,
+            r#""directivity": {"dipole_weight": 0.75, "dipole_power": 2.0},
+      "position_m": [12.5, -12.0, 1.5]"#,
+        );
+        let fixture = Fixture::parse(text.as_bytes(), "directivity-test").unwrap();
+        assert_eq!(
+            fixture.sources[0].directivity,
+            FixtureDirectivity {
+                dipole_weight: 0.75,
+                dipole_power: 2.0,
+            }
+        );
+        assert_eq!(
+            fixture.sources[0].directivity.to_api(),
+            Directivity {
+                dipole_weight: 0.75,
+                dipole_power: 2.0,
+            }
+        );
+    }
+
+    #[test]
+    fn fixture_source_rejects_invalid_and_unknown_directivity_shapes() {
+        for (directivity, expected) in [
+            (
+                r#"{"dipole_weight": -0.1, "dipole_power": 2.0}"#,
+                "dipole_weight must be in [0,1]",
+            ),
+            (
+                r#"{"dipole_weight": 0.75, "dipole_power": 16.1}"#,
+                "dipole_power must be in [0.25,16]",
+            ),
+            (
+                r#"{"dipole_weight": 0.75, "dipole_power": 2.0, "axis": "north"}"#,
+                "unknown field `axis`",
+            ),
+            (r#"{"dipole_weight": 0.75}"#, "missing field `dipole_power`"),
+        ] {
+            let text = include_str!("../../../fixtures/city/chicago-walk/fixture.json").replace(
+                r#""position_m": [12.5, -12.0, 1.5]"#,
+                &format!(
+                    r#""directivity": {directivity},
+      "position_m": [12.5, -12.0, 1.5]"#
+                ),
+            );
+            let error = Fixture::parse(text.as_bytes(), "directivity-test").unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in directivity error, got: {error}"
+            );
+        }
     }
 
     #[test]
