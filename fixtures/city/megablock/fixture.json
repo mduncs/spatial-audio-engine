@@ -29,7 +29,6 @@
     {
       "id": "artillery-sw-map-corner",
       "asset_id": "artillery-impact",
-      "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
         "db_spl": 155
@@ -47,7 +46,6 @@
     {
       "id": "siren-circling-center-block",
       "asset_id": "ff-siren",
-      "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
         "db_spl": 118
@@ -70,7 +68,6 @@
     {
       "id": "bell-two-blocks-east",
       "asset_id": "church-bells",
-      "default_enabled": false,
       "reference_level": {
         "mode": "SplAtOneMeter",
         "db_spl": 115
