@@ -42,6 +42,10 @@ use crate::fixture::{
     BallisticShotFixture, Fixture, FixtureTriggerKey, Trajectory, VisibilityRangeAdoption,
     load_baked, occlusion_mode_for_extent, scene_mesh,
 };
+use crate::mix_defaults::{
+    MAX_SOURCE_OFFSET_DB, MIN_SOURCE_OFFSET_DB, MixDefaults, SourceMixDefault,
+    clamp_source_offset_db,
+};
 use crate::pose::{ListenerControl, PoseMailbox};
 
 const BLOCK_SIZE: u32 = 128;
@@ -348,6 +352,8 @@ pub struct Workbench {
     capture_entries: Vec<CaptureBrowserEntry>,
     capture_warnings: Vec<String>,
     capture_status: Option<String>,
+    fixture_path: PathBuf,
+    mix_defaults_status: Option<String>,
     autopilot: Autopilot,
     source_height_levels: SourceHeightLevels,
     probe_coverage: ProbeCoverageQuery,
@@ -368,6 +374,7 @@ struct SourceView {
     asset_id: String,
     position: EnuVector3,
     declared_spl_at_one_meter_db: f32,
+    monitor_offset_db: f32,
     enabled: bool,
     muted: bool,
     soloed: bool,
@@ -522,11 +529,12 @@ struct CaptureStaticContext {
     engine_config: CaptureEngineConfig,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct SourceMix {
     enabled: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
     muted: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
     soloed: [bool; fightbox_runtime::MAX_ACTIVE_SOURCES],
+    monitor_gains: [f32; fightbox_runtime::MAX_ACTIVE_SOURCES],
 }
 
 impl SourceMix {
@@ -534,6 +542,7 @@ impl SourceMix {
         enabled: [true; fightbox_runtime::MAX_ACTIVE_SOURCES],
         muted: [false; fightbox_runtime::MAX_ACTIVE_SOURCES],
         soloed: [false; fightbox_runtime::MAX_ACTIVE_SOURCES],
+        monitor_gains: [1.0; fightbox_runtime::MAX_ACTIVE_SOURCES],
     };
 
     fn from_sources(sources: &[SourceView]) -> Self {
@@ -542,6 +551,7 @@ impl SourceMix {
             mix.enabled[index] = source.enabled;
             mix.muted[index] = source.muted;
             mix.soloed[index] = source.soloed;
+            mix.monitor_gains[index] = monitor_offset_gain(source.monitor_offset_db);
         }
         mix
     }
@@ -557,9 +567,31 @@ impl SourceMix {
                     && self.enabled[index]
                     && !self.muted[index]
                     && (!any_soloed || self.soloed[index]),
-            )
+            ) * self.monitor_gains[index]
         })
     }
+}
+
+fn monitor_offset_gain(offset_db: f32) -> f32 {
+    10.0_f32.powf(clamp_source_offset_db(offset_db) / 20.0)
+}
+
+fn format_db_number(value: f32) -> String {
+    if (value - value.round()).abs() < 0.05 {
+        format!("{:.0}", value)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn format_level_truth(base_db: f32, offset_db: f32) -> String {
+    let operator = if offset_db < 0.0 { "" } else { "+" };
+    format!(
+        "{}{operator}{} -> {}",
+        format_db_number(base_db),
+        format_db_number(offset_db),
+        format_db_number(base_db + offset_db),
+    )
 }
 
 enum AudioState {
@@ -763,6 +795,7 @@ impl Workbench {
                 asset_id: source.asset_id.clone(),
                 position,
                 declared_spl_at_one_meter_db: source.reference_level.db_spl as f32,
+                monitor_offset_db: 0.0,
                 enabled: source.default_enabled,
                 muted: false,
                 soloed: false,
@@ -866,6 +899,7 @@ impl Workbench {
                         ReferenceLevel::SplAtOneMeter { db_spl } => db_spl,
                         ReferenceLevel::CreativeDb { .. } => unreachable!(),
                     },
+                    monitor_offset_db: 0.0,
                     enabled: false,
                     muted: false,
                     soloed: false,
@@ -906,6 +940,48 @@ impl Workbench {
                 awaiting_inactive_publication: false,
                 status: None,
             });
+        }
+        // User mix defaults are resolved only after calibrated profiles and
+        // backend descriptors are complete. They can affect playback controls,
+        // never the fixture's physical source declarations.
+        let mut monitor_gain_db = OutputSafetyConfig::DEFAULT_MONITOR_GAIN_DB;
+        let mut mix_defaults_status = None;
+        match MixDefaults::read(&scene_spec.path) {
+            Ok(Some(defaults)) => {
+                let valid_source_ids = fixture
+                    .sources
+                    .iter()
+                    .map(|source| source.id.clone())
+                    .chain(fixture.events.iter().flat_map(|event| {
+                        let shot = event.ballistic_shot();
+                        [
+                            shot.event_sources.crack.id.clone(),
+                            shot.event_sources.blast.id.clone(),
+                        ]
+                    }));
+                let resolved = defaults.resolve(valid_source_ids);
+                monitor_gain_db = resolved.monitor_gain_db;
+                for source in &mut source_views {
+                    if let Some(saved) = resolved.sources.get(&source.id) {
+                        if source.event_role.is_none() {
+                            source.enabled = saved.enabled;
+                        }
+                        source.muted = saved.muted;
+                        source.soloed = saved.soloed;
+                        source.monitor_offset_db = saved.monitor_offset_db;
+                    }
+                }
+                mix_defaults_status = if resolved.ignored_source_ids.is_empty() {
+                    Some("Loaded saved mix defaults".into())
+                } else {
+                    Some(format!(
+                        "Loaded saved mix; ignored unknown source ids: {}",
+                        resolved.ignored_source_ids.join(", ")
+                    ))
+                };
+            }
+            Ok(None) => {}
+            Err(error) => mix_defaults_status = Some(error),
         }
         let audio_config = AudioConfig {
             sample_rate_hz: SAMPLE_RATE as i32,
@@ -969,13 +1045,16 @@ impl Workbench {
             max_active_sources: prepared_sources.len() as u8,
             ..EngineConfig::default()
         };
-        let (output_safety_controller, output_safety_reader) = configure_output_safety(
+        let (mut output_safety_controller, output_safety_reader) = configure_output_safety(
             initial_listener.pose.position,
             &prepared_sources
                 .iter()
                 .map(|(profile, _)| profile.clone())
                 .collect::<Vec<_>>(),
         )?;
+        output_safety_controller
+            .set_monitor_gain_db(monitor_gain_db)
+            .map_err(|error| format!("cannot apply saved monitor gain: {error:?}"))?;
         let mut graph = RuntimeGraph::new_with_backend_and_output_safety(
             engine_config,
             reader,
@@ -1065,7 +1144,7 @@ impl Workbench {
             source_motion,
             audio,
             camera,
-            monitor_gain_db: OutputSafetyConfig::DEFAULT_MONITOR_GAIN_DB,
+            monitor_gain_db,
             output_safety_controller,
             meter_reader,
             source_mix_writer,
@@ -1078,6 +1157,8 @@ impl Workbench {
             capture_entries: browser.entries,
             capture_warnings: browser.warnings,
             capture_status: None,
+            fixture_path: scene_spec.path.clone(),
+            mix_defaults_status,
             autopilot,
             source_height_levels,
             probe_coverage,
@@ -1688,6 +1769,28 @@ impl Workbench {
         }
     }
 
+    fn save_mix_defaults(&mut self) {
+        let defaults = MixDefaults {
+            schema_version: MixDefaults::SCHEMA_VERSION,
+            monitor_gain_db: self.monitor_gain_db,
+            sources: self
+                .sources
+                .iter()
+                .map(|source| SourceMixDefault {
+                    id: source.id.clone(),
+                    enabled: source.event_role.is_none() && source.enabled,
+                    muted: source.muted,
+                    soloed: source.soloed,
+                    monitor_offset_db: source.monitor_offset_db,
+                })
+                .collect(),
+        };
+        self.mix_defaults_status = Some(match defaults.write(&self.fixture_path) {
+            Ok(path) => format!("Saved mix defaults to {}", path.display()),
+            Err(error) => error,
+        });
+    }
+
     fn capture_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Capture");
         let audio_available = match &self.audio {
@@ -1807,15 +1910,19 @@ impl Workbench {
         ui.separator();
         ui.heading("Output safety");
         let mix_controls_enabled = matches!(self.capture_state, CaptureUiState::Idle);
-        if ui
-            .add_enabled(
-                mix_controls_enabled,
-                egui::Slider::new(&mut self.monitor_gain_db, -20.0..=40.0)
-                    .suffix(" dB")
-                    .text("monitor"),
-            )
-            .changed()
-        {
+        let monitor_gain_changed = ui
+            .horizontal(|ui| {
+                let changed = ui
+                    .add_enabled(
+                        mix_controls_enabled,
+                        egui::Slider::new(&mut self.monitor_gain_db, -20.0..=40.0).text("monitor"),
+                    )
+                    .changed();
+                ui.monospace(format!("{:+.1} dB", self.monitor_gain_db));
+                changed
+            })
+            .inner;
+        if monitor_gain_changed {
             self.output_safety_controller
                 .set_monitor_gain_db(self.monitor_gain_db)
                 .expect("the monitor-gain slider publishes only finite values");
@@ -1851,43 +1958,84 @@ impl Workbench {
             }
         }
         ui.separator();
-        ui.heading("Sources");
+        ui.horizontal(|ui| {
+            ui.heading("Sources");
+            if ui
+                .add_enabled(
+                    mix_controls_enabled,
+                    egui::Button::new("save mix defaults").small(),
+                )
+                .clicked()
+            {
+                self.save_mix_defaults();
+            }
+        });
+        if let Some(status) = &self.mix_defaults_status {
+            ui.small(status);
+        }
         let mut source_mix_changed = false;
         let mut source_height_changed = None;
         let source_height_levels = self.source_height_levels;
         for (index, source) in self.sources.iter_mut().enumerate() {
-            ui.add_enabled_ui(mix_controls_enabled && source.event_role.is_none(), |ui| {
+            ui.add_enabled_ui(mix_controls_enabled, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut source.enabled, "")
-                        .on_hover_text("Enable this source")
-                        .changed()
-                    {
-                        source_mix_changed = true;
-                    }
-                    if ui
-                        .selectable_label(source.muted, "M")
-                        .on_hover_text("Mute this source")
-                        .clicked()
-                    {
-                        source.muted = !source.muted;
-                        source_mix_changed = true;
-                    }
-                    if ui
-                        .selectable_label(source.soloed, "S")
-                        .on_hover_text("Solo this source")
-                        .clicked()
-                    {
-                        source.soloed = !source.soloed;
-                        source_mix_changed = true;
-                    }
+                    ui.add_enabled_ui(source.event_role.is_none(), |ui| {
+                        if ui
+                            .checkbox(&mut source.enabled, "")
+                            .on_hover_text("Enable this source")
+                            .changed()
+                        {
+                            source_mix_changed = true;
+                        }
+                        if ui
+                            .selectable_label(source.muted, "M")
+                            .on_hover_text("Mute this source")
+                            .clicked()
+                        {
+                            source.muted = !source.muted;
+                            source_mix_changed = true;
+                        }
+                        if ui
+                            .selectable_label(source.soloed, "S")
+                            .on_hover_text("Solo this source")
+                            .clicked()
+                        {
+                            source.soloed = !source.soloed;
+                            source_mix_changed = true;
+                        }
+                    });
                     ui.monospace(&source.id);
                     if let Some(role) = source.event_role {
-                        ui.small(match role {
-                            BallisticSourceRole::Crack => "event crack · direct/path only",
-                            BallisticSourceRole::Blast => "event blast",
+                        ui.small("event").on_hover_text(match role {
+                            BallisticSourceRole::Crack => "ballistic crack · direct/path only",
+                            BallisticSourceRole::Blast => "ballistic blast",
                         });
+                    } else if !source.enabled {
+                        ui.small("muted in mix");
                     }
+                    ui.monospace(format!(
+                        "{} dB",
+                        format_db_number(source.declared_spl_at_one_meter_db)
+                    ))
+                    .on_hover_text("Fixture base SPL at 1 meter");
+                    ui.small("monitor offset");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut source.monitor_offset_db)
+                                .range(MIN_SOURCE_OFFSET_DB..=MAX_SOURCE_OFFSET_DB)
+                                .speed(0.1)
+                                .suffix(" dB"),
+                        )
+                        .on_hover_text("Audition trim in the workbench playback layer; not physics")
+                        .changed()
+                    {
+                        source.monitor_offset_db = clamp_source_offset_db(source.monitor_offset_db);
+                        source_mix_changed = true;
+                    }
+                    ui.monospace(format_level_truth(
+                        source.declared_spl_at_one_meter_db,
+                        source.monitor_offset_db,
+                    ));
                     if source.asset_id == ARTILLERY_ASSET_ID && source.event_role.is_none() {
                         ui.small(format!("{ARTILLERY_RETRIGGER_SECONDS} s retrigger"));
                     }
@@ -1895,21 +2043,23 @@ impl Workbench {
                         ui.small(format!("{priority:?} · protect {remaining_blocks} blocks"));
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.add_space(22.0);
-                    ui.small("height");
-                    for height in SourceHeight::ALL {
-                        if ui
-                            .selectable_label(source.height == height, height.label())
-                            .clicked()
-                        {
-                            source.height = height;
-                            source_height_changed = Some((index, height));
+                ui.add_enabled_ui(source.event_role.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(22.0);
+                        ui.small("height");
+                        for height in SourceHeight::ALL {
+                            if ui
+                                .selectable_label(source.height == height, height.label())
+                                .clicked()
+                            {
+                                source.height = height;
+                                source_height_changed = Some((index, height));
+                            }
                         }
-                    }
-                    let resulting_height_m =
-                        source_height_levels.height_m(source.height, source.street_height_m);
-                    ui.monospace(format!("{resulting_height_m:.1} m z"));
+                        let resulting_height_m =
+                            source_height_levels.height_m(source.height, source.street_height_m);
+                        ui.monospace(format!("{resulting_height_m:.1} m z"));
+                    });
                 });
             });
             acoustic_badge_row(ui, source.acoustic, source.occlusion_mode);
@@ -3825,6 +3975,46 @@ mod tests {
         mix.enabled[1] = false;
         mix.soloed[1] = true;
         assert_eq!(&mix.gains(3)[..3], &[1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn monitor_offset_is_source_local_and_does_not_change_calibrated_descriptor_level() {
+        let profile = SourceProfile {
+            id: SourceId::new("calibrated-source"),
+            pose: Pose {
+                position: EnuVector3::default(),
+                forward: EnuVector3::new(0.0, 1.0, 0.0),
+                up: EnuVector3::new(0.0, 0.0, 1.0),
+            },
+            reference_level: ReferenceLevel::SplAtOneMeter { db_spl: 155.0 },
+            asset_analysis: AssetAnalysis::new(
+                -24.0,
+                -12.0,
+                AssetMeasurementProvenance::new("monitor-offset-test/v1").unwrap(),
+            )
+            .unwrap(),
+            extent: fightbox_api::ExtentDescriptor::Point,
+            directivity: fightbox_api::Directivity::default(),
+            max_speed_mps: 0.0,
+        };
+        let _descriptor = MultiSourceDescriptor::at(profile.pose.position)
+            .with_reference_level(profile.reference_level);
+        let mut mix = SourceMix::ALL_AUDIBLE;
+        mix.monitor_gains[0] = monitor_offset_gain(-6.0);
+
+        assert!((mix.gains(2)[0] - 10.0_f32.powf(-6.0 / 20.0)).abs() < 1.0e-6);
+        assert_eq!(mix.gains(2)[1], 1.0);
+        assert_eq!(
+            profile.reference_level,
+            ReferenceLevel::SplAtOneMeter { db_spl: 155.0 }
+        );
+    }
+
+    #[test]
+    fn compact_level_truth_formats_base_offset_and_effective_level() {
+        assert_eq!(format_level_truth(155.0, -6.0), "155-6 -> 149");
+        assert_eq!(format_level_truth(105.0, 0.0), "105+0 -> 105");
+        assert_eq!(format_level_truth(118.0, 2.5), "118+2.5 -> 120.5");
     }
 
     #[test]

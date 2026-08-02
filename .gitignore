@@ -5,6 +5,7 @@ fixtures/assets/squad/
 __pycache__/
 *.py[cod]
 .DS_Store
+*.user.json
 /EXECUTION.md
 /runs/
 platforms/ios/FightboxKit/.build/

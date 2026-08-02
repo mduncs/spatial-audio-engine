@@ -46,7 +46,7 @@ const BLAST_SOURCE: usize = 3;
 const RETAINED_A_POSITION: ApiEnuVector3 = ApiEnuVector3::new(102.5, 102.5, 1.5);
 const RETAINED_B_POSITION: ApiEnuVector3 = ApiEnuVector3::new(245.0, 245.0, 1.5);
 
-const MUZZLE: ApiEnuVector3 = ApiEnuVector3::new(137.5, 262.5, 1.5);
+const MUZZLE: ApiEnuVector3 = ApiEnuVector3::new(30.0, 288.0, 1.5);
 const SHOT_DIRECTION: ApiEnuVector3 = ApiEnuVector3::new(1.0, 0.0, 0.0);
 const SHOT_MACH: f64 = 2.5;
 const BLAST_SPL_AT_ONE_METER_DB: f64 = 155.0;
@@ -57,26 +57,31 @@ const REFLECTIONS_ONLY: StageOutputGains = StageOutputGains {
     pathing: 0.0,
     reflections: 1.0,
 };
+const DIRECT_ONLY: StageOutputGains = StageOutputGains {
+    direct: 1.0,
+    pathing: 0.0,
+    reflections: 0.0,
+};
 
 const LISTENERS: [ListenerCase; 3] = [
     ListenerCase {
-        label: "nominal-los-one-block",
+        label: "firing-street-los",
         position: ApiEnuVector3::new(197.5, 292.5, 1.5),
-        inspect_echoes: false,
-    },
-    ListenerCase {
-        label: "around-corner-one-block",
-        position: ApiEnuVector3::new(197.5, 197.5, 1.5),
         inspect_echoes: true,
     },
     ListenerCase {
-        label: "nominal-los-two-block",
-        position: ApiEnuVector3::new(327.5, 292.5, 1.5),
+        label: "around-one-corner",
+        position: ApiEnuVector3::new(292.5, 340.0, 1.5),
+        inspect_echoes: true,
+    },
+    ListenerCase {
+        label: "far-firing-street-los",
+        position: ApiEnuVector3::new(482.5, 292.5, 1.5),
         inspect_echoes: true,
     },
 ];
 
-const CONFIGS: [ConfigCase; 5] = [
+const CONFIGS: [ConfigCase; 4] = [
     ConfigCase {
         label: "honest-reduced-a",
         requested_ir_s: 1.5,
@@ -98,12 +103,6 @@ const CONFIGS: [ConfigCase; 5] = [
     ConfigCase {
         label: "forced-full-2.0s",
         requested_ir_s: 2.0,
-        force_full: true,
-        honest_repeat: 0,
-    },
-    ConfigCase {
-        label: "forced-full-4.0s",
-        requested_ir_s: 4.0,
         force_full: true,
         honest_repeat: 0,
     },
@@ -164,7 +163,9 @@ struct MeasurementRow {
     sdk_ir_frames: i32,
     sdk_reverb_times_s: [f32; 3],
     tick_cost: TickCost,
+    direct_peak_dbfs: f64,
     tail: TailMetrics,
+    tail_below_direct_db: f64,
     crack_window_energy: f64,
     blast_window_energy: f64,
     crack_total_energy: f64,
@@ -281,7 +282,7 @@ fn measure_case(
     }
     let tick_cost = summarize_ticks(&tick_samples);
 
-    settle_event_sources(&mut render, &mut stage_gains);
+    settle_event_sources(&mut render, &mut stage_gains, REFLECTIONS_ONLY);
     let propagation = simulation.snapshot.sources[BLAST_SOURCE];
     let reflection = propagation.reflections;
     let direct_occlusion = propagation.direct.occlusion;
@@ -310,6 +311,15 @@ fn measure_case(
         delivered_ir_s,
         listener_case.inspect_echoes,
     );
+
+    // Measure the direct stage with the identical source, unit impulse, distance
+    // delay, and impulse-class shaping used for the reflection capture. This is
+    // deliberately last: the direct stimulus also enters Steam Audio's muted
+    // reflection effect, so measuring it first would contaminate a later tail.
+    settle_event_sources(&mut render, &mut stage_gains, DIRECT_ONLY);
+    let direct_capture = render_source_program(&mut render, BLAST_SOURCE, &blast_program);
+    let direct_peak_dbfs = peak_dbfs(&direct_capture);
+    let tail_below_direct_db = tail.peak_dbfs - direct_peak_dbfs;
 
     let crack_window_energy = plan.crack.map_or(0.0, |crack| {
         centered_window_energy(&crack_capture, crack.arrival_time_s, 0.010)
@@ -341,7 +351,9 @@ fn measure_case(
         sdk_ir_frames: reflection.ir_size,
         sdk_reverb_times_s: reflection.reverb_times,
         tick_cost,
+        direct_peak_dbfs,
         tail,
+        tail_below_direct_db,
         crack_window_energy,
         blast_window_energy,
         crack_total_energy,
@@ -454,8 +466,9 @@ fn recover_governor_to_full(simulation: &mut MultiSourceSimulation, config: S3Si
 fn settle_event_sources(
     render: &mut MultiSourceRenderGraph,
     stage_gains: &mut SnapshotWriter<StageOutputGains>,
+    gains: StageOutputGains,
 ) {
-    stage_gains.publish(REFLECTIONS_ONLY);
+    stage_gains.publish(gains);
     let zeros = [0.0_f32; BLOCK_FRAMES as usize];
     for _ in 0..SETTLE_BLOCKS {
         render_event_block(render, &zeros, &zeros, None);
@@ -713,9 +726,6 @@ fn find_echoes(
             .all(|kept| (kept.delay_s - candidate.delay_s).abs() >= MIN_SEPARATION_S)
         {
             selected.push(candidate);
-            if selected.len() == 8 {
-                break;
-            }
         }
     }
     selected.sort_by(|left, right| left.delay_s.total_cmp(&right.delay_s));
@@ -739,6 +749,22 @@ fn stereo_energy(stereo: &[f32]) -> f64 {
         .iter()
         .map(|sample| f64::from(*sample) * f64::from(*sample))
         .sum()
+}
+
+fn peak_dbfs(stereo: &[f32]) -> f64 {
+    let peak_frame_energy = stereo
+        .chunks_exact(2)
+        .map(|frame| {
+            let left = f64::from(frame[0]);
+            let right = f64::from(frame[1]);
+            left * left + right * right
+        })
+        .fold(0.0_f64, f64::max);
+    if peak_frame_energy > 0.0 {
+        10.0 * (peak_frame_energy / 2.0).log10()
+    } else {
+        f64::NEG_INFINITY
+    }
 }
 
 fn energy_ratio_db(numerator: f64, denominator: f64) -> f64 {
@@ -779,7 +805,7 @@ fn print_configuration(package: &Path, bake: &Path, mesh: &SceneMesh) {
 
 fn print_measurement_table(rows: &[MeasurementRow]) {
     println!(
-        "WAVE14_TABLE config\trepeat\tlistener\tposition\tdistance_m\tdirect_occlusion\tsource_probe\tlistener_probe\tboot_level\tdelivered_level\trays\tbounces\trequested_ir_s\tdelivered_ir_s\tcadence\tsdk_ir_frames\tsdk_ir_s\tcapacity_clamped\treverb_times_s\texecuted_tick_median_ms\texecuted_tick_p95_ms\texecuted_tick_max_ms\ttail_energy\ttail_peak_dbfs\ttail_above_signal_floor\tfirst_after_blast_ms\tedc_t20_s\tedc_t40_s\tedc_t60_s\tdiscrete_count"
+        "WAVE14_TABLE config\trepeat\tlistener\tposition\tdistance_m\tdirect_occlusion\tdirect_stage_peak_dbfs\ttail_below_direct_db\tsource_probe\tlistener_probe\tboot_level\tdelivered_level\trays\tbounces\trequested_ir_s\tdelivered_ir_s\tcadence\tsdk_ir_frames\tsdk_ir_s\tcapacity_clamped\treverb_times_s\texecuted_tick_median_ms\texecuted_tick_p95_ms\texecuted_tick_max_ms\ttail_energy\ttail_peak_dbfs\ttail_above_signal_floor\tfirst_after_blast_ms\tedc_t20_s\tedc_t40_s\tedc_t60_s\tdiscrete_count"
     );
     for row in rows {
         let delivered = row.delivered.reflections;
@@ -787,7 +813,7 @@ fn print_measurement_table(rows: &[MeasurementRow]) {
         let capacity_clamped = row.config.force_full
             && (sdk_ir_s - f64::from(row.config.requested_ir_s)).abs() > 1.0 / SAMPLE_RATE as f64;
         println!(
-            "WAVE14_TABLE {}\t{}\t{}\t[{:.1},{:.1},{:.1}]\t{:.3}\t{:.9e}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{sdk_ir_s:.6}\t{}\t{:.3}/{:.3}/{:.3}\t{:.6}\t{:.6}\t{:.6}\t{:.9e}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "WAVE14_TABLE {}\t{}\t{}\t[{:.1},{:.1},{:.1}]\t{:.3}\t{:.9e}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{sdk_ir_s:.6}\t{}\t{:.3}/{:.3}/{:.3}\t{:.6}\t{:.6}\t{:.6}\t{:.9e}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.config.label,
             row.config.honest_repeat,
             row.listener.label,
@@ -796,6 +822,8 @@ fn print_measurement_table(rows: &[MeasurementRow]) {
             row.listener.position.up_m,
             distance(MUZZLE, row.listener.position),
             row.direct_occlusion,
+            format_db(row.direct_peak_dbfs),
+            format_db(row.tail_below_direct_db),
             row.source_has_probe,
             row.listener_has_probe,
             row.boot.reflections.level,
@@ -924,26 +952,20 @@ fn print_verdict(rows: &[MeasurementRow]) {
         .iter()
         .filter_map(|row| row.tail.decay_60_s)
         .reduce(f64::max);
-    let nominal_los_all_blocked = rows
+    let street_los_all_blocked = rows
         .iter()
-        .filter(|row| row.listener.label.starts_with("nominal-los"))
+        .filter(|row| row.listener.label.contains("los"))
         .all(|row| row.direct_occlusion <= 1.0e-6);
     let any_tail_above_signal_floor = rows.iter().any(|row| row.tail.above_signal_floor);
     println!(
-        "WAVE14_VERDICT any_tail_above_signal_floor={} any_discrete_above_diffuse_floor={} any_facade_range_return={} maximum_formal_edc_t60_s={} nominal_los_cases_all_directly_blocked={} crack_reflection_null={} extended_4s_capacity_clamped={}",
+        "WAVE14_VERDICT any_tail_above_signal_floor={} any_discrete_above_diffuse_floor={} any_facade_range_return={} maximum_formal_edc_t60_s={} street_los_cases_all_directly_blocked={} crack_reflection_null={}",
         any_tail_above_signal_floor,
         any_discrete,
         any_facade,
         format_option(max_t60_s, 6),
-        nominal_los_all_blocked,
+        street_los_all_blocked,
         rows.iter()
             .all(|row| row.crack_total_energy <= f64::EPSILON),
-        rows.iter()
-            .filter(|row| row.config.requested_ir_s == 4.0 && row.config.force_full)
-            .any(|row| {
-                (row.sdk_ir_frames as f64 / SAMPLE_RATE as f64 - 4.0).abs()
-                    > 1.0 / SAMPLE_RATE as f64
-            }),
     );
 }
 
