@@ -21,6 +21,7 @@ use crate::atomicio::{
     AtomicDir, validate_output_path, write_bytes_atomic, write_json_atomic,
     write_json_string_atomic,
 };
+use crate::bake_reservation::{BakeReservation, format_bytes};
 use crate::error::{CliError, Result};
 
 const DEFAULT_HEIGHT_M: f32 = 4.0;
@@ -36,6 +37,9 @@ const PERCEPT_SHADOW_LISTENER_M: [f64; 3] = [-10.0, -68.0, 1.5];
 const PERCEPT_LOS_LISTENER_M: [f64; 3] = [16.0, -42.0, 1.5];
 const SYNTH_BLOCK_SIZE_M: f64 = 80.0;
 const SYNTH_STREET_WIDTH_M: f64 = 15.0;
+const BAKE_ARTIFACT_FIXED_BYTES: u64 = 64 * 1024;
+const SERIALIZED_BYTES_PER_PROBE: u64 = 256;
+const SERIALIZED_BYTES_PER_REACHABLE_PAIR: u64 = 10;
 
 pub fn compile_geojson(geojson: &Path, output: &Path) -> Result<()> {
     let input = std::fs::read(geojson)
@@ -551,6 +555,98 @@ fn elevated_probe_layers(config: &BakeConfig) -> Vec<ElevatedProbeLayer> {
         .collect()
 }
 
+/// Conservative disk budget derived from the probe layout and path radius.
+///
+/// Steam Audio's uniform-floor layout has at most `floor(span / spacing) + 1`
+/// probes on either horizontal axis. Elevated layers use that same grid and
+/// may only remove probes buried in solids, so summing the unculled grids is a
+/// safe probe-count bound before the SDK starts its expensive path bake.
+///
+/// Retained Steam Audio 4.8.1 city serializations use fewer than six bytes per
+/// potentially reachable ordered probe pair. Ten bytes leaves headroom for
+/// route/schema variation, 256 bytes per probe covers batch bookkeeping, and a
+/// fixed 64 KiB covers serialization roots plus the two JSON sidecars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BakeArtifactEstimate {
+    probe_count_upper_bound: u64,
+    probe_batch_bytes: u64,
+    bytes: u64,
+}
+
+fn estimate_bake_artifact(
+    probes: ProbeVolume,
+    elevated_layers: &[ElevatedProbeLayer],
+    path_range_m: f32,
+) -> Result<BakeArtifactEstimate> {
+    let mut probe_count = grid_probe_count(probes, probes.spacing_m)?;
+    let mut minimum_spacing_m = probes.spacing_m;
+    for layer in elevated_layers {
+        probe_count = probe_count
+            .checked_add(grid_probe_count(probes, layer.spacing_m)?)
+            .ok_or_else(|| CliError::new("city probe layout count overflowed u64"))?;
+        minimum_spacing_m = minimum_spacing_m.min(layer.spacing_m);
+    }
+
+    let layer_count = u64::try_from(elevated_layers.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| CliError::new("city probe layer count overflowed u64"))?;
+    let radius_in_cells = f64::from(path_range_m) / f64::from(minimum_spacing_m);
+    // Every lattice point owns a unit square. If its centre is within the path
+    // radius, that square lies within a circle expanded by half the square's
+    // diagonal; the expanded circle's area therefore bounds the point count.
+    let expanded_radius = radius_in_cells + std::f64::consts::FRAC_1_SQRT_2;
+    let reachable_per_layer = f64_to_u64_ceil(
+        std::f64::consts::PI * expanded_radius * expanded_radius,
+        "city path-neighbour estimate exceeds u64",
+    )?;
+    let reachable_per_probe = reachable_per_layer
+        .checked_mul(layer_count)
+        .unwrap_or(u64::MAX)
+        .min(probe_count);
+
+    let per_probe = u128::from(SERIALIZED_BYTES_PER_PROBE)
+        + u128::from(SERIALIZED_BYTES_PER_REACHABLE_PAIR) * u128::from(reachable_per_probe);
+    let probe_batch_bytes = u64::try_from(u128::from(probe_count) * per_probe).map_err(|_| {
+        CliError::new("estimated city bake artifact exceeds the supported u64 file size")
+    })?;
+    let bytes = BAKE_ARTIFACT_FIXED_BYTES
+        .checked_add(probe_batch_bytes)
+        .ok_or_else(|| {
+            CliError::new("estimated city bake artifact exceeds the supported u64 file size")
+        })?;
+    Ok(BakeArtifactEstimate {
+        probe_count_upper_bound: probe_count,
+        probe_batch_bytes,
+        bytes,
+    })
+}
+
+fn grid_probe_count(probes: ProbeVolume, spacing_m: f32) -> Result<u64> {
+    let east = grid_axis_count(probes.min_enu_m.x, probes.max_enu_m.x, spacing_m)?;
+    let north = grid_axis_count(probes.min_enu_m.y, probes.max_enu_m.y, spacing_m)?;
+    east.checked_mul(north)
+        .ok_or_else(|| CliError::new("city probe layout count overflowed u64"))
+}
+
+fn grid_axis_count(min: f32, max: f32, spacing_m: f32) -> Result<u64> {
+    let span = f64::from(max) - f64::from(min);
+    if !span.is_finite() || span < 0.0 || !spacing_m.is_finite() || spacing_m <= 0.0 {
+        return Err(CliError::new(
+            "city probe layout requires finite bounds and positive spacing",
+        ));
+    }
+    let steps = (span / f64::from(spacing_m)).floor();
+    f64_to_u64_ceil(steps + 1.0, "city probe axis count exceeds u64")
+}
+
+fn f64_to_u64_ceil(value: f64, overflow_message: &'static str) -> Result<u64> {
+    if !value.is_finite() || value < 0.0 || value > u64::MAX as f64 {
+        return Err(CliError::new(overflow_message));
+    }
+    Ok(value.ceil() as u64)
+}
+
 pub fn bake(package: &Path, output: &Path) -> Result<()> {
     bake_with_config(package, output, BakeConfig::default())
 }
@@ -561,17 +657,29 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
         .map_err(|error| CliError::new(format!("cannot load package: {error}")))?;
     let scene = scene_mesh(&loaded)?;
     let probes = probe_volume(&scene, &config)?;
+    let elevated_layers = elevated_probe_layers(&config);
+    let estimate = estimate_bake_artifact(probes, &elevated_layers, config.path_range_m)?;
     // Claim the destination before the bake, not after. A city-scale path bake
-    // is minutes of work; discovering an unwritable or already-occupied output
-    // at the end of it throws all of that away.
+    // is minutes of work; discovering an unwritable, occupied, or full output
+    // at the end of it throws all of that away. The large file itself is filled
+    // with zeroes here so APFS must allocate its blocks before compute starts.
     let output = validate_output_path(output)?;
     let directory = AtomicDir::create(output.clone())?;
+    let temp = directory.temp_path();
+    let reservation =
+        BakeReservation::create(&temp.join("probe-batch.bin"), &output, estimate.bytes)?;
+    eprintln!(
+        "fightbox: city bake preflight reserved {} for at most {} probes (filesystem reported {} available; APFS purgeable space can make that optimistic)",
+        format_bytes(estimate.bytes),
+        estimate.probe_count_upper_bound,
+        format_bytes(reservation.reported_available_bytes())
+    );
 
     let defaults = PathBakeConfig::default();
     let baked = bake_s3(&S3BakeRequest {
         mesh: scene,
         probes,
-        elevated_probe_layers: elevated_probe_layers(&config),
+        elevated_probe_layers: elevated_layers,
         pathing: PathBakeConfig {
             num_visibility_samples: config.visibility_samples,
             probe_visibility_radius_m: defaults.probe_visibility_radius_m,
@@ -586,8 +694,16 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
         .validate()
         .map_err(|error| CliError::new(format!("city bake validation failed: {error}")))?;
 
-    let temp = directory.temp_path();
-    write_bytes_atomic(&temp.join("probe-batch.bin"), &baked.bytes)?;
+    let actual_probe_batch_bytes = u64::try_from(baked.bytes.len())
+        .map_err(|_| CliError::new("city probe batch exceeds the supported file size"))?;
+    if actual_probe_batch_bytes > estimate.probe_batch_bytes {
+        return Err(CliError::new(format!(
+            "city probe batch is {} but its conservative pre-compute budget was {}; the artifact estimator was exceeded",
+            format_bytes(actual_probe_batch_bytes),
+            format_bytes(estimate.probe_batch_bytes)
+        )));
+    }
+    reservation.finish(&baked.bytes)?;
     write_json_string_atomic(
         &temp.join("probe-batch-metadata.json"),
         &baked.metadata.to_json(),
@@ -1158,6 +1274,23 @@ mod tests {
         path
     }
 
+    #[cfg(feature = "linked-sdk")]
+    fn bake_temp(label: &str) -> PathBuf {
+        let scratch = if cfg!(unix) {
+            PathBuf::from("/tmp/lane-bake-robustness")
+        } else {
+            std::env::temp_dir().join("lane-bake-robustness")
+        };
+        std::fs::create_dir_all(&scratch).unwrap();
+        let path = scratch.join(format!(
+            "fightbox-city-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
     #[test]
     fn compile_is_byte_deterministic_and_inspect_discloses_default_height() {
         let root = temp("compile");
@@ -1238,6 +1371,50 @@ mod tests {
         );
         assert!(BakeConfig::default().elevated_probe_layers_m.is_empty());
         assert!(BakeConfig::default().elevated_probe_spacing_m.is_none());
+    }
+
+    #[test]
+    fn artifact_estimator_uses_the_unculled_layout_as_its_probe_bound() {
+        let probes = ProbeVolume {
+            min_enu_m: fightbox_steam_audio::EnuVector3::new(-5.0, -5.0, 0.0),
+            max_enu_m: fightbox_steam_audio::EnuVector3::new(52.0, 30.0, 3.0),
+            spacing_m: 4.0,
+            height_above_floor_m: 1.5,
+        };
+        let estimate = estimate_bake_artifact(probes, &[], 100.0).unwrap();
+        assert_eq!(estimate.probe_count_upper_bound, 135);
+        assert_eq!(estimate.probe_batch_bytes, 216_810);
+        assert_eq!(estimate.bytes, 282_346);
+    }
+
+    #[cfg(feature = "linked-sdk")]
+    #[test]
+    fn artifact_estimator_bounds_a_small_real_bake_in_a_tempdir() {
+        let root = bake_temp("artifact-estimate-real-bake");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/city/synthetic/block.geojson");
+        let package = root.join("block.fightbox");
+        compile_geojson(&source, &package).unwrap();
+
+        let config = BakeConfig::default();
+        let loaded = read_package(&package).unwrap();
+        let scene = scene_mesh(&loaded).unwrap();
+        let probes = probe_volume(&scene, &config).unwrap();
+        let layers = elevated_probe_layers(&config);
+        let estimate = estimate_bake_artifact(probes, &layers, config.path_range_m).unwrap();
+
+        let output = root.join("block.baked");
+        bake_with_config(&package, &output, config).unwrap();
+        let baked = load_baked(&output).unwrap();
+        let actual_artifact_bytes: u64 = output
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(estimate.probe_count_upper_bound >= u64::from(baked.metadata.probe_count));
+        assert!(estimate.bytes >= actual_artifact_bytes);
+        assert!(estimate.bytes <= actual_artifact_bytes * 4);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Positions are a pure function of `(volume, layer, mesh)`, and neither the

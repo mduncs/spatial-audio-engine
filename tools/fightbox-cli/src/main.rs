@@ -21,6 +21,7 @@ use fightbox_steam_audio::{CapabilityStatus, runtime_status, steam_audio_provena
 
 mod asset;
 mod atomicio;
+mod bake_reservation;
 mod bundle;
 mod calibrate;
 mod city;
@@ -77,7 +78,8 @@ city bake        Bake probes for a city package (requires linked-sdk)\n    \
                   mid-air probe layer at that ENU altitude so airborne\n    \
                   sources have influencing probes)\n    \
                   [--elevated-probe-spacing-m <m>] (horizontal spacing of every\n    \
-                  elevated layer; defaults to the floor probe spacing)\n    \
+                  elevated layer; requires at least one layer and defaults to\n    \
+                  the floor probe spacing)\n    \
                   defaults: 100m, 6m, 1, 0.5, 4m, 1.5m, 3m, no layers, 1 thread\n    \
 city render      Render a fixture through a packaged and baked city\n\n\
 city metamorphic Jitter assumed heights, bake, and assert the occlusion percept\n\n\
@@ -242,6 +244,11 @@ fn parse_city_bake_args(args: &[String]) -> error::Result<(PathBuf, PathBuf, cit
                 )));
             }
         }
+    }
+    if elevated_probe_spacing_m.is_some() && elevated_probe_layers_m.is_empty() {
+        return Err(error::CliError::new(
+            "--elevated-probe-spacing-m requires at least one --elevated-probe-layer-m",
+        ));
     }
     let defaults = city::BakeConfig::default();
     Ok((
@@ -801,6 +808,23 @@ mod tests {
         assert_eq!(config.probe_spacing_m, 8.0);
         assert_eq!(config.elevated_probe_layers_m, vec![30.0, 63.0]);
         assert_eq!(config.elevated_probe_spacing_m, Some(16.0));
+    }
+
+    #[test]
+    fn city_bake_rejects_elevated_spacing_without_a_layer() {
+        let error = parse_city_bake_args(&[
+            "--package".into(),
+            "city.fightbox".into(),
+            "--output".into(),
+            "city.baked".into(),
+            "--elevated-probe-spacing-m".into(),
+            "16".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "--elevated-probe-spacing-m requires at least one --elevated-probe-layer-m"
+        );
     }
 
     #[test]
