@@ -419,20 +419,57 @@ pub enum CalibrationError {
     InvalidPropagationDistance,
 }
 
-/// Spatial extent requested by a source. Only Point is an initial renderer capability.
+/// Spatial extent requested by a source.
+///
+/// The Steam Audio backend uses non-point extents to select a volumetric
+/// direct-occlusion footprint. Spatial-width rendering is not implemented:
+/// dry audio, pathing, and reflections are still rendered from one source
+/// position.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum ExtentDescriptor {
     #[default]
     Point,
-    MultiPoint {
-        count: u8,
-    },
-    LineSegment {
-        length_m: f32,
-    },
-    StereoImage {
-        width_m: f32,
-    },
+    /// A compact point cloud. `count` must be nonzero.
+    MultiPoint { count: u8 },
+    /// A line whose length must be finite and positive.
+    LineSegment { length_m: f32 },
+    /// A stereo image whose width must be finite and positive.
+    StereoImage { width_m: f32 },
+}
+
+impl ExtentDescriptor {
+    /// Validates the finite, non-degenerate extent contract.
+    pub fn validate(self) -> Result<(), ExtentError> {
+        match self {
+            Self::Point => Ok(()),
+            Self::MultiPoint { count: 0 } => Err(ExtentError::EmptyMultiPoint),
+            Self::MultiPoint { .. } => Ok(()),
+            Self::LineSegment { length_m } if !length_m.is_finite() => {
+                Err(ExtentError::NonFiniteLineLength)
+            }
+            Self::LineSegment { length_m } if length_m <= 0.0 => {
+                Err(ExtentError::NonPositiveLineLength)
+            }
+            Self::LineSegment { .. } => Ok(()),
+            Self::StereoImage { width_m } if !width_m.is_finite() => {
+                Err(ExtentError::NonFiniteStereoWidth)
+            }
+            Self::StereoImage { width_m } if width_m <= 0.0 => {
+                Err(ExtentError::NonPositiveStereoWidth)
+            }
+            Self::StereoImage { .. } => Ok(()),
+        }
+    }
+}
+
+/// Validation failures for a source extent descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentError {
+    EmptyMultiPoint,
+    NonFiniteLineLength,
+    NonPositiveLineLength,
+    NonFiniteStereoWidth,
+    NonPositiveStereoWidth,
 }
 
 /// Analytic source-radiation pattern matching Steam Audio's `IPLDirectivity` model.
@@ -580,6 +617,7 @@ impl SourceProfile {
         if !self.max_speed_mps.is_finite() || self.max_speed_mps < 0.0 {
             return Err(SourceError::InvalidMaxSpeed);
         }
+        self.extent.validate().map_err(SourceError::Extent)?;
         self.directivity
             .validate()
             .map_err(SourceError::Directivity)?;
@@ -598,6 +636,7 @@ pub enum SourceError {
     EmptyId,
     NonFinitePose,
     InvalidMaxSpeed,
+    Extent(ExtentError),
     Directivity(DirectivityError),
     Calibration(CalibrationError),
 }
@@ -725,6 +764,61 @@ mod tests {
             assert_eq!(
                 source_profile_with_directivity(directivity).validate(),
                 Err(SourceError::Directivity(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn source_profile_validates_every_extent_variant() {
+        for extent in [
+            ExtentDescriptor::Point,
+            ExtentDescriptor::MultiPoint { count: 1 },
+            ExtentDescriptor::LineSegment { length_m: 0.25 },
+            ExtentDescriptor::StereoImage { width_m: 4.0 },
+        ] {
+            let mut profile = source_profile_with_directivity(Directivity::default());
+            profile.extent = extent;
+            assert_eq!(profile.validate(), Ok(()), "{extent:?}");
+        }
+
+        for (extent, expected) in [
+            (
+                ExtentDescriptor::MultiPoint { count: 0 },
+                ExtentError::EmptyMultiPoint,
+            ),
+            (
+                ExtentDescriptor::LineSegment { length_m: 0.0 },
+                ExtentError::NonPositiveLineLength,
+            ),
+            (
+                ExtentDescriptor::LineSegment { length_m: -1.0 },
+                ExtentError::NonPositiveLineLength,
+            ),
+            (
+                ExtentDescriptor::LineSegment { length_m: f32::NAN },
+                ExtentError::NonFiniteLineLength,
+            ),
+            (
+                ExtentDescriptor::StereoImage { width_m: 0.0 },
+                ExtentError::NonPositiveStereoWidth,
+            ),
+            (
+                ExtentDescriptor::StereoImage { width_m: -1.0 },
+                ExtentError::NonPositiveStereoWidth,
+            ),
+            (
+                ExtentDescriptor::StereoImage {
+                    width_m: f32::INFINITY,
+                },
+                ExtentError::NonFiniteStereoWidth,
+            ),
+        ] {
+            let mut profile = source_profile_with_directivity(Directivity::default());
+            profile.extent = extent;
+            assert_eq!(
+                profile.validate(),
+                Err(SourceError::Extent(expected)),
+                "{extent:?}"
             );
         }
     }

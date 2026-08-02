@@ -384,6 +384,7 @@ impl Workbench {
             .map(|(profile, _)| {
                 MultiSourceDescriptor::at(profile.pose.position)
                     .with_directivity(profile.directivity)
+                    .with_extent(profile.extent)
             })
             .collect::<Vec<_>>();
         let audio_config = AudioConfig {

@@ -189,6 +189,7 @@ pub(crate) struct MultiSourceSimulation {
     audio: AudioConfig,
     config: S3SimulationConfig,
     source_directivities: [Directivity; MAX_ACTIVE_SOURCES],
+    source_occlusion_modes: [DirectOcclusionMode; MAX_ACTIVE_SOURCES],
     frame: SimulationFrame,
     valid_update: bool,
     snapshot: SteamPropagationSnapshot,
@@ -383,6 +384,7 @@ impl MultiSourceSimulation {
             let mut inputs = source_inputs(
                 self.frame.sources[index],
                 self.source_directivities[index],
+                self.source_occlusion_modes[index],
                 self.world.probe_batch(),
                 self.config,
                 quality,
@@ -472,16 +474,18 @@ impl MultiSourceSimulation {
                     // visibility does not expose the center ray used by
                     // pathing, so it cannot prove this bypass.
                     let direct_line_of_sight =
-                        matches!(self.config.direct_occlusion, DirectOcclusionMode::Raycast)
-                            && self.last_direct_frame.is_some_and(|direct_frame| {
-                                same_position(
-                                    direct_frame.listener.position,
-                                    self.frame.listener.position,
-                                ) && same_position(
-                                    direct_frame.sources[index].position,
-                                    self.frame.sources[index].position,
-                                ) && source_snapshot.direct.occlusion >= 1.0 - 1.0e-6
-                            });
+                        matches!(
+                            self.source_occlusion_modes[index],
+                            DirectOcclusionMode::Raycast
+                        ) && self.last_direct_frame.is_some_and(|direct_frame| {
+                            same_position(
+                                direct_frame.listener.position,
+                                self.frame.listener.position,
+                            ) && same_position(
+                                direct_frame.sources[index].position,
+                                self.frame.sources[index].position,
+                            ) && source_snapshot.direct.occlusion >= 1.0 - 1.0e-6
+                        });
                     let endpoints_have_probes = listener_has_probe
                         && self
                             .world
@@ -632,6 +636,7 @@ fn shared_inputs(
 fn source_inputs(
     source: SteamPose,
     directivity: Directivity,
+    direct_occlusion: DirectOcclusionMode,
     probe_batch: ffi::IPLProbeBatch,
     config: S3SimulationConfig,
     quality: GovernorRenderSnapshot,
@@ -653,12 +658,12 @@ fn source_inputs(
             callback: None,
             userData: core::ptr::null_mut(),
         },
-        occlusionType: direct_occlusion_ffi_type(config.direct_occlusion),
-        occlusionRadius: match config.direct_occlusion {
+        occlusionType: direct_occlusion_ffi_type(direct_occlusion),
+        occlusionRadius: match direct_occlusion {
             DirectOcclusionMode::Raycast => 0.0,
             DirectOcclusionMode::Volumetric { radius_m, .. } => radius_m,
         },
-        numOcclusionSamples: match config.direct_occlusion {
+        numOcclusionSamples: match direct_occlusion {
             DirectOcclusionMode::Raycast => 0,
             DirectOcclusionMode::Volumetric { sample_count, .. } => sample_count,
         },
@@ -1353,6 +1358,7 @@ pub(crate) fn build_multi_source_generation(
         up: SteamVector3::new(0.0, 1.0, 0.0),
     }; MAX_ACTIVE_SOURCES];
     let mut source_directivities = [Directivity::OMNIDIRECTIONAL; MAX_ACTIVE_SOURCES];
+    let mut source_occlusion_modes = [config.direct_occlusion; MAX_ACTIVE_SOURCES];
     let mut active = [false; MAX_ACTIVE_SOURCES];
     for (index, descriptor) in descriptors.iter().enumerate() {
         source_poses[index] =
@@ -1360,6 +1366,8 @@ pub(crate) fn build_multi_source_generation(
                 BackendError::InvalidInput("multi-source descriptor position must be finite"),
             )?;
         source_directivities[index] = descriptor.directivity;
+        source_occlusion_modes[index] =
+            crate::direct_occlusion_for_extent(config, descriptor.extent);
         active[index] = true;
         initial.sources[index].active = true;
         initial.sources[index].source_position = source_poses[index].position;
@@ -1386,6 +1394,7 @@ pub(crate) fn build_multi_source_generation(
         audio,
         config,
         source_directivities,
+        source_occlusion_modes,
         frame: SimulationFrame {
             listener,
             listener_linear_velocity_mps: SteamVector3::default(),
@@ -1436,6 +1445,14 @@ fn validate_multi_source_config(
     {
         return Err(BackendError::InvalidInput(
             "multi-source descriptor directivity is outside the validated ranges",
+        ));
+    }
+    if descriptors
+        .iter()
+        .any(|descriptor| descriptor.extent.validate().is_err())
+    {
+        return Err(BackendError::InvalidInput(
+            "multi-source descriptor extent is invalid",
         ));
     }
     if config.max_occlusion_samples <= 0
@@ -2063,6 +2080,143 @@ mod tests {
             material_indices: vec![0, 0, 0, 0, 1, 1, 1, 1],
             materials: vec![wall, AcousticMaterial::GROUND],
         }
+    }
+
+    #[test]
+    fn point_extent_builds_legacy_default_occlusion_inputs_bit_exactly() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let config = test_config();
+        let descriptors = [crate::MultiSourceDescriptor::at(ApiEnuVector3::new(
+            2.0, 3.0, 1.5,
+        ))];
+        let (simulation, _render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            config,
+            &descriptors,
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+
+        assert_eq!(
+            simulation.source_occlusion_modes[0],
+            config.direct_occlusion
+        );
+        let inputs = source_inputs(
+            simulation.frame.sources[0],
+            simulation.source_directivities[0],
+            simulation.source_occlusion_modes[0],
+            simulation.world.probe_batch(),
+            config,
+            simulation.governor.render_quality(),
+            ffi::IPL_SIMULATIONFLAGS_DIRECT,
+        )
+        .unwrap();
+        assert_eq!(inputs.occlusionType, ffi::IPL_OCCLUSIONTYPE_RAYCAST);
+        assert_eq!(inputs.occlusionRadius.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(inputs.numOcclusionSamples, 0);
+    }
+
+    #[test]
+    fn retained_world_rejects_degenerate_and_invalid_extents() {
+        use fightbox_api::ExtentDescriptor;
+
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        for extent in [
+            ExtentDescriptor::MultiPoint { count: 0 },
+            ExtentDescriptor::LineSegment { length_m: 0.0 },
+            ExtentDescriptor::LineSegment { length_m: -1.0 },
+            ExtentDescriptor::LineSegment {
+                length_m: f32::INFINITY,
+            },
+            ExtentDescriptor::StereoImage { width_m: 0.0 },
+            ExtentDescriptor::StereoImage { width_m: -1.0 },
+            ExtentDescriptor::StereoImage { width_m: f32::NAN },
+        ] {
+            let descriptors = [
+                crate::MultiSourceDescriptor::at(ApiEnuVector3::new(2.0, 3.0, 1.5))
+                    .with_extent(extent),
+            ];
+            assert_eq!(
+                validate_multi_source_config(
+                    &mesh,
+                    None,
+                    audio,
+                    test_config(),
+                    &descriptors,
+                    QualityTier::Desktop,
+                ),
+                Err(BackendError::InvalidInput(
+                    "multi-source descriptor extent is invalid"
+                )),
+                "{extent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_extent_is_fractionally_occluded_at_a_decisive_wall_edge() {
+        use fightbox_api::ExtentDescriptor;
+
+        let mesh = wall_mesh(AcousticMaterial::MASONRY);
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let config = test_config();
+        let source_position = ApiEnuVector3::new(5.75, 2.0, 1.5);
+        let listener_position = ApiEnuVector3::new(4.0, -2.0, 1.5);
+        let simulate = |extent| {
+            let descriptors =
+                [crate::MultiSourceDescriptor::at(source_position).with_extent(extent)];
+            let (mut simulation, _render) = build_multi_source_generation(
+                &mesh,
+                None,
+                audio,
+                config,
+                &descriptors,
+                1,
+                QualityTier::Desktop,
+            )
+            .unwrap();
+            simulation.update_inputs(&one_source_update(true, source_position, listener_position));
+            simulation.run_direct().unwrap();
+            (
+                simulation.snapshot.sources[0].direct.occlusion,
+                simulation.source_occlusion_modes[0],
+            )
+        };
+
+        let (point_occlusion, point_mode) = simulate(ExtentDescriptor::Point);
+        let (line_occlusion, line_mode) = simulate(ExtentDescriptor::LineSegment { length_m: 2.0 });
+        assert_eq!(point_mode, DirectOcclusionMode::Raycast);
+        assert_eq!(
+            line_mode,
+            DirectOcclusionMode::Volumetric {
+                radius_m: 1.0,
+                sample_count: crate::DEFAULT_OCCLUSION_SAMPLE_COUNT,
+            }
+        );
+        assert!(
+            point_occlusion <= 0.05 || point_occlusion >= 0.95,
+            "point ray was not decisive: {point_occlusion}"
+        );
+        assert!(
+            line_occlusion > 0.05 && line_occlusion < 0.95,
+            "line extent did not produce fractional occlusion: {line_occlusion}"
+        );
+        assert_ne!(line_occlusion.to_bits(), point_occlusion.to_bits());
+        eprintln!("extent_edge_occlusion point={point_occlusion:.9} line={line_occlusion:.9}");
     }
 
     fn impulse_onset_at_distance(

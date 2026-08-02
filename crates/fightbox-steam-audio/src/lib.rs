@@ -710,10 +710,59 @@ pub enum DirectOcclusionMode {
 }
 
 /// Recommended source radius for live sessions that opt into volumetric
-/// direct occlusion. The S3 evidence pipeline stays on `Raycast`.
+/// direct occlusion, and the default footprint for [`fightbox_api::ExtentDescriptor::MultiPoint`].
+/// The S3 evidence pipeline stays on `Raycast`.
 pub const DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS: f32 = 1.0;
-/// Recommended volumetric visibility sample count for live sessions.
+/// Recommended volumetric visibility sample count for live sessions and for
+/// extent-driven volumetric requests whose global mode is `Raycast`.
 pub const DEFAULT_OCCLUSION_SAMPLE_COUNT: i32 = 32;
+/// Smallest radius sent to Steam Audio for a positive source extent.
+pub const MIN_EXTENT_OCCLUSION_RADIUS_METERS: f32 = 0.01;
+/// Largest radius sent to Steam Audio for a source extent.
+///
+/// A 100 m radius covers even unusually long emitters without allowing an
+/// accidental world-scale descriptor to destabilize visibility sampling.
+pub const MAX_EXTENT_OCCLUSION_RADIUS_METERS: f32 = 100.0;
+
+#[cfg(any(feature = "linked-sdk", test))]
+pub(crate) fn direct_occlusion_for_extent(
+    config: S3SimulationConfig,
+    extent: fightbox_api::ExtentDescriptor,
+) -> DirectOcclusionMode {
+    use fightbox_api::ExtentDescriptor;
+
+    let radius_m = match extent {
+        ExtentDescriptor::Point => return config.direct_occlusion,
+        // MultiPoint declares multiplicity but no point layout. Model it as a
+        // compact 1 m cloud instead of inventing source-local point positions.
+        ExtentDescriptor::MultiPoint { count } if count > 0 => {
+            DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS
+        }
+        ExtentDescriptor::LineSegment { length_m }
+        | ExtentDescriptor::StereoImage { width_m: length_m }
+            if length_m.is_finite() && length_m > 0.0 =>
+        {
+            (length_m * 0.5).clamp(
+                MIN_EXTENT_OCCLUSION_RADIUS_METERS,
+                MAX_EXTENT_OCCLUSION_RADIUS_METERS,
+            )
+        }
+        // Construction rejects invalid descriptors. Keep the mapper itself
+        // defensive so a degenerate zero extent can never request a zero-radius
+        // volumetric query if validation is bypassed.
+        _ => return config.direct_occlusion,
+    };
+    let sample_count = match config.direct_occlusion {
+        DirectOcclusionMode::Raycast => {
+            DEFAULT_OCCLUSION_SAMPLE_COUNT.min(config.max_occlusion_samples.max(1))
+        }
+        DirectOcclusionMode::Volumetric { sample_count, .. } => sample_count,
+    };
+    DirectOcclusionMode::Volumetric {
+        radius_m,
+        sample_count,
+    }
+}
 
 impl DirectOcclusionMode {
     #[must_use]
@@ -813,11 +862,14 @@ impl Default for MemoryTrackingStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct S3SimulationConfig {
-    /// Capacity reserved by `IPLSimulationSettings::maxNumOcclusionSamples`.
+    /// Capacity reserved by `IPLSimulationSettings::maxNumOcclusionSamples`,
+    /// including extent-driven volumetric sources.
     pub max_occlusion_samples: i32,
-    /// Exact Steam Audio direct-occlusion algorithm and its applicable parameters.
+    /// Base Steam Audio direct-occlusion request used exactly by Point sources.
     ///
-    /// Raycast has no quality sample count. Volumetric's sample count must not
+    /// Non-point extents derive a volumetric radius from their descriptor. They
+    /// reuse this mode's sample count when it is Volumetric, or the documented
+    /// extent default when it is Raycast. Any volumetric sample count must not
     /// exceed [`Self::max_occlusion_samples`].
     pub direct_occlusion: DirectOcclusionMode,
     pub reflection_rays: i32,
@@ -855,11 +907,14 @@ pub struct S3SimulationConfig {
 /// [`fightbox_runtime::backend::SimulationRunner::update_inputs`] call.
 /// Directivity is immutable world data; its lobe follows the forward axis in
 /// the source pose supplied through that runtime update.
+/// Extent is also immutable world data and controls the source's direct
+/// occlusion footprint; it does not yet widen spatial audio rendering.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MultiSourceDescriptor {
     pub initial_position_enu: fightbox_api::EnuVector3,
     reference_level: fightbox_api::ReferenceLevel,
     directivity: fightbox_api::Directivity,
+    extent: fightbox_api::ExtentDescriptor,
 }
 
 impl MultiSourceDescriptor {
@@ -869,6 +924,7 @@ impl MultiSourceDescriptor {
             initial_position_enu,
             reference_level: fightbox_api::ReferenceLevel::CreativeDb { db: 0.0 },
             directivity: fightbox_api::Directivity::OMNIDIRECTIONAL,
+            extent: fightbox_api::ExtentDescriptor::Point,
         }
     }
 
@@ -890,6 +946,13 @@ impl MultiSourceDescriptor {
     #[must_use]
     pub const fn with_directivity(mut self, directivity: fightbox_api::Directivity) -> Self {
         self.directivity = directivity;
+        self
+    }
+
+    /// Attaches the source extent used for per-source direct occlusion.
+    #[must_use]
+    pub const fn with_extent(mut self, extent: fightbox_api::ExtentDescriptor) -> Self {
+        self.extent = extent;
         self
     }
 
@@ -2263,6 +2326,110 @@ mod tests {
             .steam_audio_discriminant(),
             1
         );
+    }
+
+    #[test]
+    fn extent_driven_occlusion_maps_all_variants_and_bounds_parameters() {
+        use fightbox_api::ExtentDescriptor;
+
+        let raycast = S3SimulationConfig::default();
+        assert_eq!(
+            direct_occlusion_for_extent(raycast, ExtentDescriptor::Point),
+            raycast.direct_occlusion
+        );
+        assert_eq!(
+            direct_occlusion_for_extent(raycast, ExtentDescriptor::MultiPoint { count: 4 }),
+            DirectOcclusionMode::Volumetric {
+                radius_m: DEFAULT_OCCLUSION_SOURCE_RADIUS_METERS,
+                sample_count: DEFAULT_OCCLUSION_SAMPLE_COUNT,
+            }
+        );
+        assert_eq!(
+            direct_occlusion_for_extent(raycast, ExtentDescriptor::LineSegment { length_m: 6.0 }),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 3.0,
+                sample_count: DEFAULT_OCCLUSION_SAMPLE_COUNT,
+            }
+        );
+        assert_eq!(
+            direct_occlusion_for_extent(raycast, ExtentDescriptor::StereoImage { width_m: 4.0 }),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 2.0,
+                sample_count: DEFAULT_OCCLUSION_SAMPLE_COUNT,
+            }
+        );
+
+        let volumetric = S3SimulationConfig {
+            direct_occlusion: DirectOcclusionMode::Volumetric {
+                radius_m: 0.75,
+                sample_count: 23,
+            },
+            ..raycast
+        };
+        assert_eq!(
+            direct_occlusion_for_extent(volumetric, ExtentDescriptor::Point),
+            volumetric.direct_occlusion
+        );
+        assert_eq!(
+            direct_occlusion_for_extent(
+                volumetric,
+                ExtentDescriptor::LineSegment { length_m: 2.0 }
+            ),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 1.0,
+                sample_count: 23,
+            }
+        );
+
+        let constrained = S3SimulationConfig {
+            max_occlusion_samples: 8,
+            ..raycast
+        };
+        assert_eq!(
+            direct_occlusion_for_extent(
+                constrained,
+                ExtentDescriptor::StereoImage { width_m: 2.0 }
+            ),
+            DirectOcclusionMode::Volumetric {
+                radius_m: 1.0,
+                sample_count: 8,
+            }
+        );
+        assert_eq!(
+            direct_occlusion_for_extent(
+                raycast,
+                ExtentDescriptor::LineSegment {
+                    length_m: f32::MIN_POSITIVE,
+                }
+            ),
+            DirectOcclusionMode::Volumetric {
+                radius_m: MIN_EXTENT_OCCLUSION_RADIUS_METERS,
+                sample_count: DEFAULT_OCCLUSION_SAMPLE_COUNT,
+            }
+        );
+        assert_eq!(
+            direct_occlusion_for_extent(
+                raycast,
+                ExtentDescriptor::StereoImage { width_m: 1_000.0 }
+            ),
+            DirectOcclusionMode::Volumetric {
+                radius_m: MAX_EXTENT_OCCLUSION_RADIUS_METERS,
+                sample_count: DEFAULT_OCCLUSION_SAMPLE_COUNT,
+            }
+        );
+
+        for degenerate_or_invalid in [
+            ExtentDescriptor::MultiPoint { count: 0 },
+            ExtentDescriptor::LineSegment { length_m: 0.0 },
+            ExtentDescriptor::LineSegment { length_m: -1.0 },
+            ExtentDescriptor::StereoImage { width_m: f32::NAN },
+        ] {
+            assert_eq!(
+                direct_occlusion_for_extent(raycast, degenerate_or_invalid),
+                raycast.direct_occlusion,
+                "{degenerate_or_invalid:?}"
+            );
+        }
     }
 
     #[test]
