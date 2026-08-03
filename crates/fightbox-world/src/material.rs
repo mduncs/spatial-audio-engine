@@ -164,12 +164,19 @@ impl Default for MaterialTable {
                     transmission: [0.0, 0.0, 0.0],
                 },
             ),
+            // Brick/concrete transmission uses the ratified masonry triple:
+            // 32/45/55 dB transmission loss per band, expressed in Steam Audio
+            // 4.8.1's amplitude-EQ convention (coefficient = 10^(-TL/20)), the
+            // same NRC/OSHA-anchored values as the fixture masonry material.
+            // Zero here made compiled-city walls fully opaque and silently
+            // overrode fixture-authored transmission (the package material
+            // table, not fixture.json, governs live workbench geometry).
             (
                 "brick",
                 Material {
                     absorption: [0.03, 0.04, 0.07],
                     scattering: 0.15,
-                    transmission: [0.0, 0.0, 0.0],
+                    transmission: [0.0251, 0.005_62, 0.001_78],
                 },
             ),
             (
@@ -177,7 +184,7 @@ impl Default for MaterialTable {
                 Material {
                     absorption: [0.02, 0.03, 0.05],
                     scattering: 0.1,
-                    transmission: [0.0, 0.0, 0.0],
+                    transmission: [0.0251, 0.005_62, 0.001_78],
                 },
             ),
             (
