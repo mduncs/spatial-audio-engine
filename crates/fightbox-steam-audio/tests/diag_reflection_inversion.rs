@@ -10,10 +10,10 @@ use fightbox_runtime::backend::{
 };
 use fightbox_steam_audio::EnuVector3 as SteamEnuVector3;
 use fightbox_steam_audio::{
-    AcousticMaterial, AnomalyQuerySession, AudioConfig, BakedProbeBatch, DirectOcclusionMode,
-    MultiSourceDescriptor, PROBE_BATCH_METADATA_SCHEMA, ProbeBatchMetadata, ReflectionEffectConfig,
-    S3SimulationConfig, STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION, SceneMesh,
-    StageOutputGains, build_multi_source_session,
+    AcousticMaterial, AnomalyClass, AnomalyQuerySession, AudioConfig, BakedProbeBatch,
+    DirectOcclusionMode, MultiSourceDescriptor, PROBE_BATCH_METADATA_SCHEMA, ProbeBatchMetadata,
+    ReflectionEffectConfig, S3SimulationConfig, STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION,
+    SceneMesh, StageOutputGains, build_multi_source_session, classify_sample_at_distance,
 };
 use serde_json::Value;
 use std::env;
@@ -47,6 +47,18 @@ const ZERO_PATH_GEOMETRY_CASES: [(&str, EnuVector3, bool); 8] = [
     ("street-se", EnuVector3::new(303.0, 281.0, 1.5), false),
     ("street-ne", EnuVector3::new(304.0, 305.0, 1.5), false),
     ("source", EnuVector3::new(292.5, 292.5, 1.5), false),
+];
+const INVALID_COEFFICIENT_EXEMPLARS: [EnuVector3; 10] = [
+    EnuVector3::new(394.0, 6.0, 1.5),
+    EnuVector3::new(190.0, 10.0, 1.5),
+    EnuVector3::new(198.0, 10.0, 1.5),
+    EnuVector3::new(402.0, 10.0, 1.5),
+    EnuVector3::new(390.0, 14.0, 1.5),
+    EnuVector3::new(190.0, 18.0, 1.5),
+    EnuVector3::new(198.0, 18.0, 1.5),
+    EnuVector3::new(398.0, 18.0, 1.5),
+    EnuVector3::new(394.0, 26.0, 1.5),
+    EnuVector3::new(394.0, 102.0, 1.5),
 ];
 
 const DIRECT_ONLY: StageOutputGains = StageOutputGains {
@@ -243,6 +255,90 @@ fn megablock_zero_path_exemplars_are_inside_building_solids() {
             inside, expected_inside,
             "geometry classification for {label}"
         );
+    }
+}
+
+#[test]
+#[ignore = "requires FIGHTBOX_DIAG_PACKAGE/FIGHTBOX_DIAG_BAKE and linked Steam Audio"]
+fn megablock_invalid_path_coefficient_query_matches_real_render_chain() {
+    let package = required_path("FIGHTBOX_DIAG_PACKAGE");
+    let bake = required_path("FIGHTBOX_DIAG_BAKE");
+    let mesh = load_mesh(&package);
+    let baked = load_baked(&bake);
+    let config = S3SimulationConfig {
+        pathing_visibility_range_m: 10.0,
+        simulation_threads: 1,
+        ..S3SimulationConfig::default()
+    };
+    let audio = AudioConfig {
+        sample_rate_hz: SAMPLE_RATE,
+        frame_size: BLOCK_FRAMES,
+    };
+
+    for source_height_m in [1.5_f32, 63.0] {
+        let source = EnuVector3::new(SOURCE_EAST_M, SOURCE_NORTH_M, source_height_m);
+        let descriptor = MultiSourceDescriptor::at(source)
+            .with_reference_level(ReferenceLevel::SplAtOneMeter { db_spl: 105.0 });
+        let mut query = AnomalyQuerySession::new(&mesh, &baked, config, descriptor)
+            .expect("build anomaly query session");
+        let (mut simulation, mut render) =
+            build_multi_source_session(&mesh, &baked, audio, config, &[descriptor])
+                .expect("build retained render session");
+        let mut stage_control = render
+            .take_stage_output_gain_control()
+            .expect("take stage output control");
+        stage_control
+            .publish(PATH_ONLY)
+            .expect("select path-only output");
+
+        for (index, listener) in INVALID_COEFFICIENT_EXEMPLARS.into_iter().enumerate() {
+            let query_sample = query
+                .sample(SteamEnuVector3::new(
+                    listener.east_m,
+                    listener.north_m,
+                    listener.up_m,
+                ))
+                .expect("query exemplar");
+            let query_cell =
+                classify_sample_at_distance(query_sample, 105.0, distance(source, listener));
+            assert!(
+                !query_cell.flags.contains(AnomalyClass::InvalidCoefficient),
+                "unnormalized path EQ at {listener:?} is not a normalized coefficient failure"
+            );
+            simulation.update_inputs(&one_source_update_at(source, listener));
+            simulation.run_direct().expect("direct simulation");
+            simulation.run_pathing().expect("path simulation");
+            let render_diagnostics = simulation
+                .source_diagnostics(0)
+                .expect("source zero diagnostics");
+            let mut noise = Noise {
+                state: 0x9e37_79b9_7f4a_7c15,
+            };
+            let path_dbfs = (index == 0)
+                .then(|| measure_stage(&mut render, &mut stage_control, &mut noise, PATH_ONLY));
+            let above = EnuVector3::new(listener.east_m, listener.north_m, 1_000.0);
+            let overhead_hits = segment_hits(&mesh, listener, above).len();
+            println!(
+                "INVALID_COEFF_COMPARE source_z={source_height_m:.1} listener=[{:.1},{:.1},{:.1}] distance_m={:.6} query_direct={:.9e} query_eq={:?} query_sh_energy={:.9e} source_probe={} listener_probe={} source_inside={} listener_inside={} render_distance={:.9e} render_direct={:.9e} render_transmission={:?} render_air={:?} render_eq={:?} render_sh_energy={:.9e} render_path_dbfs={path_dbfs:?} overhead_hits={overhead_hits}",
+                listener.east_m,
+                listener.north_m,
+                listener.up_m,
+                distance(source, listener),
+                query_sample.direct_audibility,
+                query_sample.path_eq,
+                query_sample.path_sh_energy,
+                query_sample.source_probe_covered,
+                query_sample.listener_probe_covered,
+                query_sample.source_endpoint_inside_static_geometry,
+                query_sample.listener_endpoint_inside_static_geometry,
+                render_diagnostics.distance_attenuation,
+                render_diagnostics.occlusion,
+                render_diagnostics.transmission,
+                render_diagnostics.air_absorption,
+                render_diagnostics.path_eq,
+                render_diagnostics.path_sh_energy,
+            );
+        }
     }
 }
 

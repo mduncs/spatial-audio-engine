@@ -1354,8 +1354,6 @@ mod tests {
             direct_audibility: 1.0,
             path_eq: [0.1; 3],
             path_sh_energy: 0.1,
-            path_coefficient_min: 0.1,
-            path_coefficient_max: 0.1,
             source_probe_covered: true,
             listener_probe_covered: true,
             source_endpoint_inside_static_geometry: false,

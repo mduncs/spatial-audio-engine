@@ -82,7 +82,7 @@ impl AnomalyClass {
                 "NaN, infinity, or a denormal energy indicates computation trouble"
             }
             Self::InvalidCoefficient => {
-                "direct audibility and path coefficients are normalized to [0,1]"
+                "direct audibility is normalized to [0,1] and path EQ gains are non-negative"
             }
             Self::NeighborSpike => {
                 "one cell unlike every neighbour is unlikely to be a stable field"
@@ -104,7 +104,7 @@ impl AnomalyClass {
         match self {
             Self::InversionSignature => "free>=35dB, direct_loss>=18dB, path<=-20dB",
             Self::InvalidEnergy => "non-finite or 0<abs(x)<f32::MIN_POSITIVE",
-            Self::InvalidCoefficient => "outside [0,1]",
+            Self::InvalidCoefficient => "direct outside [0,1], or path_eq negative/non-finite",
             Self::NeighborSpike => "occlusion delta>=0.70 or path delta>=24dB",
             Self::ExcessiveDiscontinuity => "occlusion slope>0.26/m",
             Self::ZeroPathWithCoverage => {
@@ -145,10 +145,10 @@ pub struct AnomalyRawSample {
     pub position_enu: EnuVector3,
     /// Steam Audio audibility convention: one is clear and zero is blocked.
     pub direct_audibility: f32,
+    /// Unnormalized path-effect EQ gains. These are finite but are not bounded
+    /// to `[0, 1]`; overall path level is also carried by the SH coefficients.
     pub path_eq: [f32; 3],
     pub path_sh_energy: f32,
-    pub path_coefficient_min: f32,
-    pub path_coefficient_max: f32,
     pub source_probe_covered: bool,
     pub listener_probe_covered: bool,
     /// True when an upward ray from the source meets static scene geometry.
@@ -304,9 +304,7 @@ pub fn classify_sample_at_distance(
         || raw
             .path_eq
             .into_iter()
-            .any(|value| !in_unit_interval(value))
-        || !in_unit_interval(raw.path_coefficient_min)
-        || !in_unit_interval(raw.path_coefficient_max)
+            .any(|value| !value.is_finite() || value < 0.0)
     {
         flags.insert(AnomalyClass::InvalidCoefficient);
     }
@@ -546,14 +544,6 @@ impl AnomalyQuerySession {
                 direct_audibility: diagnostics.occlusion,
                 path_eq: diagnostics.path_eq,
                 path_sh_energy: diagnostics.path_sh_energy,
-                path_coefficient_min: diagnostics
-                    .path_eq
-                    .into_iter()
-                    .fold(f32::INFINITY, f32::min),
-                path_coefficient_max: diagnostics
-                    .path_eq
-                    .into_iter()
-                    .fold(f32::NEG_INFINITY, f32::max),
                 source_probe_covered: self.source_probe_covered,
                 listener_probe_covered: covered_by_spheres(&self.probe_spheres, listener),
                 source_endpoint_inside_static_geometry: self.source_endpoint_inside_static_geometry,
@@ -692,8 +682,6 @@ mod tests {
             direct_audibility: 0.8,
             path_eq: [0.5; 3],
             path_sh_energy: 0.1,
-            path_coefficient_min: 0.1,
-            path_coefficient_max: 0.5,
             source_probe_covered: true,
             listener_probe_covered: true,
             source_endpoint_inside_static_geometry: false,
@@ -748,10 +736,25 @@ mod tests {
                 .contains(AnomalyClass::InvalidEnergy)
         );
 
+        let mut unnormalized_path_eq = clean_raw();
+        unnormalized_path_eq.path_eq = [3.437_618_3, 3.363_226, 3.327_156_8];
+        assert!(
+            !classified(unnormalized_path_eq)
+                .flags
+                .contains(AnomalyClass::InvalidCoefficient)
+        );
+
         let mut invalid_coefficient = clean_raw();
-        invalid_coefficient.path_eq[1] = 1.01;
+        invalid_coefficient.direct_audibility = 1.01;
         assert!(
             classified(invalid_coefficient)
+                .flags
+                .contains(AnomalyClass::InvalidCoefficient)
+        );
+        let mut negative_path_eq = clean_raw();
+        negative_path_eq.path_eq[2] = -0.01;
+        assert!(
+            classified(negative_path_eq)
                 .flags
                 .contains(AnomalyClass::InvalidCoefficient)
         );

@@ -328,3 +328,42 @@ Same-configuration 190,260-dot rescans reduced
 `zero_path_with_coverage` from 2,695 to 0 at each source height. Direct/path
 samples and every other class count were unchanged; only the invalid endpoint
 interpretation was removed.
+
+## η. Unnormalized path-EQ classification correction
+
+The 2026-08-03 full-map street-source sweeps initially reported 183
+`invalid_coefficient` cells at 4 m, 41 at 8 m, and 16 at 16 m, while the same
+source at 63 m reported none. The apparent south-edge band came from the ten
+ranked `top_zones` in the manifest, not the complete raster. Decoding the 183
+flag bits showed additional compact regions at northings 70–82, 150–170,
+382–402, 470–484, and 510–570 m. The finding was therefore neither confined
+to the south boundary nor evidence of a boundary-wall or ground-ray defect.
+
+The checked value was Steam Audio's three-band path-effect `eqCoeffs`. At
+listener `[394,6,1.5]`, the query and retained render chain both returned
+`[2.3908284, 2.3908174, 2.3908045]`; at `[198,10,1.5]` they both returned
+`[3.111482, 3.005162, 2.9536152]`; and at `[198,18,1.5]` they both returned
+`[3.4376183, 3.363226, 3.3271568]`. These poses had valid direct audibility
+`0.0`, probe coverage at both endpoints, no containing static solid, and path
+SH energies of `6.1512683e-6`, `6.3085031e-6`, and `6.5185131e-6`. The first
+pose's real path-only render measured -68.883 dBFS. At 63 m, the same three
+listener poses produced path EQ `[0.5533226, 0.2153623, 0.117976636]`,
+`[0.82894814, 0.55796915, 0.37056217]`, and
+`[0.74931204, 0.43162212, 0.2681046]`.
+
+Path EQ is an unnormalized spectral gain used together with the path SH field,
+not a probability or an audibility fraction. Steam Audio exposes a separate
+`normalizeEQ` PathEffect option; the renderer deliberately uses the SDK output
+as-is with `normalizeEQ = false`. The proxy classifier had conflated these EQ
+gains with normalized direct audibility and imposed an unsupported `[0,1]`
+range. The source-height split reflects different baked path/probe routes
+landing on different valid EQ gains. The spacing split reflects finer sampling
+of compact spatial regions: 183/41 is 4.46, close to the fourfold cell-density
+change from 8 m to 4 m, with grid alignment accounting for the remainder.
+
+`invalid_coefficient` now tests `direct_audibility` against its genuine `[0,1]`
+SDK convention and rejects only negative or non-finite path EQ, not positive
+unnormalized gain. Path EQ also remains subject to finite-energy checks and
+continues unchanged into the render chain. The workbench classifier cache key
+advances to schema 3. This correction changes classification only; it does not
+change simulation, path rendering, smoothing, stage gain, or the limiter.

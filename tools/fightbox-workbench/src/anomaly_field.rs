@@ -24,7 +24,7 @@ use crate::fixture::load_baked;
 
 const FIELD_SCHEMA: &str = "fightbox.anomaly-field.v1";
 const TRAIL_SCHEMA: &str = "fightbox.anomaly-trail.v1";
-const CLASSIFIER_SCHEMA: u32 = 2;
+const CLASSIFIER_SCHEMA: u32 = 3;
 const ADAPTIVE_RADIUS_M: f32 = 3.0;
 const ADAPTIVE_SPACING_M: f32 = 2.0;
 const SOURCE_COVERED_BIT: u32 = 1 << 31;
@@ -389,8 +389,6 @@ impl FieldController {
             direct_audibility,
             path_eq,
             path_sh_energy,
-            path_coefficient_min: path_eq.into_iter().fold(f32::INFINITY, f32::min),
-            path_coefficient_max: path_eq.into_iter().fold(f32::NEG_INFINITY, f32::max),
             source_probe_covered: acoustic.source_probes == ProbeCoverage::Covered,
             listener_probe_covered: acoustic.listener_probes == ProbeCoverage::Covered,
             // Live poses come from the operator/trajectory rather than a synthetic
