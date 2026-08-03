@@ -18,7 +18,7 @@ use fightbox_runtime::{
     TimingPercentiles,
 };
 use fightbox_steam_audio::{
-    AcousticMaterial, AudioConfig, BakedProbeBatch, DirectOcclusionMode,
+    AcousticMaterial, AudioConfig, BakedProbeBatch, DirectOcclusionMode, EchoProfile,
     EnuVector3 as SteamEnuVector3, GovernorTransitionReason, MultiSourceDescriptor, PathBakeConfig,
     PathQualityLevel, ProbeVolume, QualityGovernorTelemetry, REVERB_RUNG_CAPABILITIES,
     ReflectionEffectConfig, ReflectionQualityLevel, ReflectionSettingAvailability,
@@ -57,6 +57,8 @@ struct FixtureSource {
     id: String,
     asset_id: String,
     reference_level: FixtureReferenceLevel,
+    #[serde(default)]
+    impulsive: bool,
     position_m: Option<[f64; 3]>,
     trajectory: Option<Trajectory>,
 }
@@ -188,6 +190,7 @@ struct PreparedSource {
     descriptor_hash: String,
     signal: Vec<f32>,
     profile: SourceProfile,
+    echo_profile: EchoProfile,
 }
 
 struct PreparedFixture {
@@ -1490,12 +1493,13 @@ fn build_graph(
         .fixture
         .sources
         .iter()
-        .map(|source| {
-            MultiSourceDescriptor::at(initial_position(source)).with_reference_level(
-                ReferenceLevel::SplAtOneMeter {
+        .enumerate()
+        .map(|(index, source)| {
+            MultiSourceDescriptor::at(initial_position(source))
+                .with_reference_level(ReferenceLevel::SplAtOneMeter {
                     db_spl: source.reference_level.db_spl as f32,
-                },
-            )
+                })
+                .with_echo_profile(prepared.sources[index].echo_profile)
         })
         .collect();
     let (runner, backend) = build_multi_source_session(
@@ -1633,6 +1637,20 @@ fn prepare_fixture(
             )));
         }
         let resolved = descriptor.resolve().map_err(CliError::new)?;
+        let onset_frames = descriptor.onset_frames().map_err(CliError::new)?;
+        let loop_frames = u32::try_from(resolved.frame_count)
+            .map_err(|_| CliError::new("asset loop is too long for echo onset scheduling"))?;
+        let echo_impulse_class = if source.asset_id == "squad-a10-impacts" {
+            fightbox_api::ImpulseClass::ArtilleryThunder
+        } else {
+            fightbox_api::ImpulseClass::None
+        };
+        let echo_profile = if source.impulsive {
+            EchoProfile::from_loop_frames(loop_frames, &onset_frames, echo_impulse_class)
+                .map_err(|error| CliError::new(format!("invalid echo profile: {error:?}")))?
+        } else {
+            EchoProfile::OFF
+        };
         let (signal, analysis) = resolved.regenerate_mono().map_err(CliError::new)?;
         sources.push(PreparedSource {
             id: source.id.clone(),
@@ -1657,6 +1675,7 @@ fn prepare_fixture(
                     .as_ref()
                     .map_or(0.0, |value| value.max_speed_mps as f32),
             },
+            echo_profile,
         });
     }
     let duration = fixture

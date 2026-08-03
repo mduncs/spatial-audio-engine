@@ -27,5 +27,11 @@
     "Timing model: at a 1,200 m slant range, a 1,021 m/s PGU-13 HEI projectile arrives in 1.175 s while the muzzle report takes 3.499 s at 343 m/s, so impacts lead the report at the strike point by 2.323 s. The impact stem begins at 38.000 s; the sky WAV's report begins at 39.959 s and the 125 m static-proxy path adds 0.364 s for a 40.323 s target arrival. Projectile speed source: https://jpeoaa.army.mil/Portals/94/JPEOAA/Documents/JPEOAAPortfolioBook_2017.pdf",
     "The fixture's 163 dB SplAtOneMeter is a conservative per-burst creative anchor borrowed from Shaw and Gee's measured GAU-8 outdoor maximum above 163 dB peak at 9.1 m: https://physics.byu.edu/download/publication/632. It is intentionally not back-solved, is not an impact-site measurement, and does not claim a continuous physical SPL or delivered-ear level; it follows the M2/DShK precedent of exposing an impulsive peak as a steady-source control.",
     "The separate impact stem models one clustered strike-line event. It makes no claim to individual projectile positions, exact projectile drag, dispersion, target material, explosive yield, or a physically measured impact SPL."
+  ],
+  "onsets_s": [
+    38.0,
+    38.18,
+    38.36,
+    38.54
   ]
 }

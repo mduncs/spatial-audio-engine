@@ -13,6 +13,8 @@ pub struct AssetDescriptor {
     pub channels: u16,
     pub sample_rate_hz: u32,
     pub duration_s: f64,
+    #[serde(default)]
+    pub onsets_s: Vec<f64>,
     pub target_rms_dbfs: f64,
 }
 
@@ -62,6 +64,29 @@ pub struct WavBlock {
 pub struct PreparedAsset {
     pub samples: Vec<f32>,
     pub analysis: AssetAnalysis,
+    pub onset_frames: Vec<u32>,
+}
+
+impl PreparedAsset {
+    /// Builds runtime echo state only when the fixture independently opts in.
+    /// An absent descriptor onset table remains the structural Off profile.
+    pub fn echo_profile(
+        &self,
+        impulsive: bool,
+        impulse_class: fightbox_api::ImpulseClass,
+    ) -> Result<fightbox_steam_audio::EchoProfile, String> {
+        if !impulsive {
+            return Ok(fightbox_steam_audio::EchoProfile::OFF);
+        }
+        let loop_frames = u32::try_from(self.samples.len())
+            .map_err(|_| "asset loop is too long for echo onset scheduling".to_owned())?;
+        fightbox_steam_audio::EchoProfile::from_loop_frames(
+            loop_frames,
+            &self.onset_frames,
+            impulse_class,
+        )
+        .map_err(|error| format!("invalid echo profile: {error:?}"))
+    }
 }
 
 pub fn load_asset(asset_id: &str) -> Result<PreparedAsset, String> {
@@ -83,6 +108,32 @@ pub fn load_asset(asset_id: &str) -> Result<PreparedAsset, String> {
     }
     let descriptor_elapsed = descriptor_started.elapsed();
     let frames = (descriptor.duration_s * f64::from(descriptor.sample_rate_hz)).round() as usize;
+    let mut onset_frames = Vec::with_capacity(descriptor.onsets_s.len());
+    let mut previous_onset = None;
+    for (index, onset) in descriptor.onsets_s.iter().copied().enumerate() {
+        if !onset.is_finite()
+            || onset < 0.0
+            || onset >= descriptor.duration_s
+            || previous_onset.is_some_and(|previous| onset <= previous)
+        {
+            return Err(format!(
+                "asset descriptor {asset_id} onsets_s[{index}] is not strictly ascending in [0, duration_s)"
+            ));
+        }
+        let frame = (onset * f64::from(descriptor.sample_rate_hz)).round() as usize;
+        if frame >= frames
+            || frame > u32::MAX as usize
+            || onset_frames
+                .last()
+                .is_some_and(|previous| frame as u32 <= *previous)
+        {
+            return Err(format!(
+                "asset descriptor {asset_id} onsets_s[{index}] does not map to a distinct loop frame"
+            ));
+        }
+        onset_frames.push(frame as u32);
+        previous_onset = Some(onset);
+    }
     let spec = WavSpec {
         sample_rate_hz: descriptor.sample_rate_hz,
         channels: 1,
@@ -179,7 +230,11 @@ pub fn load_asset(asset_id: &str) -> Result<PreparedAsset, String> {
             analysis_elapsed.as_millis()
         ),
     }
-    Ok(PreparedAsset { samples, analysis })
+    Ok(PreparedAsset {
+        samples,
+        analysis,
+        onset_frames,
+    })
 }
 
 enum AssetLoadTiming {

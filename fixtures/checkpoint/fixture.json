@@ -70,6 +70,7 @@
     },
     {
       "id": "m2-checkpoint-gun",
+      "impulsive": true,
       "asset_id": "squad-m2-burst-loop",
       "reference_level": {
         "mode": "SplAtOneMeter",
@@ -87,6 +88,7 @@
     },
     {
       "id": "dshk-return-fire",
+      "impulsive": true,
       "asset_id": "squad-dshk-burst-loop",
       "reference_level": {
         "mode": "SplAtOneMeter",
@@ -121,6 +123,7 @@
     },
     {
       "id": "a10-strike-line",
+      "impulsive": true,
       "asset_id": "squad-a10-impacts",
       "reference_level": {
         "mode": "SplAtOneMeter",

@@ -71,6 +71,7 @@ class TimelineAsset:
     asset_id: str
     duration_s: float
     layers: tuple[TimedLayer, ...]
+    emit_layer_onsets: bool
     preparation_notes: tuple[str, ...]
 
 
@@ -190,6 +191,7 @@ TIMELINE_ASSETS = (
                 "distant GAU-8 muzzle report",
             ),
         ),
+        emit_layer_onsets=False,
         preparation_notes=(
             "This is an 84.000 s fixed timeline. The sky WAV advances its baked observer events by 0.364 s to offset the engine's 125 m static-proxy path at the strike point: wide flyover source onset 28.136 s (28.500 s target arrival), GAU-8 source onset 39.959 s (40.323 s target arrival), close-pass source peak 43.636 s (44.000 s target arrival), recorded source egress through 77.009 s, then 6.991 s tail silence.",
             "The Flyby and FlybyClose recordings are baked ground-observer perspectives that already encode the aircraft's real-speed Doppler sweep, level trajectory, and pass character. The fixture therefore keeps this source static: applying a fast trajectory would double-apply motion.",
@@ -229,6 +231,7 @@ TIMELINE_ASSETS = (
                 "impact round-robin 4/4",
             ),
         ),
+        emit_layer_onsets=True,
         preparation_notes=(
             "This companion stem is exactly 84.000 s, matching squad-a10-pass sample-for-sample. Four Close impact variants enter once each in fixed 01, 02, 03, 04 order at 180 ms spacing, with no adjacent repeat; their tails overlap into one strike-line cluster.",
             "Only the closest/driest impact pool is used. Mid and Far recordings are excluded because the engine supplies distance, occlusion, and reflections; using baked distance perspectives would double-apply those cues.",
@@ -475,6 +478,7 @@ def composed_descriptor(
     wav_path: Path,
     samples: array,
     levels: dict[str, float],
+    onsets_s: list[float],
 ) -> dict[str, object]:
     non_claims = [
         "This descriptor makes no delivered-ear-SPL claim without output calibration.",
@@ -482,7 +486,7 @@ def composed_descriptor(
         "The prepared WAV is a local derivative of Squad v8.1 game assets; this descriptor grants no right to redistribute audio bytes.",
         *asset.preparation_notes,
     ]
-    return {
+    output = {
         "schema_version": "fightbox.asset-descriptor.v1",
         "asset_id": asset.asset_id,
         "kind": "wav",
@@ -504,6 +508,9 @@ def composed_descriptor(
         },
         "non_claims": non_claims,
     }
+    if onsets_s:
+        output["onsets_s"] = onsets_s
+    return output
 
 
 def prepare_timeline(
@@ -557,7 +564,14 @@ def prepare_timeline(
     samples, levels = normalize_composition(composition)
     wav_path = WAV_ROOT / f"{asset.asset_id}.wav"
     write_float_wav(wav_path, samples)
-    output_descriptor = composed_descriptor(asset, wav_path, samples, levels)
+    onsets_s = (
+        [round(layer.start_s, 9) for layer in asset.layers]
+        if asset.emit_layer_onsets
+        else []
+    )
+    output_descriptor = composed_descriptor(
+        asset, wav_path, samples, levels, onsets_s
+    )
     descriptor_path = DESCRIPTOR_ROOT / f"{asset.asset_id}.json"
     descriptor_path.write_text(
         json.dumps(output_descriptor, indent=2, ensure_ascii=False) + "\n",
@@ -575,6 +589,7 @@ def prepare_timeline(
         "composition": {
             "timeline_duration_s": asset.duration_s,
             "layers": layer_report,
+            "onsets_s": onsets_s,
             "raw_rms_dbfs": round(levels["raw_rms_dbfs"], 6),
             "raw_peak_dbfs": round(levels["raw_peak_dbfs"], 6),
             "applied_gain_db": output_descriptor["calibration"][
@@ -617,7 +632,9 @@ def prepare_composed(
 
     composition = array("f")
     burst_report = []
+    onsets_s = []
     for burst in asset.bursts:
+        onsets_s.append(round(len(composition) / SAMPLE_RATE_HZ, 9))
         for round_index, variant in enumerate(burst.round_variants):
             filename = asset.round_filename.format(variant=variant)
             samples = load(filename)
@@ -654,7 +671,9 @@ def prepare_composed(
 
     wav_path = WAV_ROOT / f"{asset.asset_id}.wav"
     write_float_wav(wav_path, samples)
-    output_descriptor = composed_descriptor(asset, wav_path, samples, levels)
+    output_descriptor = composed_descriptor(
+        asset, wav_path, samples, levels, onsets_s
+    )
     descriptor_path = DESCRIPTOR_ROOT / f"{asset.asset_id}.json"
     descriptor_path.write_text(
         json.dumps(output_descriptor, indent=2, ensure_ascii=False) + "\n",
@@ -673,6 +692,7 @@ def prepare_composed(
         "composition": {
             "bursts": burst_report,
             "crossfade_ms": asset.crossfade_ms,
+            "onsets_s": onsets_s,
             "duration_s": output_descriptor["duration_s"],
             "raw_rms_dbfs": round(levels["raw_rms_dbfs"], 6),
             "raw_peak_dbfs": round(levels["raw_peak_dbfs"], 6),

@@ -105,6 +105,12 @@ impl PreparedMultiSourceWorld {
         self.render.take_stage_output_gain_writer()
     }
 
+    pub(crate) fn take_echo_output_gain_writer(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotWriter<f32>> {
+        self.render.take_echo_output_gain_writer()
+    }
+
     pub(crate) fn diagnostics(&self) -> crate::WorldGenerationDiagnostics {
         self.simulation.diagnostics()
     }
@@ -297,6 +303,12 @@ impl MultiSourceRenderGraph {
         &mut self,
     ) -> Option<fightbox_runtime::SnapshotWriter<StageOutputGains>> {
         self.active.take_stage_output_gain_writer()
+    }
+
+    pub(crate) fn take_echo_output_gain_writer(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotWriter<f32>> {
+        self.active.take_echo_output_gain_writer()
     }
 
     fn flush_retirement(&mut self) {

@@ -13,8 +13,8 @@ so a stem hash is stable.
 - `validate.py` — a dependency-free validator. It enforces the schema's structural rules plus
   the cross-field rules JSON Schema cannot express: the generator carries *exactly* its kind's
   block (no mismatched kind/generator), frequencies are finite, positive, unique, and below
-  Nyquist for the declared sample rate, and the mandatory no-delivered-ear-SPL non-claim is
-  present.
+  Nyquist for the declared sample rate, optional onset timestamps are finite, strictly ascending,
+  and inside the asset duration, and the mandatory no-delivered-ear-SPL non-claim is present.
 - `s0-approach-sine.json`, `s0-calibrated-pink.json`, `s3-calibrated-pink.json`,
   `s3-multitone.json` — the current descriptor files. The last file's asset ID is
   `s3-multitone-spectral`.
@@ -57,6 +57,14 @@ into a second caller-supplied loudness gain. In the manifest, each source record
 chain — scene anchor, decoded `AssetAnalysis`, declared `ReferenceLevel`, derived `SourceDrive`,
 the generator normalization separately when applicable, and a monitor gain / output transfer that
 is explicit and distinct.
+
+## Impulsive loop onsets
+
+A composed loop may add a top-level `"onsets_s"` array. Its values are seconds from loop start,
+must be strictly ascending, and must satisfy `0 <= onset < duration_s`. The composition tool emits
+these timestamps from its deterministic placement cursor; it does not inspect or rewrite the WAV.
+When the field is absent, the asset schedules no echo taps. A fixture source must independently set
+`"impulsive": true` before an onset table is eligible for the echo sidecar.
 
 ## What this directory does NOT do
 

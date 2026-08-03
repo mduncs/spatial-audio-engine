@@ -97,6 +97,11 @@
           "pattern": "^[a-z0-9][a-z0-9-]*$"
         },
         "reference_level": {"$ref": "#/$defs/reference_level"},
+        "impulsive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit source eligibility for onset-scheduled echo taps; absent defaults false."
+        },
         "position_m": {"$ref": "#/$defs/vec3"},
         "trajectory": {"$ref": "#/$defs/trajectory"},
         "directivity": {

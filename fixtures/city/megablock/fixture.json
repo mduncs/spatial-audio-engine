@@ -84,6 +84,7 @@
     {
       "id": "dshk-street-gun",
       "default_enabled": false,
+      "impulsive": true,
       "asset_id": "squad-dshk-burst-loop",
       "reference_level": {
         "mode": "SplAtOneMeter",

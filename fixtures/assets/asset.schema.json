@@ -69,6 +69,11 @@
     "channels": {"enum": [1, 2]},
     "sample_rate_hz": {"type": "integer", "minimum": 1},
     "duration_s": {"type": "number", "exclusiveMinimum": 0},
+    "onsets_s": {
+      "description": "Impulsive onset timestamps baked into a deterministic loop, in seconds from loop start. Absence means the asset schedules no echo taps.",
+      "type": "array",
+      "items": {"type": "number", "minimum": 0}
+    },
     "target_rms_dbfs": {
       "description": "Requested delivered RMS in dBFS. Must be a finite JSON number strictly below 0 dBFS.",
       "type": "number",

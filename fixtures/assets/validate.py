@@ -53,7 +53,7 @@ def _check_common(record: dict) -> None:
     if missing:
         raise Invalid(f"missing required fields: {', '.join(missing)}")
 
-    unknown = sorted(set(record) - set(required))
+    unknown = sorted(set(record) - set(required) - {"onsets_s"})
     if unknown:
         raise Invalid(f"unknown fields: {', '.join(unknown)}")
 
@@ -75,6 +75,22 @@ def _check_common(record: dict) -> None:
         raise Invalid("duration_s must be a number")
     if not math.isfinite(duration) or duration <= 0.0:
         raise Invalid("duration_s must be finite and positive")
+
+    onsets = record.get("onsets_s")
+    if onsets is not None:
+        if not isinstance(onsets, list):
+            raise Invalid("onsets_s must be an array")
+        previous = None
+        for index, onset in enumerate(onsets):
+            if not isinstance(onset, (int, float)) or isinstance(onset, bool):
+                raise Invalid(f"onsets_s[{index}] must be a JSON number")
+            if not math.isfinite(onset) or onset < 0.0 or onset >= duration:
+                raise Invalid(
+                    f"onsets_s[{index}] must be finite and in [0, duration_s)"
+                )
+            if previous is not None and onset <= previous:
+                raise Invalid("onsets_s must be strictly ascending")
+            previous = onset
 
     target = record["target_rms_dbfs"]
     if not isinstance(target, (int, float)) or isinstance(target, bool):

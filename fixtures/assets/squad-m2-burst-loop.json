@@ -25,5 +25,11 @@
     "The fixed offline M2 composition uses close third-person Default/Initial round slices and tails only; Mid, Far, and Echo_Close layers are excluded because the engine supplies distance and reflection effects.",
     "The fixture's 153 dB SplAtOneMeter steady-source control is anchored to the 153 dB M2 HB .50-cal impulse-noise value in U.S. Army ATP 4-25.12, Unit Field Sanitation Teams, 30 April 2014, chapter 10: https://rdl.train.army.mil/catalog-ws/view/100.ATSC/6FDDE4EE-4362-464B-AEA0-1EC3A3D90D88-1399551821430/atp4_25x12.pdf",
     "Peak-to-reference rationale: the cited per-shot operator peak is used directly as a conservative steady-source scene anchor; it is not a claim that the loop has a continuous physical SPL or that its duty-cycle energy was measured."
+  ],
+  "onsets_s": [
+    0.0,
+    6.546,
+    14.604145833,
+    20.115625
   ]
 }

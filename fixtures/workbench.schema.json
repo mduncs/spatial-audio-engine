@@ -191,6 +191,11 @@
         "default_enabled": {
           "type": "boolean"
         },
+        "impulsive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicitly opts this source into onset-scheduled echo taps when its asset descriptor carries onsets_s. Defaults false in the Rust loader."
+        },
         "directivity": {
           "$ref": "#/$defs/directivity"
         },

@@ -112,6 +112,8 @@ pub struct FixtureSource {
     #[serde(default = "default_enabled")]
     pub default_enabled: bool,
     #[serde(default)]
+    pub impulsive: bool,
+    #[serde(default)]
     pub directivity: FixtureDirectivity,
     #[serde(default, deserialize_with = "deserialize_extent")]
     pub extent: ExtentDescriptor,
@@ -985,6 +987,8 @@ mod tests {
         );
         assert_eq!(fixture.sources[4].id, "dshk-street-gun");
         assert!(!fixture.sources[4].default_enabled);
+        assert!(fixture.sources[4].impulsive);
+        assert!(fixture.sources[..4].iter().all(|source| !source.impulsive));
         assert_eq!(fixture.sources[4].asset_id, "squad-dshk-burst-loop");
         assert_eq!(fixture.sources[4].reference_level.db_spl, 154.0);
         assert_eq!(
@@ -1083,6 +1087,17 @@ mod tests {
             assert_eq!(source.asset_id, asset_id);
             assert_eq!(source.reference_level.db_spl, spl);
         }
+        assert!(fixture.sources[3].impulsive);
+        assert!(fixture.sources[4].impulsive);
+        assert!(fixture.sources[6].impulsive);
+        assert!(!fixture.sources[5].impulsive);
+        assert!(
+            fixture
+                .sources
+                .iter()
+                .enumerate()
+                .all(|(index, source)| [3, 4, 6].contains(&index) == source.impulsive)
+        );
         assert_eq!(
             fixture.sources[0].extent,
             ExtentDescriptor::LineSegment { length_m: 8.0 }

@@ -14,6 +14,7 @@
 #[cfg(any(feature = "linked-sdk", test))]
 mod backend_snapshot;
 mod ballistic_event;
+mod echo_sidecar;
 mod elevated_probes;
 mod governor;
 mod impulse_shaping;
@@ -30,6 +31,10 @@ mod world_swap;
 pub use ballistic_event::{
     BallisticEventError, BallisticEventLevels, BallisticEventSource, BallisticShot,
     BallisticShotPlan, EVENT_PROGRAM_SECONDS, plan_ballistic_shot, synthesize_crack_stem,
+};
+pub use echo_sidecar::{
+    CORNER_LOSS_DB_1_KHZ, CORNER_LOSS_DB_4_KHZ, CORNER_LOSS_DB_250_HZ, EchoProfile,
+    EchoProfileError, MAX_ECHO_ONSETS, MAX_ECHO_TAPS_GLOBAL, MAX_ECHO_TAPS_PER_SOURCE,
 };
 pub use elevated_probes::ElevatedProbeLayer;
 pub use governor::{
@@ -939,6 +944,7 @@ pub struct MultiSourceDescriptor {
     directivity: fightbox_api::Directivity,
     extent: fightbox_api::ExtentDescriptor,
     impulse_class: fightbox_api::ImpulseClass,
+    echo_profile: EchoProfile,
     initially_active: bool,
     priority_class: SourcePriorityClass,
     reflection_send_enabled: bool,
@@ -955,6 +961,7 @@ impl MultiSourceDescriptor {
             directivity: fightbox_api::Directivity::OMNIDIRECTIONAL,
             extent: fightbox_api::ExtentDescriptor::Point,
             impulse_class: fightbox_api::ImpulseClass::None,
+            echo_profile: EchoProfile::OFF,
             initially_active: true,
             priority_class: SourcePriorityClass::Steady,
             reflection_send_enabled: true,
@@ -1005,6 +1012,17 @@ impl MultiSourceDescriptor {
     #[must_use]
     pub const fn with_impulse_class(mut self, impulse_class: fightbox_api::ImpulseClass) -> Self {
         self.impulse_class = impulse_class;
+        self
+    }
+
+    /// Attaches an explicit composed-loop onset schedule for the echo sidecar.
+    ///
+    /// `EchoProfile::OFF` is the legacy/default structural bypass. Eligibility
+    /// remains independent of `ImpulseClass`; the profile carries that class
+    /// only so an enabled tap can key the unchanged shaper by total path.
+    #[must_use]
+    pub const fn with_echo_profile(mut self, echo_profile: EchoProfile) -> Self {
+        self.echo_profile = echo_profile;
         self
     }
 
@@ -1094,6 +1112,25 @@ impl StageOutputGains {
 pub struct StageOutputGainControl {
     writer: fightbox_runtime::SnapshotWriter<StageOutputGains>,
 }
+
+/// Producer handle for the generation-local echo bus gain.
+pub struct EchoOutputGainControl {
+    writer: fightbox_runtime::SnapshotWriter<f32>,
+}
+
+impl EchoOutputGainControl {
+    /// Publishes a finite, non-negative echo gain for adoption at a block boundary.
+    pub fn publish(&mut self, gain: f32) -> Result<(), InvalidEchoOutputGain> {
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(InvalidEchoOutputGain);
+        }
+        self.writer.publish(gain);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidEchoOutputGain;
 
 impl StageOutputGainControl {
     /// Publishes all three stage gains as one immutable snapshot.
@@ -1191,6 +1228,7 @@ pub struct PreparedSteamAudioWorld {
     #[cfg(feature = "linked-sdk")]
     inner: linked::PreparedMultiSourceWorld,
     stage_output_gain_control: Option<StageOutputGainControl>,
+    echo_output_gain_control: Option<EchoOutputGainControl>,
     #[cfg(not(feature = "linked-sdk"))]
     _private: (),
 }
@@ -1270,6 +1308,8 @@ pub struct PreparedWorldSwapReceipt {
     /// Stage-gain snapshots are generation-local. This producer controls the
     /// newly adopted graph; the preceding generation's producer may be dropped.
     pub stage_output_gain_control: StageOutputGainControl,
+    /// Dedicated diagnostic/send gain for the newly adopted echo bus.
+    pub echo_output_gain_control: EchoOutputGainControl,
 }
 
 /// Simulation half of a retained multi-source Steam Audio session.
@@ -1330,9 +1370,15 @@ impl SteamAudioSimulationRunner {
             let writer = inner
                 .take_stage_output_gain_writer()
                 .expect("a freshly prepared graph owns its stage-gain producer");
+            let echo_writer = inner
+                .take_echo_output_gain_writer()
+                .expect("a freshly prepared graph owns its echo-gain producer");
             return Ok(PreparedSteamAudioWorld {
                 inner,
                 stage_output_gain_control: Some(StageOutputGainControl { writer }),
+                echo_output_gain_control: Some(EchoOutputGainControl {
+                    writer: echo_writer,
+                }),
             });
         }
         #[cfg(not(feature = "linked-sdk"))]
@@ -1360,6 +1406,10 @@ impl SteamAudioSimulationRunner {
                     .stage_output_gain_control
                     .take()
                     .expect("prepared world retained its stage-gain producer"),
+                echo_output_gain_control: prepared
+                    .echo_output_gain_control
+                    .take()
+                    .expect("prepared world retained its echo-gain producer"),
             });
         }
         #[cfg(not(feature = "linked-sdk"))]
@@ -1412,6 +1462,7 @@ pub struct SteamAudioRenderGraph {
     #[cfg(feature = "linked-sdk")]
     inner: linked::MultiSourceRenderGraph,
     stage_output_gain_control: Option<StageOutputGainControl>,
+    echo_output_gain_control: Option<EchoOutputGainControl>,
     #[cfg(not(feature = "linked-sdk"))]
     _private: (),
 }
@@ -1423,6 +1474,11 @@ impl SteamAudioRenderGraph {
     /// unity, and taking the handle does not itself change any gain.
     pub fn take_stage_output_gain_control(&mut self) -> Option<StageOutputGainControl> {
         self.stage_output_gain_control.take()
+    }
+
+    /// Takes the unique producer for this graph's dedicated echo output gain.
+    pub fn take_echo_output_gain_control(&mut self) -> Option<EchoOutputGainControl> {
+        self.echo_output_gain_control.take()
     }
 }
 
@@ -2109,12 +2165,18 @@ pub fn build_multi_source_session_for_tier(
         let stage_output_gain_writer = render
             .take_stage_output_gain_writer()
             .expect("new render graph owns its stage-gain producer");
+        let echo_output_gain_writer = render
+            .take_echo_output_gain_writer()
+            .expect("new render graph owns its echo-gain producer");
         Ok((
             SteamAudioSimulationRunner { inner: simulation },
             SteamAudioRenderGraph {
                 inner: render,
                 stage_output_gain_control: Some(StageOutputGainControl {
                     writer: stage_output_gain_writer,
+                }),
+                echo_output_gain_control: Some(EchoOutputGainControl {
+                    writer: echo_output_gain_writer,
                 }),
             },
         ))

@@ -102,6 +102,8 @@ pub struct AssetDescriptor {
     pub channels: u16,
     pub sample_rate_hz: u32,
     pub duration_s: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub onsets_s: Vec<f64>,
     pub target_rms_dbfs: f64,
     #[serde(default)]
     pub expected_reference_rms_dbfs: Option<f64>,
@@ -149,6 +151,16 @@ impl AssetDescriptor {
         }
         if !self.duration_s.is_finite() || self.duration_s <= 0.0 {
             return Err("duration_s must be finite and positive".into());
+        }
+        let mut previous_onset = None;
+        for &onset in &self.onsets_s {
+            if !onset.is_finite() || onset < 0.0 || onset >= self.duration_s {
+                return Err("onsets_s values must be finite and in [0, duration_s)".into());
+            }
+            if previous_onset.is_some_and(|previous| onset <= previous) {
+                return Err("onsets_s must be strictly ascending".into());
+            }
+            previous_onset = Some(onset);
         }
         if !self.target_rms_dbfs.is_finite() || self.target_rms_dbfs >= 0.0 {
             return Err("target_rms_dbfs must be finite and strictly below 0 dBFS".into());
@@ -246,6 +258,24 @@ impl AssetDescriptor {
             descriptor: self.clone(),
             frame_count,
         })
+    }
+
+    /// Converts descriptor-authored loop onsets to exact sample-frame indices.
+    pub fn onset_frames(&self) -> Result<Vec<u32>, String> {
+        let frame_count = (self.duration_s * self.sample_rate_hz as f64).round() as u64;
+        let mut frames = Vec::with_capacity(self.onsets_s.len());
+        for &onset in &self.onsets_s {
+            let frame = (onset * self.sample_rate_hz as f64).round() as u64;
+            if frame >= frame_count || frame > u64::from(u32::MAX) {
+                return Err("onsets_s value does not map inside the loop frame range".into());
+            }
+            let frame = frame as u32;
+            if frames.last().is_some_and(|previous| frame <= *previous) {
+                return Err("onsets_s values must map to distinct ascending frames".into());
+            }
+            frames.push(frame);
+        }
+        Ok(frames)
     }
 }
 
@@ -582,6 +612,39 @@ fn asset_analysis_message(error: &fightbox_evidence::AssetAnalysisError) -> &'st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composed_loop_onset_tables_parse_to_exact_frames_and_validate_order() {
+        let descriptor = AssetDescriptor::parse(include_str!(
+            "../../../fixtures/assets/squad-m2-burst-loop.json"
+        ))
+        .unwrap();
+        assert_eq!(descriptor.onsets_s, [0.0, 6.546, 14.604145833, 20.115625]);
+        assert_eq!(
+            descriptor.onset_frames().unwrap(),
+            [0, 314_208, 700_999, 965_550]
+        );
+
+        let original = include_str!("../../../fixtures/assets/squad-m2-burst-loop.json");
+        let descending = original.replace("0.0,\n    6.546", "6.546,\n    0.0");
+        assert!(
+            AssetDescriptor::parse(&descending)
+                .unwrap_err()
+                .contains("strictly ascending")
+        );
+        let outside = original.replace("20.115625", "26.400833333");
+        assert!(
+            AssetDescriptor::parse(&outside)
+                .unwrap_err()
+                .contains("[0, duration_s)")
+        );
+
+        let no_table =
+            AssetDescriptor::parse(include_str!("../../../fixtures/assets/squad-a10-pass.json"))
+                .unwrap();
+        assert!(no_table.onsets_s.is_empty());
+        assert!(no_table.onset_frames().unwrap().is_empty());
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const PINK: &str = include_str!("../../../fixtures/assets/s0-calibrated-pink.json");

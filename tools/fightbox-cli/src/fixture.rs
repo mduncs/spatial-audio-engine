@@ -214,6 +214,8 @@ pub struct Source {
     pub reference_level: ReferenceLevel,
     pub asset_id: String,
     #[serde(default)]
+    pub impulsive: bool,
+    #[serde(default)]
     pub directivity: Directivity,
     #[serde(default, with = "extent_json")]
     pub extent: ExtentDescriptor,
@@ -705,6 +707,35 @@ mod tests {
     const FIXTURE_SCHEMA: &str = include_str!("../../../fixtures/fixture.schema.json");
     const S6A_SCHEMA: &str = include_str!("../../../fixtures/s6a.schema.json");
     const MEGABLOCK: &str = include_str!("../../../fixtures/city/megablock/fixture.json");
+    const CHECKPOINT: &str = include_str!("../../../fixtures/checkpoint/fixture.json");
+
+    #[test]
+    fn impulsive_flag_defaults_false_and_scene_opt_ins_are_exact() {
+        assert!(!test_fixtures::s0().source.impulsive);
+
+        let megablock: serde_json::Value = serde_json::from_str(MEGABLOCK).unwrap();
+        let megablock_impulsive = megablock["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|source| source["impulsive"] == true)
+            .map(|source| source["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(megablock_impulsive, ["dshk-street-gun"]);
+
+        let checkpoint: serde_json::Value = serde_json::from_str(CHECKPOINT).unwrap();
+        let checkpoint_impulsive = checkpoint["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|source| source["impulsive"] == true)
+            .map(|source| source["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checkpoint_impulsive,
+            ["m2-checkpoint-gun", "dshk-return-fire", "a10-strike-line"]
+        );
+    }
 
     fn schema_accepts_directivity(value: Option<&serde_json::Value>) -> bool {
         let schema: serde_json::Value =

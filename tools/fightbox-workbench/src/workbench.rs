@@ -778,6 +778,12 @@ impl Workbench {
                 .get(&source.asset_id)
                 .ok_or_else(|| format!("asset cache is missing {}", source.asset_id))?
                 .clone();
+            let echo_impulse_class = if source.asset_id == "squad-a10-impacts" {
+                fightbox_api::ImpulseClass::ArtilleryThunder
+            } else {
+                fightbox_api::ImpulseClass::None
+            };
+            let echo_profile = asset.echo_profile(source.impulsive, echo_impulse_class)?;
             let pose = Pose {
                 position,
                 forward: EnuVector3::new(0.0, 1.0, 0.0),
@@ -802,7 +808,8 @@ impl Workbench {
                 MultiSourceDescriptor::at(profile.pose.position)
                     .with_reference_level(profile.reference_level)
                     .with_directivity(profile.directivity)
-                    .with_extent(profile.extent),
+                    .with_extent(profile.extent)
+                    .with_echo_profile(echo_profile),
             );
             prepared_sources.push((profile, asset.samples));
             source_motion[index] = SourceMotion {

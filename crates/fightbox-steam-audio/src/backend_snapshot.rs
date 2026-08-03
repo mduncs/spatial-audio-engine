@@ -1,5 +1,6 @@
 //! Backend-private, fixed-capacity Steam Audio publication layout.
 
+use crate::echo_sidecar::EchoSourcePlan;
 use crate::width_render::{DECLARED_LATENCY_SAMPLES, WIDTH_RENDERER_REVISION};
 use crate::{BackendError, EnuVector3, SteamVector3, enu_to_steam};
 use fightbox_api::{EnuVector3 as ApiEnuVector3, ExtentDescriptor};
@@ -65,6 +66,7 @@ pub(crate) struct SteamSourcePropagation {
     pub(crate) path_sh: [f32; MAX_PATH_SH_COEFFS],
     pub(crate) configured_pathing_order: u8,
     pub(crate) reflections: SteamReflectionParams,
+    pub(crate) echo: EchoSourcePlan,
 }
 
 impl Default for SteamSourcePropagation {
@@ -87,6 +89,7 @@ impl Default for SteamSourcePropagation {
             path_sh: [0.0; MAX_PATH_SH_COEFFS],
             configured_pathing_order: 0,
             reflections: SteamReflectionParams::default(),
+            echo: EchoSourcePlan::default(),
         }
     }
 }

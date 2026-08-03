@@ -12,6 +12,11 @@ use crate::backend_snapshot::{
     SteamDirectParams, SteamPropagationSnapshot, SteamReflectionParams, SteamSourcePropagation,
     SteamWidthState, api_enu_to_steam, fixed_path_sh, path_coefficient_count,
 };
+use crate::echo_sidecar::{
+    CORNER_LOSS_DB_1_KHZ, CORNER_LOSS_DB_4_KHZ, CORNER_LOSS_DB_250_HZ, EchoDelayRing,
+    EchoLoopScheduler, EchoPathKind, EchoProfile, EchoSourcePlan, EchoTapPlan,
+    MAX_ECHO_TAPS_PER_SOURCE, delivered_tap_counts,
+};
 use crate::governor::{
     GovernorRenderSnapshot, GovernorSimulationPass, QualityGovernor, QualityGovernorTelemetry,
     ReverbStrategy, SourceQualityLevel,
@@ -250,6 +255,7 @@ pub(crate) struct MultiSourceSimulation {
     source_directivities: [Directivity; MAX_ACTIVE_SOURCES],
     source_occlusion_modes: [DirectOcclusionMode; MAX_ACTIVE_SOURCES],
     source_extents: [ExtentDescriptor; MAX_ACTIVE_SOURCES],
+    source_echo_profiles: [EchoProfile; MAX_ACTIVE_SOURCES],
     frame: SimulationFrame,
     valid_update: bool,
     snapshot: SteamPropagationSnapshot,
@@ -548,6 +554,15 @@ impl MultiSourceSimulation {
                         return Err(SimulationError::KernelFailure);
                     }
                     source_snapshot.direct = direct;
+                    source_snapshot.echo = analytic_megablock_echo_plan(
+                        self.world.context(),
+                        self.source_echo_profiles[index],
+                        self.frame.sources[index].position,
+                        self.frame.listener.position,
+                        direct.occlusion,
+                        self.audio.sample_rate_hz,
+                        self.snapshot.sequence,
+                    );
                     self.governor
                         .observe_source_gain(index, predicted_direct_gain(direct));
                 }
@@ -739,6 +754,235 @@ fn predicted_direct_gain(direct: SteamDirectParams) -> f32 {
         .max(0.0)
 }
 
+const ANALYTIC_MEGABLOCK_PITCH_M: f32 = 95.0;
+const ANALYTIC_MEGABLOCK_BLOCK_MIN_M: f32 = 15.0;
+const ANALYTIC_MEGABLOCK_FACADE_INSET_M: f32 = 3.75;
+const ANALYTIC_MEGABLOCK_BLOCK_SIZE_M: f32 = 80.0;
+const ANALYTIC_MEGABLOCK_BLOCKS: usize = 6;
+const MIN_SPECULAR_EXCESS_SECONDS: f32 = 0.3;
+const MAX_SPECULAR_EXCESS_SECONDS: f32 = 1.2;
+const MASONRY_ABSORPTION: [f32; 3] = [0.03, 0.05, 0.07];
+const MASONRY_SCATTERING: f32 = 0.1;
+
+/// Audible-v1 oracle for the deterministic 6x6 synth grid. Production tables
+/// remain an offline-baker concern; this fixed grid enumerator runs only in the
+/// control-side direct pass and publishes a complete plan for onset adoption.
+fn analytic_megablock_echo_plan(
+    context: ffi::IPLContext,
+    profile: EchoProfile,
+    source_steam: SteamVector3,
+    listener_steam: SteamVector3,
+    direct_occlusion: f32,
+    sample_rate_hz: i32,
+    generation: u64,
+) -> EchoSourcePlan {
+    if !profile.is_enabled() {
+        return EchoSourcePlan::default();
+    }
+    let source = steam_vector_to_api(source_steam);
+    let listener = steam_vector_to_api(listener_steam);
+    let direct_distance = api_distance(source, listener);
+    if !direct_distance.is_finite() {
+        return EchoSourcePlan::default();
+    }
+
+    let mut plan = EchoSourcePlan {
+        generation,
+        ..EchoSourcePlan::default()
+    };
+    for axis in 0..2 {
+        for block in 0..ANALYTIC_MEGABLOCK_BLOCKS {
+            let block_min =
+                ANALYTIC_MEGABLOCK_BLOCK_MIN_M + block as f32 * ANALYTIC_MEGABLOCK_PITCH_M;
+            let planes = [
+                block_min + ANALYTIC_MEGABLOCK_FACADE_INSET_M,
+                block_min + ANALYTIC_MEGABLOCK_BLOCK_SIZE_M - ANALYTIC_MEGABLOCK_FACADE_INSET_M,
+            ];
+            for (side, plane) in planes.into_iter().enumerate() {
+                let source_axis = if axis == 0 {
+                    source.east_m
+                } else {
+                    source.north_m
+                };
+                let listener_axis = if axis == 0 {
+                    listener.east_m
+                } else {
+                    listener.north_m
+                };
+                // Both endpoints must occupy the same half-space. Opposite
+                // sides would be transmission through the authored facade,
+                // not an image-source return.
+                if (source_axis - plane) * (listener_axis - plane) <= 0.0 {
+                    continue;
+                }
+                let mut image = source;
+                if axis == 0 {
+                    image.east_m = 2.0 * plane - source.east_m;
+                } else {
+                    image.north_m = 2.0 * plane - source.north_m;
+                }
+                let total_distance = api_distance(image, listener);
+                let excess_seconds =
+                    (total_distance - direct_distance) / SPEED_OF_SOUND_METERS_PER_SECOND;
+                if !(MIN_SPECULAR_EXCESS_SECONDS..=MAX_SPECULAR_EXCESS_SECONDS)
+                    .contains(&excess_seconds)
+                    || total_distance > crate::motion_smoothing::MAX_PROPAGATION_DISTANCE_METERS
+                {
+                    continue;
+                }
+                let denominator = if axis == 0 {
+                    image.east_m - listener.east_m
+                } else {
+                    image.north_m - listener.north_m
+                };
+                if denominator.abs() <= 1.0e-6 {
+                    continue;
+                }
+                let t = (plane - listener_axis) / denominator;
+                if !(0.0..=1.0).contains(&t) {
+                    continue;
+                }
+                let bounce = ApiEnuVector3::new(
+                    listener.east_m + (image.east_m - listener.east_m) * t,
+                    listener.north_m + (image.north_m - listener.north_m) * t,
+                    listener.up_m + (image.up_m - listener.up_m) * t,
+                );
+                let (distance_gain, air) = path_attenuation(context, total_distance);
+                let scatter_pressure = (1.0 - MASONRY_SCATTERING).sqrt();
+                let material = MASONRY_ABSORPTION
+                    .map(|absorption| (1.0 - absorption).sqrt() * scatter_pressure);
+                let bands = std::array::from_fn(|index| air[index] * material[index]);
+                let score = distance_gain * bands.into_iter().sum::<f32>() / 3.0;
+                insert_specular_candidate(
+                    &mut plan,
+                    EchoTapPlan {
+                        valid: true,
+                        kind: EchoPathKind::Specular,
+                        stable_path_id: 1 + (axis * 32 + block * 2 + side) as u32,
+                        total_path_distance_m: total_distance,
+                        delay_samples: total_distance / SPEED_OF_SOUND_METERS_PER_SECOND
+                            * sample_rate_hz as f32,
+                        arrival_position: api_enu_to_steam(bounce),
+                        distance_gain,
+                        band_gain: bands,
+                        score,
+                    },
+                );
+            }
+        }
+    }
+
+    // Steam's direct occlusion convention is 1 = clear and 0 = blocked.
+    if direct_occlusion < 0.5 {
+        let corners = [
+            ApiEnuVector3::new(source.east_m, listener.north_m, source.up_m),
+            ApiEnuVector3::new(listener.east_m, source.north_m, source.up_m),
+        ];
+        let (edge_index, edge, total_distance) = corners
+            .into_iter()
+            .enumerate()
+            .map(|(index, edge)| {
+                let distance = api_distance(source, edge) + api_distance(edge, listener);
+                (index, edge, distance)
+            })
+            .min_by(|left, right| {
+                left.2
+                    .total_cmp(&right.2)
+                    .then_with(|| left.0.cmp(&right.0))
+            })
+            .expect("two analytic corner candidates");
+        if total_distance.is_finite()
+            && total_distance > 0.0
+            && total_distance <= crate::motion_smoothing::MAX_PROPAGATION_DISTANCE_METERS
+        {
+            let (distance_gain, air) = path_attenuation(context, total_distance);
+            let losses_db = [
+                CORNER_LOSS_DB_250_HZ,
+                CORNER_LOSS_DB_1_KHZ,
+                CORNER_LOSS_DB_4_KHZ,
+            ];
+            let bands =
+                std::array::from_fn(|index| air[index] * 10.0_f32.powf(losses_db[index] / 20.0));
+            let score = distance_gain * bands.into_iter().sum::<f32>() / 3.0;
+            let specular_count = usize::from(plan.tap_count).min(3);
+            for index in (1..=specular_count).rev() {
+                plan.taps[index] = plan.taps[index - 1];
+            }
+            plan.taps[0] = EchoTapPlan {
+                valid: true,
+                kind: EchoPathKind::Diffraction,
+                stable_path_id: 0x8000_0000 | edge_index as u32,
+                total_path_distance_m: total_distance,
+                delay_samples: total_distance / SPEED_OF_SOUND_METERS_PER_SECOND
+                    * sample_rate_hz as f32,
+                arrival_position: api_enu_to_steam(edge),
+                distance_gain,
+                band_gain: bands,
+                score,
+            };
+            plan.tap_count = (specular_count + 1) as u8;
+        }
+    }
+    plan
+}
+
+fn insert_specular_candidate(plan: &mut EchoSourcePlan, candidate: EchoTapPlan) {
+    let mut insert_at = usize::from(plan.tap_count).min(3);
+    for index in 0..usize::from(plan.tap_count).min(3) {
+        let current = plan.taps[index];
+        let candidate_precedes = candidate
+            .score
+            .total_cmp(&current.score)
+            .reverse()
+            .then_with(|| {
+                candidate
+                    .total_path_distance_m
+                    .total_cmp(&current.total_path_distance_m)
+            })
+            .then_with(|| candidate.stable_path_id.cmp(&current.stable_path_id))
+            .is_lt();
+        if candidate_precedes {
+            insert_at = index;
+            break;
+        }
+    }
+    if insert_at >= 3 {
+        return;
+    }
+    let old_count = usize::from(plan.tap_count).min(3);
+    for index in (insert_at + 1..=old_count.min(2)).rev() {
+        plan.taps[index] = plan.taps[index - 1];
+    }
+    plan.taps[insert_at] = candidate;
+    plan.tap_count = (old_count + 1).min(3) as u8;
+}
+
+fn path_attenuation(context: ffi::IPLContext, distance_m: f32) -> (f32, [f32; 3]) {
+    let source = ffi::IPLVector3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    let listener = ffi::IPLVector3 {
+        x: distance_m,
+        y: 0.0,
+        z: 0.0,
+    };
+    let mut distance_model = default_distance_model();
+    let mut air_model = default_air_absorption_model();
+    (
+        ffi::distance_attenuation_calculate(context, source, listener, &mut distance_model),
+        ffi::air_absorption_calculate(context, source, listener, &mut air_model),
+    )
+}
+
+fn api_distance(left: ApiEnuVector3, right: ApiEnuVector3) -> f32 {
+    let east = left.east_m - right.east_m;
+    let north = left.north_m - right.north_m;
+    let up = left.up_m - right.up_m;
+    (east * east + north * north + up * up).sqrt()
+}
+
 fn coordinate_space(pose: SteamPose) -> Option<ffi::IPLCoordinateSpace3> {
     let forward = steam_vector_to_api(pose.forward);
     let up = steam_vector_to_api(pose.up);
@@ -910,6 +1154,35 @@ struct SourceRenderState {
     reactivation_epoch_samples: usize,
     quality_gains: [f32; 3],
     width: Option<LineWidthRenderState>,
+    echo: Option<EchoRenderState>,
+}
+
+struct EchoRenderState {
+    profile: EchoProfile,
+    scheduler: EchoLoopScheduler,
+    delay: EchoDelayRing,
+    tap_direct_effects: [usize; MAX_ECHO_TAPS_PER_SOURCE],
+    tap_binaural_effects: [usize; MAX_ECHO_TAPS_PER_SOURCE],
+    tap_shapers: [Option<ImpulseShaper>; MAX_ECHO_TAPS_PER_SOURCE],
+    input: OwnedAudioBuffer,
+    filtered: OwnedAudioBuffer,
+    stereo: OwnedAudioBuffer,
+    tap_work: Vec<f32>,
+    active_plan: EchoSourcePlan,
+    has_triggered: bool,
+}
+
+impl EchoRenderState {
+    fn reset(&mut self) {
+        self.scheduler.reset();
+        self.delay.reset();
+        self.tap_work.fill(0.0);
+        self.active_plan = EchoSourcePlan::default();
+        self.has_triggered = false;
+        for shaper in self.tap_shapers.iter_mut().flatten() {
+            shaper.reset();
+        }
+    }
 }
 
 struct LineWidthRenderState {
@@ -937,8 +1210,12 @@ pub(crate) struct MultiSourceRenderGraph {
     publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
     stage_output_gain_writer: Option<fightbox_runtime::SnapshotWriter<StageOutputGains>>,
     stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
+    echo_output_gain_writer: Option<fightbox_runtime::SnapshotWriter<f32>>,
+    echo_output_gain: fightbox_runtime::SnapshotReader<f32>,
     governor_quality: fightbox_runtime::SnapshotReader<GovernorRenderSnapshot>,
     applied_governor_quality: GovernorRenderSnapshot,
+    echo_profiles: [EchoProfile; MAX_ACTIVE_SOURCES],
+    has_echo_sources: bool,
     reflection_output_gain: f32,
     propagation_block_retention: f32,
     #[cfg(test)]
@@ -963,6 +1240,12 @@ impl MultiSourceRenderGraph {
         &mut self,
     ) -> Option<fightbox_runtime::SnapshotWriter<StageOutputGains>> {
         self.stage_output_gain_writer.take()
+    }
+
+    pub(crate) fn take_echo_output_gain_writer(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotWriter<f32>> {
+        self.echo_output_gain_writer.take()
     }
 
     pub(crate) fn render_block(
@@ -991,12 +1274,50 @@ impl MultiSourceRenderGraph {
             return Err(BackendRenderError::InactiveGraph);
         }
         let stage_output_gains = self.stage_output_gains.read();
+        let echo_output_gain = self.echo_output_gain.read();
         let governor_quality = self.governor_quality.read();
         #[cfg(test)]
         {
             self.governor_snapshot_reads = self.governor_snapshot_reads.saturating_add(1);
         }
         self.applied_governor_quality = governor_quality;
+        let delivered_echo_taps = if self.has_echo_sources {
+            let mut rendered = [false; MAX_ACTIVE_SOURCES];
+            for source in block.sources {
+                rendered[source.source_index] = true;
+            }
+            let active =
+                std::array::from_fn(|index| rendered[index] && snapshot.sources[index].active);
+            let plans = std::array::from_fn(|index| {
+                let Some(echo) = self
+                    .sources
+                    .get(index)
+                    .and_then(|source| source.echo.as_ref())
+                else {
+                    return EchoSourcePlan::default();
+                };
+                let mut scheduler = echo.scheduler;
+                let triggers_this_block =
+                    (0..frames).any(|_| scheduler.advance_sample(echo.profile));
+                if triggers_this_block {
+                    snapshot.sources[index].echo
+                } else if echo.has_triggered {
+                    echo.active_plan
+                } else {
+                    EchoSourcePlan::default()
+                }
+            });
+            delivered_tap_counts(
+                &self.echo_profiles,
+                &plans,
+                &active,
+                &governor_quality.sources,
+                self.world.source_count,
+                governor_quality.reflections.level,
+            )
+        } else {
+            [0; MAX_ACTIVE_SOURCES]
+        };
         for (index, state) in self.sources.iter_mut().enumerate() {
             if !snapshot.sources[index].active {
                 state.propagation_smoother.reset();
@@ -1012,6 +1333,9 @@ impl MultiSourceRenderGraph {
                 }
                 state.last_propagation_observation = None;
                 state.reactivation_epoch_samples = 0;
+                if let Some(echo) = &mut state.echo {
+                    echo.reset();
+                }
             }
         }
 
@@ -1031,6 +1355,8 @@ impl MultiSourceRenderGraph {
                 block.output_right,
                 stage_output_gains,
                 governor_quality,
+                delivered_echo_taps[source_block.source_index],
+                echo_output_gain,
             );
         }
         self.render_reflection_mix(
@@ -1093,6 +1419,8 @@ impl MultiSourceRenderGraph {
         output_right: &mut [f32],
         stage_output_gains: StageOutputGains,
         governor_quality: GovernorRenderSnapshot,
+        delivered_echo_taps: u8,
+        echo_output_gain: f32,
     ) {
         let state = &mut self.sources[source_block.source_index];
         let source_quality = governor_quality.sources[source_block.source_index];
@@ -1122,6 +1450,24 @@ impl MultiSourceRenderGraph {
                 self.propagation_block_retention,
             )
             .endpoint();
+        if let Some(echo) = &mut state.echo {
+            render_echo_sidecar(
+                echo,
+                source_block.input_mono,
+                propagation.echo,
+                delivered_echo_taps,
+                listener,
+                smoothed.listener_position,
+                self.hrtf,
+                stage_output_gains.reflections
+                    * governor_quality.reflection_output_gain
+                    * echo_output_gain,
+                output_left,
+                output_right,
+                &mut self.mono_work,
+                &mut self.stereo_work,
+            );
+        }
         // Time of flight is anchored by the simulated endpoints rather than by
         // the 80 ms acoustic smoother above. The smoother exists to keep gain
         // and occlusion from zippering; running the raw delay through it too
@@ -1571,6 +1917,14 @@ impl Drop for MultiSourceRenderGraph {
                 let mut minus = handle(width.minus_binaural_effect);
                 ffi::binaural_effect_release(&mut minus);
             }
+            if let Some(echo) = &mut source.echo {
+                for tap_index in 0..MAX_ECHO_TAPS_PER_SOURCE {
+                    let mut direct = handle(echo.tap_direct_effects[tap_index]);
+                    ffi::direct_effect_release(&mut direct);
+                    let mut binaural = handle(echo.tap_binaural_effects[tap_index]);
+                    ffi::binaural_effect_release(&mut binaural);
+                }
+            }
             let mut path = handle(source.path_effect);
             ffi::path_effect_release(&mut path);
             let mut reflections = handle(source.reflection_effect);
@@ -1634,6 +1988,7 @@ pub(crate) fn build_multi_source_generation(
     let mut source_directivities = [Directivity::OMNIDIRECTIONAL; MAX_ACTIVE_SOURCES];
     let mut source_occlusion_modes = [config.direct_occlusion; MAX_ACTIVE_SOURCES];
     let mut source_extents = [ExtentDescriptor::Point; MAX_ACTIVE_SOURCES];
+    let mut source_echo_profiles = [EchoProfile::OFF; MAX_ACTIVE_SOURCES];
     let mut active = [false; MAX_ACTIVE_SOURCES];
     let listener = SteamPose::from_api(default_api_pose(ApiEnuVector3::default()))
         .expect("canonical listener pose is valid");
@@ -1645,6 +2000,7 @@ pub(crate) fn build_multi_source_generation(
         source_occlusion_modes[index] =
             crate::direct_occlusion_for_extent(config, descriptor.extent);
         source_extents[index] = descriptor.extent;
+        source_echo_profiles[index] = descriptor.echo_profile;
         active[index] = descriptor.initially_active;
         initial.sources[index].active = descriptor.initially_active;
         initial.sources[index].source_position = source_poses[index].position;
@@ -1657,6 +2013,16 @@ pub(crate) fn build_multi_source_generation(
     let (writer, reader) = SnapshotPublication::new(initial);
     let (stage_output_gain_writer, stage_output_gains) =
         SnapshotPublication::new(StageOutputGains::UNITY);
+    let initial_echo_output_gain = if descriptors
+        .iter()
+        .any(|descriptor| descriptor.echo_profile.is_enabled())
+    {
+        1.0
+    } else {
+        0.0
+    };
+    let (echo_output_gain_writer, echo_output_gain) =
+        SnapshotPublication::new(initial_echo_output_gain);
     let (mut governor, governor_quality) =
         QualityGovernor::new(audio, config, descriptors, quality_tier, memory);
     for (index, descriptor) in descriptors.iter().enumerate() {
@@ -1669,6 +2035,8 @@ pub(crate) fn build_multi_source_generation(
         reader,
         stage_output_gain_writer,
         stage_output_gains,
+        echo_output_gain_writer,
+        echo_output_gain,
         governor_quality,
         descriptors,
     )?;
@@ -1679,6 +2047,7 @@ pub(crate) fn build_multi_source_generation(
         source_directivities,
         source_occlusion_modes,
         source_extents,
+        source_echo_profiles,
         frame: SimulationFrame {
             listener,
             listener_linear_velocity_mps: SteamVector3::default(),
@@ -1790,6 +2159,10 @@ fn session_memory_telemetry(
         .iter()
         .filter(|descriptor| matches!(descriptor.extent, ExtentDescriptor::LineSegment { .. }))
         .count() as u64;
+    let echo_sources = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.echo_profile.is_enabled())
+        .count() as u64;
     let channels = u64::try_from(ambisonics_channel_count(config.reflection_order)?)
         .map_err(|_| BackendError::InvalidInput("Ambisonic channel count must be positive"))?;
     let ir_samples = u64::try_from(reflection_ir_size(
@@ -1805,7 +2178,8 @@ fn session_memory_telemetry(
     let snapshot_ring_payload_bytes = 4_u64.saturating_mul(
         size_of::<SteamPropagationSnapshot>()
             .saturating_add(size_of::<GovernorRenderSnapshot>())
-            .saturating_add(size_of::<StageOutputGains>()) as u64,
+            .saturating_add(size_of::<StageOutputGains>())
+            .saturating_add(size_of::<f32>()) as u64,
     );
     let reflection_ir_payload_capacity_bytes =
         if reflection_effect_uses_ir(config.reflection_effect.effect_type) {
@@ -1822,14 +2196,18 @@ fn session_memory_telemetry(
     let audio_buffer_payload_bytes = sources
         .saturating_mul(6_u64.saturating_add(channels))
         .saturating_add(wide_sources.saturating_mul(6))
+        .saturating_add(echo_sources.saturating_mul(4))
         .saturating_add(channels.saturating_add(2))
         .saturating_mul(frames)
         .saturating_mul(float_bytes);
     let width_scratch_channels = if wide_sources > 0 { 4 } else { 0 };
-    let render_scratch_bytes = (3_u64 + width_scratch_channels)
-        .saturating_mul(frames)
-        .saturating_mul(float_bytes);
+    let render_scratch_bytes = (3_u64
+        + width_scratch_channels
+        + echo_sources.saturating_mul(MAX_ECHO_TAPS_PER_SOURCE as u64))
+    .saturating_mul(frames)
+    .saturating_mul(float_bytes);
     let propagation_delay_line_bytes = sources
+        .saturating_add(echo_sources)
         .saturating_mul(
             maximum_propagation_delay_samples(audio.sample_rate_hz).saturating_add(4) as u64,
         )
@@ -2033,6 +2411,8 @@ fn create_render_graph(
     mut publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
     stage_output_gain_writer: fightbox_runtime::SnapshotWriter<StageOutputGains>,
     stage_output_gains: fightbox_runtime::SnapshotReader<StageOutputGains>,
+    echo_output_gain_writer: fightbox_runtime::SnapshotWriter<f32>,
+    echo_output_gain: fightbox_runtime::SnapshotReader<f32>,
     mut governor_quality: fightbox_runtime::SnapshotReader<GovernorRenderSnapshot>,
     descriptors: &[crate::MultiSourceDescriptor],
 ) -> Result<MultiSourceRenderGraph, BackendError> {
@@ -2109,6 +2489,7 @@ fn create_render_graph(
             descriptors[index].extent,
             descriptors[index].impulse_class,
             descriptors[index].reflection_send_enabled,
+            descriptors[index].echo_profile,
         )?;
         if !initial_snapshot.sources[index].active {
             // A pre-declared inactive event can trigger before the callback has
@@ -2139,6 +2520,14 @@ fn create_render_graph(
     let has_line_width = descriptors
         .iter()
         .any(|descriptor| matches!(descriptor.extent, ExtentDescriptor::LineSegment { .. }));
+    let echo_profiles = std::array::from_fn(|index| {
+        descriptors
+            .get(index)
+            .map_or(EchoProfile::OFF, |descriptor| descriptor.echo_profile)
+    });
+    let has_echo_sources = descriptors
+        .iter()
+        .any(|descriptor| descriptor.echo_profile.is_enabled());
     Ok(MultiSourceRenderGraph {
         world,
         config,
@@ -2170,8 +2559,12 @@ fn create_render_graph(
         publication,
         stage_output_gain_writer: Some(stage_output_gain_writer),
         stage_output_gains,
+        echo_output_gain_writer: Some(echo_output_gain_writer),
+        echo_output_gain,
         governor_quality,
         applied_governor_quality,
+        echo_profiles,
+        has_echo_sources,
         reflection_output_gain: applied_governor_quality.reflection_output_gain,
         propagation_block_retention: (-(audio.frame_size as f32 / audio.sample_rate_hz as f32)
             / PROPAGATION_SLEW_TIME_SECONDS)
@@ -2206,6 +2599,157 @@ fn source_quality_targets(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_echo_sidecar(
+    echo: &mut EchoRenderState,
+    dry_mono: &[f32],
+    published_plan: EchoSourcePlan,
+    delivered_taps: u8,
+    listener: SteamPose,
+    listener_position: SteamVector3,
+    hrtf: usize,
+    output_gain: f32,
+    output_left: &mut [f32],
+    output_right: &mut [f32],
+    mono_work: &mut [f32],
+    stereo_work: &mut [f32],
+) {
+    let frames = dry_mono.len();
+    debug_assert_eq!(echo.tap_work.len(), frames * MAX_ECHO_TAPS_PER_SOURCE);
+    echo.tap_work.fill(0.0);
+    for (frame, sample) in dry_mono.iter().copied().enumerate() {
+        echo.delay.push(sample);
+        if echo.scheduler.advance_sample(echo.profile) {
+            echo.active_plan = published_plan;
+            echo.has_triggered = published_plan.tap_count != 0;
+            for shaper in echo.tap_shapers.iter_mut().flatten() {
+                shaper.reset();
+            }
+        }
+        if !echo.has_triggered {
+            continue;
+        }
+        let count = usize::from(delivered_taps)
+            .min(usize::from(echo.active_plan.tap_count))
+            .min(MAX_ECHO_TAPS_PER_SOURCE);
+        for tap_index in 0..count {
+            let tap = echo.active_plan.taps[tap_index];
+            if tap.valid {
+                echo.tap_work[tap_index * frames + frame] = echo.delay.read(tap.delay_samples);
+            }
+        }
+    }
+
+    let count = usize::from(delivered_taps)
+        .min(usize::from(echo.active_plan.tap_count))
+        .min(MAX_ECHO_TAPS_PER_SOURCE);
+    for tap_index in 0..count {
+        let tap = echo.active_plan.taps[tap_index];
+        if !tap.valid {
+            continue;
+        }
+        mono_work.copy_from_slice(&echo.tap_work[tap_index * frames..(tap_index + 1) * frames]);
+        if let Some(shaper) = &mut echo.tap_shapers[tap_index] {
+            // The immutable key is total traveled path distance, never one leg
+            // or the direct source-listener distance.
+            let parameters = shaper.parameters_at_distance(tap.total_path_distance_m);
+            for sample in mono_work.iter_mut() {
+                *sample = shaper.process_sample(*sample, parameters);
+            }
+        }
+        echo.input.write_mono(mono_work);
+        let mut input = echo.input.raw();
+        let mut filtered = echo.filtered.raw();
+        let mut direct_params = ffi::IPLDirectEffectParams {
+            flags: ffi::IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION
+                | ffi::IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION,
+            transmissionType: ffi::IPL_TRANSMISSIONTYPE_FREQDEPENDENT,
+            distanceAttenuation: tap.distance_gain,
+            airAbsorption: tap.band_gain,
+            directivity: 1.0,
+            occlusion: 1.0,
+            transmission: [1.0; 3],
+        };
+        ffi::direct_effect_apply(
+            handle(echo.tap_direct_effects[tap_index]),
+            &mut direct_params,
+            &mut input,
+            &mut filtered,
+        );
+        let mut stereo = echo.stereo.raw();
+        let mut binaural_params = ffi::IPLBinauralEffectParams {
+            direction: relative_direction_steam(tap.arrival_position, listener_position, listener),
+            interpolation: ffi::IPL_HRTFINTERPOLATION_BILINEAR,
+            spatialBlend: 1.0,
+            hrtf: handle(hrtf),
+            peakDelays: core::ptr::null_mut(),
+        };
+        ffi::binaural_effect_apply(
+            handle(echo.tap_binaural_effects[tap_index]),
+            &mut binaural_params,
+            &mut filtered,
+            &mut stereo,
+        );
+        echo.stereo.read_interleaved(stereo_work);
+        accumulate_stereo_ramped(
+            stereo_work,
+            output_left,
+            output_right,
+            output_gain,
+            GainRamp::new(1.0, 1.0, frames),
+        );
+    }
+}
+
+fn create_echo_render_state(
+    context: ffi::IPLContext,
+    audio_settings: &mut ffi::IPLAudioSettings,
+    hrtf: ffi::IPLHRTF,
+    maximum_delay_samples: usize,
+    profile: EchoProfile,
+) -> Result<EchoRenderState, BackendError> {
+    let mut tap_direct_effects = [0; MAX_ECHO_TAPS_PER_SOURCE];
+    let mut tap_binaural_effects = [0; MAX_ECHO_TAPS_PER_SOURCE];
+    let mut direct_settings = ffi::IPLDirectEffectSettings { numChannels: 1 };
+    let mut binaural_settings = ffi::IPLBinauralEffectSettings { hrtf };
+    for tap_index in 0..MAX_ECHO_TAPS_PER_SOURCE {
+        let mut direct = core::ptr::null_mut();
+        sdk_status(
+            "iplDirectEffectCreate(echo tap)",
+            ffi::direct_effect_create(context, audio_settings, &mut direct_settings, &mut direct),
+        )?;
+        tap_direct_effects[tap_index] = direct as usize;
+        let mut binaural = core::ptr::null_mut();
+        sdk_status(
+            "iplBinauralEffectCreate(echo tap)",
+            ffi::binaural_effect_create(
+                context,
+                audio_settings,
+                &mut binaural_settings,
+                &mut binaural,
+            ),
+        )?;
+        tap_binaural_effects[tap_index] = binaural as usize;
+    }
+    let frames = audio_settings.frameSize as usize;
+    Ok(EchoRenderState {
+        profile,
+        scheduler: EchoLoopScheduler::default(),
+        delay: EchoDelayRing::new(maximum_delay_samples),
+        tap_direct_effects,
+        tap_binaural_effects,
+        tap_shapers: std::array::from_fn(|_| {
+            ImpulseShaper::new(profile.impulse_class(), audio_settings.samplingRate)
+        }),
+        input: OwnedAudioBuffer::allocate(context, 1, audio_settings.frameSize)?,
+        filtered: OwnedAudioBuffer::allocate(context, 1, audio_settings.frameSize)?,
+        stereo: OwnedAudioBuffer::allocate(context, 2, audio_settings.frameSize)?,
+        tap_work: vec![0.0; frames * MAX_ECHO_TAPS_PER_SOURCE],
+        active_plan: EchoSourcePlan::default(),
+        has_triggered: false,
+    })
+}
+
 fn create_source_render_state(
     context: ffi::IPLContext,
     audio_settings: &mut ffi::IPLAudioSettings,
@@ -2218,6 +2762,7 @@ fn create_source_render_state(
     extent: ExtentDescriptor,
     impulse_class: fightbox_api::ImpulseClass,
     reflection_send_enabled: bool,
+    echo_profile: EchoProfile,
 ) -> Result<SourceRenderState, BackendError> {
     let line_length_m = match extent {
         ExtentDescriptor::LineSegment { length_m } => Some(length_m),
@@ -2304,6 +2849,17 @@ fn create_source_render_state(
             })
         })
         .transpose()?;
+    let echo = if echo_profile.is_enabled() {
+        Some(create_echo_render_state(
+            context,
+            audio_settings,
+            hrtf,
+            maximum_delay_samples,
+            echo_profile,
+        )?)
+    } else {
+        None
+    };
     Ok(SourceRenderState {
         direct_effect: direct as usize,
         binaural_effect: binaural as usize,
@@ -2337,6 +2893,7 @@ fn create_source_render_state(
         reactivation_epoch_samples: 0,
         quality_gains: [1.0; 3],
         width,
+        echo,
     })
 }
 
@@ -3422,6 +3979,16 @@ mod tests {
         extent: Option<ExtentDescriptor>,
         impulse_class: Option<fightbox_api::ImpulseClass>,
     ) -> (Vec<f32>, SteamDirectParams) {
+        directivity_capture_with_profile(directivity, source_forward, extent, impulse_class, None)
+    }
+
+    fn directivity_capture_with_profile(
+        directivity: Option<Directivity>,
+        source_forward: ApiEnuVector3,
+        extent: Option<ExtentDescriptor>,
+        impulse_class: Option<fightbox_api::ImpulseClass>,
+        echo_profile: Option<EchoProfile>,
+    ) -> (Vec<f32>, SteamDirectParams) {
         let mesh = SceneMesh::controlled_s3_corner();
         let audio = AudioConfig {
             sample_rate_hz: 48_000,
@@ -3438,6 +4005,9 @@ mod tests {
         }
         if let Some(impulse_class) = impulse_class {
             descriptor = descriptor.with_impulse_class(impulse_class);
+        }
+        if let Some(echo_profile) = echo_profile {
+            descriptor = descriptor.with_echo_profile(echo_profile);
         }
         let descriptors = [descriptor];
         let (mut simulation, mut render) = build_multi_source_generation(
@@ -3718,15 +4288,39 @@ mod tests {
             Some(ExtentDescriptor::Point),
             Some(fightbox_api::ImpulseClass::None),
         );
+        let (explicit_echo_off, echo_off_direct) = directivity_capture_with_profile(
+            Some(Directivity::OMNIDIRECTIONAL),
+            toward,
+            Some(ExtentDescriptor::Point),
+            Some(fightbox_api::ImpulseClass::None),
+            Some(EchoProfile::OFF),
+        );
+        let enabled_profile =
+            EchoProfile::from_loop_frames(24 * 128, &[0], fightbox_api::ImpulseClass::None)
+                .unwrap();
+        let (enabled_direct, enabled_direct_params) = directivity_capture_with_profile(
+            Some(Directivity::OMNIDIRECTIONAL),
+            toward,
+            Some(ExtentDescriptor::Point),
+            Some(fightbox_api::ImpulseClass::None),
+            Some(enabled_profile),
+        );
         assert_eq!(sample_bits(&explicit_omni), sample_bits(&legacy_default));
         assert_eq!(sample_bits(&explicit_point), sample_bits(&legacy_default));
         assert_eq!(
             sample_bits(&explicit_impulse_none),
             sample_bits(&legacy_default)
         );
+        assert_eq!(
+            sample_bits(&explicit_echo_off),
+            sample_bits(&legacy_default)
+        );
+        assert_eq!(sample_bits(&enabled_direct), sample_bits(&legacy_default));
         assert_eq!(explicit_direct, legacy_direct);
         assert_eq!(point_direct, legacy_direct);
         assert_eq!(impulse_none_direct, legacy_direct);
+        assert_eq!(echo_off_direct, legacy_direct);
+        assert_eq!(enabled_direct_params, legacy_direct);
 
         // Captured before directivity was plumbed through `source_inputs`: this
         // pins the same deterministic scene, tone, direct effect, and HRTF PCM.
@@ -3741,6 +4335,77 @@ mod tests {
             "omni_prechange_sha256={hash} energy={:.12e} samples={}",
             energy(&explicit_omni),
             explicit_omni.len()
+        );
+    }
+
+    #[test]
+    fn enabled_sidecar_renders_a_physical_late_branch_without_changing_block_length() {
+        let mesh = SceneMesh::controlled_s3_corner();
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            frame_size: 128,
+        };
+        let profile = EchoProfile::from_loop_frames(
+            audio.frame_size as u32,
+            &[0],
+            fightbox_api::ImpulseClass::None,
+        )
+        .unwrap();
+        let descriptor = crate::MultiSourceDescriptor::at(ApiEnuVector3::new(10.0, 0.0, 1.5))
+            .with_echo_profile(profile)
+            .with_reflection_send(false);
+        let (mut simulation, mut render) = build_multi_source_generation(
+            &mesh,
+            None,
+            audio,
+            test_config(),
+            &[descriptor],
+            1,
+            QualityTier::Desktop,
+        )
+        .unwrap();
+        let mut stage_gains = render.take_stage_output_gain_writer().unwrap();
+        stage_gains.publish(StageOutputGains {
+            direct: 0.0,
+            pathing: 0.0,
+            reflections: 1.0,
+        });
+        let mut echo_gain = render.take_echo_output_gain_writer().unwrap();
+        echo_gain.publish(1.0);
+
+        let mut snapshot = simulation.snapshot;
+        snapshot.sources[0].echo = EchoSourcePlan {
+            generation: 1,
+            tap_count: 1,
+            taps: [
+                EchoTapPlan {
+                    valid: true,
+                    stable_path_id: 7,
+                    total_path_distance_m: 1.0,
+                    delay_samples: 2.0,
+                    arrival_position: api_enu_to_steam(ApiEnuVector3::new(10.0, 0.0, 1.5)),
+                    distance_gain: 1.0,
+                    band_gain: [1.0; 3],
+                    score: 1.0,
+                    ..EchoTapPlan::default()
+                },
+                EchoTapPlan::default(),
+                EchoTapPlan::default(),
+                EchoTapPlan::default(),
+            ],
+        };
+        simulation.snapshot = snapshot;
+        simulation.publication.publish(snapshot);
+
+        let mut input = vec![0.0; audio.frame_size as usize];
+        input[0] = 0.25;
+        let (left, right) = render_one_source_block(&mut render, &input);
+        assert_eq!(left.len(), input.len());
+        assert_eq!(right.len(), input.len());
+        assert!(left.iter().chain(&right).all(|sample| sample.is_finite()));
+        assert!(
+            energy(&left) + energy(&right) > 0.0,
+            "the isolated echo branch was silent"
         );
     }
 
