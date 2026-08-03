@@ -58,6 +58,22 @@ class ComposedAsset:
     preparation_notes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class TimedLayer:
+    relative_path: str
+    start_s: float
+    gain_db: float
+    role: str
+
+
+@dataclass(frozen=True)
+class TimelineAsset:
+    asset_id: str
+    duration_s: float
+    layers: tuple[TimedLayer, ...]
+    preparation_notes: tuple[str, ...]
+
+
 ASSETS = (
     Asset(
         "squad-abrams-idle",
@@ -135,6 +151,90 @@ COMPOSED_ASSETS = (
             "The DShK 3p Default/Initial folder has only a start recording plus silence, not a per-round variant set, so this fixed offline composition uses the requested 1p Default/Initial fallback; Mech and silence files are excluded.",
             "No direct DShK operator-peak measurement was located. The fixture's 154 dB SplAtOneMeter steady-source control is an explicit 12.7 mm heavy-machine-gun class inference: 1 dB above the 153 dB M2 HB .50-cal value in U.S. Army ATP 4-25.12 (30 April 2014, chapter 10, https://rdl.train.army.mil/catalog-ws/view/100.ATSC/6FDDE4EE-4362-464B-AEA0-1EC3A3D90D88-1399551821430/atp4_25x12.pdf) and below the 160.7 dB(C) bridge-wing peak measured for a 12.7 mm L111A1 by Paddan (2015), doi:10.1093/annhyg/mev053, https://doi.org/10.1093/annhyg/mev053.",
             "Peak-to-reference rationale: the class-inferred per-shot peak is used as a conservative steady-source scene anchor; it is not a direct DShK measurement, continuous physical SPL, or delivered-ear-SPL claim.",
+        ),
+    ),
+)
+
+
+# Both A-10 stems share this exact source-file timeline. A 1,200 m slant-range
+# shot with a 1,021 m/s PGU-13 projectile reaches the target in 1.175 s; the
+# muzzle report takes 3.499 s at 343 m/s, so the impact leads by 2.323 s.
+A10_CYCLE_DURATION_S = 84.0
+A10_IMPACT_ONSET_S = 38.0
+A10_GUN_REPORT_ARRIVAL_S = 40.323
+A10_CLOSEST_PASS_S = 44.0
+A10_STATIC_PROXY_ADVANCE_S = 0.364  # 125 m source-height difference / 343 m/s.
+
+
+TIMELINE_ASSETS = (
+    TimelineAsset(
+        asset_id="squad-a10-pass",
+        duration_s=A10_CYCLE_DURATION_S,
+        layers=(
+            TimedLayer(
+                "Game/Vehicles/A10/Sounds/Flyby/A10_flyover_01.ogg",
+                28.5 - A10_STATIC_PROXY_ADVANCE_S,
+                0.0,
+                "wide ground-perspective approach/pass/egress bed",
+            ),
+            TimedLayer(
+                "Game/Vehicles/A10/Sounds/FlybyClose/A10_flyby_close_02.ogg",
+                A10_CLOSEST_PASS_S - 4.5 - A10_STATIC_PROXY_ADVANCE_S,
+                -4.0,
+                "close-pass definition; its measured envelope peaks at 44.0 s",
+            ),
+            TimedLayer(
+                "Game/Vehicles/A10/Sounds/gau9/Firing/Far/gau9_fire_far_01.ogg",
+                A10_GUN_REPORT_ARRIVAL_S - A10_STATIC_PROXY_ADVANCE_S,
+                0.0,
+                "distant GAU-8 muzzle report",
+            ),
+        ),
+        preparation_notes=(
+            "This is an 84.000 s fixed timeline. The sky WAV advances its baked observer events by 0.364 s to offset the engine's 125 m static-proxy path at the strike point: wide flyover source onset 28.136 s (28.500 s target arrival), GAU-8 source onset 39.959 s (40.323 s target arrival), close-pass source peak 43.636 s (44.000 s target arrival), recorded source egress through 77.009 s, then 6.991 s tail silence.",
+            "The Flyby and FlybyClose recordings are baked ground-observer perspectives that already encode the aircraft's real-speed Doppler sweep, level trajectory, and pass character. The fixture therefore keeps this source static: applying a fast trajectory would double-apply motion.",
+            "The runtime fractional-delay slew cap is 0.01 samples/sample, corresponding to only about 3.4 m/s radial speed at a 343 m/s sound speed. This stem makes no claim to physically render the A-10's approximately 167 m/s motion until the fast-mover path lands.",
+            "V1 delegates only placement, direct-path occlusion, and reflections to the engine. A later fast-mover version should replace the baked pass with a dry jet loop on a true trajectory and preserve physically computed propagation delay and Doppler.",
+            "Level anchor: U.S. Air Force data reproduced in the 2006 Military Training Route EA give an A-10 flyover SEL of 96.9 dBA and Lmax of 93.2 dBA at 1,000 ft (304.8 m): https://www.nepa.navy.mil/Portals/20/Documents/Pacific%20Fleet/GOA/files/EIS/Final_EIS_2011/references/MTR_EA/Appendix_E_Sound_Basics.pdf",
+            "The fixture's 127 dB SplAtOneMeter is a cycle-bed anchor: 96.9 dBA SEL spread over 84 s is 77.66 dBA Leq,84s at 304.8 m; adding 20*log10(304.8) = 49.68 dB gives 127.34 dB at 1 m, rounded to 127 dB. It is not a claim that every instant, the cannon crest, or the delivered-ear level equals 127 dB.",
+            "GAU-8 firing context: Shaw and Gee measured outdoor maximum pressures above 3,000 Pa (163 dB peak) at 30 ft (9.1 m): https://physics.byu.edu/download/publication/632 (Noise Control Engineering Journal 58(6), 611-620, 2010, doi:10.3397/1.3495736). The far-fire layer preserves its recorded crest relative to the normalized 84 s bed; the descriptor does not reinterpret that peak measurement as continuous SPL.",
+        ),
+    ),
+    TimelineAsset(
+        asset_id="squad-a10-impacts",
+        duration_s=A10_CYCLE_DURATION_S,
+        layers=(
+            TimedLayer(
+                "Game/Vehicles/A10/Sounds/gau9/Impacts/Close/GAU9_impact_close_01.ogg",
+                A10_IMPACT_ONSET_S,
+                0.0,
+                "impact round-robin 1/4",
+            ),
+            TimedLayer(
+                "Game/Vehicles/A10/Sounds/gau9/Impacts/Close/GAU9_impact_close_02.ogg",
+                A10_IMPACT_ONSET_S + 0.18,
+                -1.0,
+                "impact round-robin 2/4",
+            ),
+            TimedLayer(
+                "Game/Vehicles/A10/Sounds/gau9/Impacts/Close/GAU9_impact_close_03.ogg",
+                A10_IMPACT_ONSET_S + 0.36,
+                -0.5,
+                "impact round-robin 3/4",
+            ),
+            TimedLayer(
+                "Game/Vehicles/A10/Sounds/gau9/Impacts/Close/GAU9_impact_close_04.ogg",
+                A10_IMPACT_ONSET_S + 0.54,
+                -1.5,
+                "impact round-robin 4/4",
+            ),
+        ),
+        preparation_notes=(
+            "This companion stem is exactly 84.000 s, matching squad-a10-pass sample-for-sample. Four Close impact variants enter once each in fixed 01, 02, 03, 04 order at 180 ms spacing, with no adjacent repeat; their tails overlap into one strike-line cluster.",
+            "Only the closest/driest impact pool is used. Mid and Far recordings are excluded because the engine supplies distance, occlusion, and reflections; using baked distance perspectives would double-apply those cues.",
+            "Timing model: at a 1,200 m slant range, a 1,021 m/s PGU-13 HEI projectile arrives in 1.175 s while the muzzle report takes 3.499 s at 343 m/s, so impacts lead the report at the strike point by 2.323 s. The impact stem begins at 38.000 s; the sky WAV's report begins at 39.959 s and the 125 m static-proxy path adds 0.364 s for a 40.323 s target arrival. Projectile speed source: https://jpeoaa.army.mil/Portals/94/JPEOAA/Documents/JPEOAAPortfolioBook_2017.pdf",
+            "The fixture's 163 dB SplAtOneMeter is a conservative per-burst creative anchor borrowed from Shaw and Gee's measured GAU-8 outdoor maximum above 163 dB peak at 9.1 m: https://physics.byu.edu/download/publication/632. It is intentionally not back-solved, is not an impact-site measurement, and does not claim a continuous physical SPL or delivered-ear level; it follows the M2/DShK precedent of exposing an impulsive peak as a steady-source control.",
+            "The separate impact stem models one clustered strike-line event. It makes no claim to individual projectile positions, exact projectile drag, dispersion, target material, explosive yield, or a physically measured impact SPL.",
         ),
     ),
 )
@@ -371,7 +471,7 @@ def normalize_composition(samples: array) -> tuple[array, dict[str, float]]:
 
 
 def composed_descriptor(
-    asset: ComposedAsset,
+    asset: ComposedAsset | TimelineAsset,
     wav_path: Path,
     samples: array,
     levels: dict[str, float],
@@ -403,6 +503,92 @@ def composed_descriptor(
             "applied_gain_db": round(levels["applied_gain_db"], 6)
         },
         "non_claims": non_claims,
+    }
+
+
+def prepare_timeline(
+    asset: TimelineAsset,
+    ffmpeg: str,
+    ffprobe: str,
+    resampler_filter: str,
+) -> dict[str, object]:
+    total_frames = round(asset.duration_s * SAMPLE_RATE_HZ)
+    if total_frames <= 0:
+        raise RuntimeError(f"{asset.asset_id} requires a positive duration")
+    composition = array("f", [0.0]) * total_frames
+    source_info: dict[Path, dict[str, float | int]] = {}
+    layer_report = []
+    latest_end_frame = 0
+
+    for layer in asset.layers:
+        source = SOURCE_ROOT / layer.relative_path
+        if not source.is_file():
+            raise RuntimeError(f"Squad source asset is missing: {source}")
+        samples, info = decode_trimmed(source, ffmpeg, ffprobe, resampler_filter)
+        source_info[source] = info
+        start_frame = round(layer.start_s * SAMPLE_RATE_HZ)
+        end_frame = start_frame + len(samples)
+        if start_frame < 0 or end_frame > total_frames:
+            raise RuntimeError(
+                f"{asset.asset_id} layer {source.name} spans frames "
+                f"{start_frame}..{end_frame} outside 0..{total_frames}"
+            )
+        gain = 10.0 ** (layer.gain_db / 20.0)
+        for index, sample in enumerate(samples):
+            output_index = start_frame + index
+            composition[output_index] = (
+                float(composition[output_index]) + float(sample) * gain
+            )
+        latest_end_frame = max(latest_end_frame, end_frame)
+        layer_report.append(
+            {
+                "path": str(source),
+                "role": layer.role,
+                "start_s": layer.start_s,
+                "end_s": round(end_frame / SAMPLE_RATE_HZ, 9),
+                "gain_db": layer.gain_db,
+                **info,
+            }
+        )
+
+    final_silence_s = (total_frames - latest_end_frame) / SAMPLE_RATE_HZ
+    if final_silence_s < 1.5:
+        raise RuntimeError(f"{asset.asset_id} requires at least 1.5 s final silence")
+    samples, levels = normalize_composition(composition)
+    wav_path = WAV_ROOT / f"{asset.asset_id}.wav"
+    write_float_wav(wav_path, samples)
+    output_descriptor = composed_descriptor(asset, wav_path, samples, levels)
+    descriptor_path = DESCRIPTOR_ROOT / f"{asset.asset_id}.json"
+    descriptor_path.write_text(
+        json.dumps(output_descriptor, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "asset_id": asset.asset_id,
+        "sources": [
+            {
+                "path": str(path),
+                **source_info[path],
+            }
+            for path in sorted(source_info)
+        ],
+        "composition": {
+            "timeline_duration_s": asset.duration_s,
+            "layers": layer_report,
+            "raw_rms_dbfs": round(levels["raw_rms_dbfs"], 6),
+            "raw_peak_dbfs": round(levels["raw_peak_dbfs"], 6),
+            "applied_gain_db": output_descriptor["calibration"][
+                "applied_gain_db"
+            ],
+            "output_rms_dbfs": output_descriptor["target_rms_dbfs"],
+            "output_peak_dbfs": round(levels["output_peak_dbfs"], 6),
+            "sha256": output_descriptor["generator"]["wav"]["sha256"],
+        },
+        "loop": {
+            "intended": True,
+            "final_silence_s": round(final_silence_s, 9),
+            "seam": seam_metrics(samples),
+        },
     }
 
 
@@ -612,6 +798,10 @@ def main() -> int:
     results.extend(
         prepare_composed(asset, ffmpeg, ffprobe, resampler_filter)
         for asset in COMPOSED_ASSETS
+    )
+    results.extend(
+        prepare_timeline(asset, ffmpeg, ffprobe, resampler_filter)
+        for asset in TIMELINE_ASSETS
     )
     report = {
         "schema_version": "fightbox.squad-asset-preparation.v1",

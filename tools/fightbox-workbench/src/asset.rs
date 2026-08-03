@@ -366,6 +366,8 @@ mod tests {
             "squad-m2-blast",
             "squad-m2-burst-loop",
             "squad-dshk-burst-loop",
+            "squad-a10-pass",
+            "squad-a10-impacts",
         ] {
             let asset = load_asset(asset_id).unwrap_or_else(|error| panic!("{asset_id}: {error}"));
             assert!(!asset.samples.is_empty(), "{asset_id}");

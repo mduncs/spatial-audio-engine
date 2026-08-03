@@ -1,0 +1,31 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-a10-impacts",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-a10-impacts.wav",
+      "sha256": "11720bc17001d5bca4332bd3f41479cab451327696a3b5ff4667f832ace7474d",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 84.0,
+  "target_rms_dbfs": -31.802535,
+  "expected_reference_rms_dbfs": -22.792197,
+  "calibration": {
+    "applied_gain_db": -9.010338
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of Squad v8.1 game assets; this descriptor grants no right to redistribute audio bytes.",
+    "This companion stem is exactly 84.000 s, matching squad-a10-pass sample-for-sample. Four Close impact variants enter once each in fixed 01, 02, 03, 04 order at 180 ms spacing, with no adjacent repeat; their tails overlap into one strike-line cluster.",
+    "Only the closest/driest impact pool is used. Mid and Far recordings are excluded because the engine supplies distance, occlusion, and reflections; using baked distance perspectives would double-apply those cues.",
+    "Timing model: at a 1,200 m slant range, a 1,021 m/s PGU-13 HEI projectile arrives in 1.175 s while the muzzle report takes 3.499 s at 343 m/s, so impacts lead the report at the strike point by 2.323 s. The impact stem begins at 38.000 s; the sky WAV's report begins at 39.959 s and the 125 m static-proxy path adds 0.364 s for a 40.323 s target arrival. Projectile speed source: https://jpeoaa.army.mil/Portals/94/JPEOAA/Documents/JPEOAAPortfolioBook_2017.pdf",
+    "The fixture's 163 dB SplAtOneMeter is a conservative per-burst creative anchor borrowed from Shaw and Gee's measured GAU-8 outdoor maximum above 163 dB peak at 9.1 m: https://physics.byu.edu/download/publication/632. It is intentionally not back-solved, is not an impact-site measurement, and does not claim a continuous physical SPL or delivered-ear level; it follows the M2/DShK precedent of exposing an impulsive peak as a steady-source control.",
+    "The separate impact stem models one clustered strike-line event. It makes no claim to individual projectile positions, exact projectile drag, dispersion, target material, explosive yield, or a physically measured impact SPL."
+  ]
+}

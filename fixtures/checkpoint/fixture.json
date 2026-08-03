@@ -101,6 +101,41 @@
         342.5,
         2.0
       ]
+    },
+    {
+      "id": "a10-gunrun-sky",
+      "asset_id": "squad-a10-pass",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 127
+      },
+      "default_enabled": false,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        342.5,
+        127.0
+      ]
+    },
+    {
+      "id": "a10-strike-line",
+      "asset_id": "squad-a10-impacts",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 163
+      },
+      "default_enabled": false,
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 35.0
+      },
+      "position_m": [
+        292.5,
+        342.5,
+        2.0
+      ]
     }
   ],
   "listener": {

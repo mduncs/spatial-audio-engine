@@ -1121,8 +1121,12 @@ mod tests {
             parsed.source.extent,
             ExtentDescriptor::LineSegment { length_m: 6.0 }
         );
+        // Extent-bearing megablock sources: artillery plus the DShK burst-loop
+        // gun added with the composed-gunfire change.
         assert!(sources.iter().all(|source| {
-            source["id"] == "artillery-sw-map-corner" || source.get("extent").is_none()
+            source["id"] == "artillery-sw-map-corner"
+                || source["id"] == "dshk-street-gun"
+                || source.get("extent").is_none()
         }));
     }
 

@@ -1,0 +1,33 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-a10-pass",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-a10-pass.wav",
+      "sha256": "92a63b9d31141800ccf95e893ea265919eb888f3ca1f4eb1b06452ebbffd38f2",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 84.0,
+  "target_rms_dbfs": -25.782964,
+  "expected_reference_rms_dbfs": -20.180778,
+  "calibration": {
+    "applied_gain_db": -5.602186
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of Squad v8.1 game assets; this descriptor grants no right to redistribute audio bytes.",
+    "This is an 84.000 s fixed timeline. The sky WAV advances its baked observer events by 0.364 s to offset the engine's 125 m static-proxy path at the strike point: wide flyover source onset 28.136 s (28.500 s target arrival), GAU-8 source onset 39.959 s (40.323 s target arrival), close-pass source peak 43.636 s (44.000 s target arrival), recorded source egress through 77.009 s, then 6.991 s tail silence.",
+    "The Flyby and FlybyClose recordings are baked ground-observer perspectives that already encode the aircraft's real-speed Doppler sweep, level trajectory, and pass character. The fixture therefore keeps this source static: applying a fast trajectory would double-apply motion.",
+    "The runtime fractional-delay slew cap is 0.01 samples/sample, corresponding to only about 3.4 m/s radial speed at a 343 m/s sound speed. This stem makes no claim to physically render the A-10's approximately 167 m/s motion until the fast-mover path lands.",
+    "V1 delegates only placement, direct-path occlusion, and reflections to the engine. A later fast-mover version should replace the baked pass with a dry jet loop on a true trajectory and preserve physically computed propagation delay and Doppler.",
+    "Level anchor: U.S. Air Force data reproduced in the 2006 Military Training Route EA give an A-10 flyover SEL of 96.9 dBA and Lmax of 93.2 dBA at 1,000 ft (304.8 m): https://www.nepa.navy.mil/Portals/20/Documents/Pacific%20Fleet/GOA/files/EIS/Final_EIS_2011/references/MTR_EA/Appendix_E_Sound_Basics.pdf",
+    "The fixture's 127 dB SplAtOneMeter is a cycle-bed anchor: 96.9 dBA SEL spread over 84 s is 77.66 dBA Leq,84s at 304.8 m; adding 20*log10(304.8) = 49.68 dB gives 127.34 dB at 1 m, rounded to 127 dB. It is not a claim that every instant, the cannon crest, or the delivered-ear level equals 127 dB.",
+    "GAU-8 firing context: Shaw and Gee measured outdoor maximum pressures above 3,000 Pa (163 dB peak) at 30 ft (9.1 m): https://physics.byu.edu/download/publication/632 (Noise Control Engineering Journal 58(6), 611-620, 2010, doi:10.3397/1.3495736). The far-fire layer preserves its recorded crest relative to the normalized 84 s bed; the descriptor does not reinterpret that peak measurement as continuous SPL."
+  ]
+}

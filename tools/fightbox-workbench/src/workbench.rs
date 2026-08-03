@@ -3558,10 +3558,13 @@ mod tests {
         let megablock_ids = planned_physical_source_ids(&megablock, &steady);
         let checkpoint_ids = planned_physical_source_ids(&checkpoint, &steady);
         assert_eq!(megablock_ids.len(), 5);
-        assert_eq!(checkpoint_ids.len(), 5);
+        // 7 = original 5 plus the A-10 gun-run pair (sky pass + strike line).
+        assert_eq!(checkpoint_ids.len(), 7);
         assert!(megablock_ids.contains(&"dshk-street-gun".into()));
         assert!(checkpoint_ids.contains(&"m2-checkpoint-gun".into()));
         assert!(checkpoint_ids.contains(&"dshk-return-fire".into()));
+        assert!(checkpoint_ids.contains(&"a10-gunrun-sky".into()));
+        assert!(checkpoint_ids.contains(&"a10-strike-line".into()));
 
         let mut slots = SceneSlotState::default();
         slots.replace(megablock_ids.clone());
