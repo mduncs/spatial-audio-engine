@@ -11,6 +11,7 @@
 
 #![deny(unsafe_code)]
 
+mod anomaly_field;
 #[cfg(any(feature = "linked-sdk", test))]
 mod backend_snapshot;
 mod ballistic_event;
@@ -28,6 +29,10 @@ mod status;
 mod width_render;
 #[allow(unsafe_code)]
 mod world_swap;
+pub use anomaly_field::{
+    ADAPTIVE_LIVE_SAMPLE_HZ, AnomalyClass, AnomalyFlags, AnomalyQuerySession, AnomalyRawSample,
+    GridSpec, IntersectionTrigger, ProxyCell, classify_grid, classify_sample_at_distance,
+};
 pub use ballistic_event::{
     BallisticEventError, BallisticEventLevels, BallisticEventSource, BallisticShot,
     BallisticShotPlan, EVENT_PROGRAM_SECONDS, plan_ballistic_shot, synthesize_crack_stem,
@@ -1222,6 +1227,21 @@ pub struct SourceAcousticDiagnostics {
     pub reflection_ir_size: i32,
 }
 
+/// Callback-safe rendered-stage energy publication for the passive live trail.
+///
+/// Energies are sums of squared stereo samples after stage and governor gains,
+/// but before the runtime monitor route and output limiter. Direct and path are
+/// accumulated together conservatively; no allocation, lock, or I/O occurs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LiveStageEnergySnapshot {
+    pub sequence: u64,
+    pub simulation_sequence: u64,
+    pub world_generation: u64,
+    pub audible_source_count: u8,
+    pub direct_path_energy: f64,
+    pub reflection_energy: f64,
+}
+
 /// A fully constructed second world which has not yet been offered to the
 /// callback. It can be primed with simulation updates before adoption.
 pub struct PreparedSteamAudioWorld {
@@ -1479,6 +1499,16 @@ impl SteamAudioRenderGraph {
     /// Takes the unique producer for this graph's dedicated echo output gain.
     pub fn take_echo_output_gain_control(&mut self) -> Option<EchoOutputGainControl> {
         self.echo_output_gain_control.take()
+    }
+
+    /// Takes the unique reader for the passive, pre-limiter stage-energy tap.
+    pub fn take_live_stage_energy_reader(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotReader<LiveStageEnergySnapshot>> {
+        #[cfg(feature = "linked-sdk")]
+        return self.inner.take_live_stage_energy_reader();
+        #[cfg(not(feature = "linked-sdk"))]
+        None
     }
 }
 

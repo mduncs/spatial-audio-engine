@@ -416,6 +416,24 @@ impl MultiSourceSimulation {
         self.valid_update = true;
     }
 
+    /// Query-only listener update that preserves the session's immutable source.
+    pub(crate) fn update_listener(&mut self, position: ApiEnuVector3) {
+        let Some(listener) = SteamPose::from_api(default_api_pose(position)) else {
+            self.valid_update = false;
+            return;
+        };
+        if endpoint_teleported(self.frame.listener.position, listener.position) {
+            for index in 0..self.world.source_count {
+                self.path_gates[index].invalidate(&mut self.snapshot.sources[index]);
+            }
+            self.snapshot.sequence = self.snapshot.sequence.wrapping_add(1);
+            self.publication.publish(self.snapshot);
+        }
+        self.frame.listener = listener;
+        self.frame.listener_linear_velocity_mps = SteamVector3::default();
+        self.valid_update = true;
+    }
+
     pub(crate) fn run_direct(&mut self) -> Result<(), SimulationError> {
         self.run_pass(
             ffi::IPL_SIMULATIONFLAGS_DIRECT,
@@ -1205,6 +1223,8 @@ pub(crate) struct MultiSourceRenderGraph {
     ambisonics_decode: usize,
     mono_work: Vec<f32>,
     stereo_work: Vec<f32>,
+    live_direct_path_left: Vec<f32>,
+    live_direct_path_right: Vec<f32>,
     width_work: Vec<f32>,
     width_feed_work: Vec<f32>,
     publication: fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
@@ -1218,6 +1238,9 @@ pub(crate) struct MultiSourceRenderGraph {
     has_echo_sources: bool,
     reflection_output_gain: f32,
     propagation_block_retention: f32,
+    live_energy_writer: fightbox_runtime::SnapshotWriter<crate::LiveStageEnergySnapshot>,
+    live_energy_reader: Option<fightbox_runtime::SnapshotReader<crate::LiveStageEnergySnapshot>>,
+    live_energy_sequence: u64,
     #[cfg(test)]
     governor_snapshot_reads: u64,
     // Must drop after every SDK effect and audio buffer. Keeping the world
@@ -1246,6 +1269,12 @@ impl MultiSourceRenderGraph {
         &mut self,
     ) -> Option<fightbox_runtime::SnapshotWriter<f32>> {
         self.echo_output_gain_writer.take()
+    }
+
+    pub(crate) fn take_live_stage_energy_reader(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotReader<crate::LiveStageEnergySnapshot>> {
+        self.live_energy_reader.take()
     }
 
     pub(crate) fn render_block(
@@ -1339,6 +1368,17 @@ impl MultiSourceRenderGraph {
             }
         }
 
+        let mut live_energy = StageEnergyAccumulator {
+            audible_source_count: block
+                .sources
+                .iter()
+                .filter(|source| source.input_mono.iter().any(|sample| *sample != 0.0))
+                .count()
+                .min(u8::MAX as usize) as u8,
+            ..StageEnergyAccumulator::default()
+        };
+        self.live_direct_path_left.fill(0.0);
+        self.live_direct_path_right.fill(0.0);
         for source_block in block.sources {
             let propagation = snapshot.sources[source_block.source_index];
             if !propagation.active {
@@ -1359,13 +1399,26 @@ impl MultiSourceRenderGraph {
                 echo_output_gain,
             );
         }
+        live_energy.direct_path_energy =
+            stereo_planes_energy(&self.live_direct_path_left, &self.live_direct_path_right);
         self.render_reflection_mix(
             listener,
             block.output_left,
             block.output_right,
             stage_output_gains.reflections,
             governor_quality,
+            &mut live_energy,
         );
+        self.live_energy_sequence = self.live_energy_sequence.wrapping_add(1);
+        self.live_energy_writer
+            .publish(crate::LiveStageEnergySnapshot {
+                sequence: self.live_energy_sequence,
+                simulation_sequence: snapshot.sequence,
+                world_generation: self.world.generation,
+                audible_source_count: live_energy.audible_source_count,
+                direct_path_energy: live_energy.direct_path_energy,
+                reflection_energy: live_energy.reflection_energy,
+            });
         Ok(())
     }
 
@@ -1638,6 +1691,13 @@ impl MultiSourceRenderGraph {
                         stage_output_gains.direct,
                         quality_ramps[0],
                     );
+                    accumulate_stereo_ramped(
+                        &self.stereo_work,
+                        &mut self.live_direct_path_left,
+                        &mut self.live_direct_path_right,
+                        stage_output_gains.direct,
+                        quality_ramps[0],
+                    );
                 }
             } else {
                 // Structural legacy bypass. Point, MultiPoint, StereoImage, and
@@ -1676,6 +1736,13 @@ impl MultiSourceRenderGraph {
                     stage_output_gains.direct,
                     quality_ramps[0],
                 );
+                accumulate_stereo_ramped(
+                    &self.stereo_work,
+                    &mut self.live_direct_path_left,
+                    &mut self.live_direct_path_right,
+                    stage_output_gains.direct,
+                    quality_ramps[0],
+                );
             }
         }
 
@@ -1711,6 +1778,13 @@ impl MultiSourceRenderGraph {
                 stage_output_gains.pathing,
                 quality_ramps[1],
             );
+            accumulate_stereo_ramped(
+                &self.stereo_work,
+                &mut self.live_direct_path_left,
+                &mut self.live_direct_path_right,
+                stage_output_gains.pathing,
+                quality_ramps[1],
+            );
         }
 
         let reflection = propagation.reflections;
@@ -1742,6 +1816,7 @@ impl MultiSourceRenderGraph {
         output_right: &mut [f32],
         gain: f32,
         governor_quality: GovernorRenderSnapshot,
+        live_energy: &mut StageEnergyAccumulator,
     ) {
         let mut mixer_params = ffi::IPLReflectionEffectParams {
             type_: reflection_effect_ffi_type(self.config.reflection_effect.effect_type)
@@ -1794,7 +1869,16 @@ impl MultiSourceRenderGraph {
             gain,
             reflection_gain_ramp,
         );
+        live_energy.reflection_energy +=
+            stereo_energy_ramped(&self.stereo_work, gain, reflection_gain_ramp);
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StageEnergyAccumulator {
+    audible_source_count: u8,
+    direct_path_energy: f64,
+    reflection_energy: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1853,6 +1937,32 @@ fn accumulate_stereo_ramped(
         *left += frame[0] * gain;
         *right += frame[1] * gain;
     }
+}
+
+fn stereo_energy_ramped(interleaved: &[f32], stage_gain: f32, ramp: GainRamp) -> f64 {
+    if stage_gain == 0.0 || !ramp.is_audible() {
+        return 0.0;
+    }
+    interleaved
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(frame_index, frame)| {
+            let gain = stage_gain * ramp.at(frame_index);
+            let left = f64::from(frame[0] * gain);
+            let right = f64::from(frame[1] * gain);
+            left * left + right * right
+        })
+        .sum()
+}
+
+fn stereo_planes_energy(left: &[f32], right: &[f32]) -> f64 {
+    left.iter()
+        .chain(right)
+        .map(|sample| {
+            let sample = f64::from(*sample);
+            sample * sample
+        })
+        .sum()
 }
 
 fn listener_pose(orientation: ListenerOrientation) -> Option<SteamPose> {
@@ -1967,6 +2077,82 @@ pub(crate) fn build_multi_source_generation(
     generation: u64,
     quality_tier: QualityTier,
 ) -> Result<(MultiSourceSimulation, MultiSourceRenderGraph), BackendError> {
+    let (simulation, reader, governor_quality) = build_simulation_generation(
+        mesh,
+        baked,
+        audio,
+        config,
+        descriptors,
+        generation,
+        quality_tier,
+    )?;
+    let (stage_output_gain_writer, stage_output_gains) =
+        SnapshotPublication::new(StageOutputGains::UNITY);
+    let initial_echo_output_gain = if descriptors
+        .iter()
+        .any(|descriptor| descriptor.echo_profile.is_enabled())
+    {
+        1.0
+    } else {
+        0.0
+    };
+    let (echo_output_gain_writer, echo_output_gain) =
+        SnapshotPublication::new(initial_echo_output_gain);
+    let render = create_render_graph(
+        Arc::clone(&simulation.world),
+        audio,
+        config,
+        reader,
+        stage_output_gain_writer,
+        stage_output_gains,
+        echo_output_gain_writer,
+        echo_output_gain,
+        governor_quality,
+        descriptors,
+    )?;
+    Ok((simulation, render))
+}
+
+/// Builds only the retained simulator used by anomaly proxy queries.
+///
+/// No HRTF, direct/path effect, reflection effect, mixer, decode effect, or
+/// render scratch is constructed on this path.
+pub(crate) fn build_anomaly_query_simulation(
+    mesh: &SceneMesh,
+    baked: &BakedProbeBatch,
+    audio: AudioConfig,
+    config: S3SimulationConfig,
+    descriptor: crate::MultiSourceDescriptor,
+) -> Result<MultiSourceSimulation, BackendError> {
+    let (simulation, _unused_snapshot_reader, _unused_governor_reader) =
+        build_simulation_generation(
+            mesh,
+            Some(baked),
+            audio,
+            config,
+            core::slice::from_ref(&descriptor),
+            1,
+            QualityTier::Desktop,
+        )?;
+    Ok(simulation)
+}
+
+fn build_simulation_generation(
+    mesh: &SceneMesh,
+    baked: Option<&BakedProbeBatch>,
+    audio: AudioConfig,
+    config: S3SimulationConfig,
+    descriptors: &[crate::MultiSourceDescriptor],
+    generation: u64,
+    quality_tier: QualityTier,
+) -> Result<
+    (
+        MultiSourceSimulation,
+        fightbox_runtime::SnapshotReader<SteamPropagationSnapshot>,
+        fightbox_runtime::SnapshotReader<GovernorRenderSnapshot>,
+    ),
+    BackendError,
+> {
     validate_multi_source_config(mesh, baked, audio, config, descriptors, quality_tier)?;
     let memory = session_memory_telemetry(audio, config, descriptors, baked)?;
     let world = Arc::new(create_world(
@@ -2011,35 +2197,11 @@ pub(crate) fn build_multi_source_generation(
         initial.sources[index].configured_pathing_order = config.pathing_order as u8;
     }
     let (writer, reader) = SnapshotPublication::new(initial);
-    let (stage_output_gain_writer, stage_output_gains) =
-        SnapshotPublication::new(StageOutputGains::UNITY);
-    let initial_echo_output_gain = if descriptors
-        .iter()
-        .any(|descriptor| descriptor.echo_profile.is_enabled())
-    {
-        1.0
-    } else {
-        0.0
-    };
-    let (echo_output_gain_writer, echo_output_gain) =
-        SnapshotPublication::new(initial_echo_output_gain);
     let (mut governor, governor_quality) =
         QualityGovernor::new(audio, config, descriptors, quality_tier, memory);
     for (index, descriptor) in descriptors.iter().enumerate() {
         governor.set_source_priority(index, descriptor.priority_class);
     }
-    let render = create_render_graph(
-        Arc::clone(&world),
-        audio,
-        config,
-        reader,
-        stage_output_gain_writer,
-        stage_output_gains,
-        echo_output_gain_writer,
-        echo_output_gain,
-        governor_quality,
-        descriptors,
-    )?;
     let simulation = MultiSourceSimulation {
         world,
         audio,
@@ -2065,7 +2227,7 @@ pub(crate) fn build_multi_source_generation(
         path_gates: [PathGateState::default(); MAX_ACTIVE_SOURCES],
         started: Instant::now(),
     };
-    Ok((simulation, render))
+    Ok((simulation, reader, governor_quality))
 }
 
 fn validate_multi_source_config(
@@ -2528,6 +2690,8 @@ fn create_render_graph(
     let has_echo_sources = descriptors
         .iter()
         .any(|descriptor| descriptor.echo_profile.is_enabled());
+    let (live_energy_writer, live_energy_reader) =
+        SnapshotPublication::new(crate::LiveStageEnergySnapshot::default());
     Ok(MultiSourceRenderGraph {
         world,
         config,
@@ -2540,6 +2704,8 @@ fn create_render_graph(
         ambisonics_decode: decode as usize,
         mono_work: vec![0.0; audio.frame_size as usize],
         stereo_work: vec![0.0; audio.frame_size as usize * 2],
+        live_direct_path_left: vec![0.0; audio.frame_size as usize],
+        live_direct_path_right: vec![0.0; audio.frame_size as usize],
         width_work: vec![
             0.0;
             if has_line_width {
@@ -2569,6 +2735,9 @@ fn create_render_graph(
         propagation_block_retention: (-(audio.frame_size as f32 / audio.sample_rate_hz as f32)
             / PROPAGATION_SLEW_TIME_SECONDS)
             .exp(),
+        live_energy_writer,
+        live_energy_reader: Some(live_energy_reader),
+        live_energy_sequence: 0,
         #[cfg(test)]
         governor_snapshot_reads: 0,
     })

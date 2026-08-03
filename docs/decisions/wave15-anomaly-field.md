@@ -1,13 +1,17 @@
 # Wave 15 acoustic-anomaly field feasibility and cost study
 
-**Status:** design and cost study only. This document does not implement an
-anomaly field.
+**Status:** ratified and implemented as Wave 15 v1 on 2026-08-03. The cheap
+proxy field, persistent live trail, and adaptive intersection sampling are in
+scope. The full-simulation sweep and bounded validator were explicitly
+rejected on cost grounds and are not implemented.
 
-**Decision:** build an 8 m **shadow/weak-path proxy field** as v1, then run the
-full renderer only on the highest-ranked cells as offline validation. The proxy
-must not be labeled a reflection-inversion measurement: it finds places where
-an inversion is plausible because direct sound is deeply shadowed and baked
-path fill is weak, but it does not predict whether reflections are strong.
+**Decision:** build an 8 m **shadow/weak-path proxy field** as v1, plus a
+persistent trail of the live renderer's visited positions. The proxy must not
+be labeled a reflection-inversion measurement: it finds places where an
+inversion is plausible because direct sound is deeply shadowed and baked path
+fill is weak, but it does not predict whether reflections are strong. The
+query-only session remains a clean seam where a future experiment could attach,
+but v1 does not expose or schedule a full-render sweep.
 
 The selected metric for a later full-simulation field is
 
@@ -231,15 +235,13 @@ across generations. A material, fixture, bake, selected-source, source-height,
 or metric-window change closes the current trail and starts a visibly separate
 layer.
 
-## ε. Recommended v1 and implementation plan
+## ε. Implemented v1
 
 Implement the 8 m proxy first. It covers the entire 585 m map in an operational
 wait, directly targets the observed direct-shadow/weak-path signature, occupies
-well under 0.1 MiB on disk, and gives the user places to audition today. Add an
-offline **Validate candidates** action later that runs the two-window full
-renderer on, for example, the top 32 proxy cells; at the measured baseline that
-is about 12.5 minutes serial or roughly 2–3 minutes with a memory-safe small
-worker pool.
+well under 1 MiB on disk, and gives the user places to audition today. No
+**Validate candidates** action is planned: even the bounded full-render form
+was rejected as too expensive after this study.
 
 Concrete seams and ownership:
 
@@ -269,8 +271,18 @@ polish, and documentation. The full-simulation candidate validator is another
 2–3 person-days after v1 because it needs convergence evidence and bounded
 multi-session scheduling.
 
-The go/no-go gates are: supplied-bake identity verified; known inversion ranks
-in the top decile; clear controls do not; 8 m cold completion under 30 seconds;
-no audio callback regression or new deadline miss while the worker runs; field
-bytes are deterministic for an unchanged cache key; and every stale input
-produces a new, visibly identified layer.
+The implementation adds seven stable anomaly-class IDs with tunable threshold
+constants, a configurable 2–32 m grid (8 m default), manifest plus row-major
+binary output, a batched map mesh, visible stale state, and hover diagnostics.
+The live trail reads a wait-free stage-energy snapshot outside the callback and
+persists at no more than 5 Hz. A negative obstruction derivative transition
+queues eight nearby query-only samples on a separate bounded worker, also
+limited to 5 Hz.
+
+The go/no-go gates are: supplied-bake identity verified; the known inversion is
+flagged by an exact-position query; 8 m completion under 30 seconds; the golden
+direct-render fingerprint remains bit-identical; field identity changes become
+visibly stale; and the audio callback performs only fixed-buffer arithmetic and
+wait-free snapshot publication. Live deadline behavior while a sweep is active
+remains an operator test because this implementation lane was forbidden from
+launching or disturbing the running workbench.

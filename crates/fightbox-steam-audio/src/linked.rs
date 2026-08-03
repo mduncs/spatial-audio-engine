@@ -29,6 +29,7 @@ use crate::{
 mod multi_source;
 use multi_source::{
     MultiSourceRenderGraph as GenerationRenderGraph, MultiSourceSimulation as GenerationSimulation,
+    build_anomaly_query_simulation as build_generation_anomaly_query_simulation,
     build_multi_source_generation,
 };
 
@@ -87,6 +88,50 @@ fn decode_delivery(encoded: u64) -> DeliveredWorldState {
         },
         transition_blocks_remaining: (encoded >> TRANSITION_SHIFT) as u8,
     }
+}
+
+/// Thin linked wrapper for the simulation-only anomaly field query path.
+pub(crate) struct AnomalyQuerySimulation {
+    inner: GenerationSimulation,
+}
+
+impl AnomalyQuerySimulation {
+    pub(crate) fn sample(
+        &mut self,
+        listener: EnuVector3,
+    ) -> Result<crate::SourceAcousticDiagnostics, BackendError> {
+        let listener = fightbox_api::EnuVector3::new(listener.x, listener.y, listener.z);
+        // Preserve the immutable source pose already seeded into the generation:
+        // a query update must move only the listener. `update_listener` exists to
+        // avoid manufacturing or exposing the private source frame here.
+        self.inner.update_listener(listener);
+        self.inner.run_direct().map_err(simulation_query_error)?;
+        self.inner.run_pathing().map_err(simulation_query_error)?;
+        self.inner
+            .source_diagnostics(0)
+            .ok_or(BackendError::InvalidInput(
+                "anomaly query session lost its only source",
+            ))
+    }
+}
+
+fn simulation_query_error(_error: SimulationError) -> BackendError {
+    BackendError::SdkCall {
+        function: "anomaly direct/path query",
+        status: -1,
+    }
+}
+
+pub(crate) fn build_anomaly_query_simulation(
+    mesh: &SceneMesh,
+    baked: &BakedProbeBatch,
+    audio: AudioConfig,
+    config: S3SimulationConfig,
+    descriptor: MultiSourceDescriptor,
+) -> Result<AnomalyQuerySimulation, BackendError> {
+    Ok(AnomalyQuerySimulation {
+        inner: build_generation_anomaly_query_simulation(mesh, baked, audio, config, descriptor)?,
+    })
 }
 
 pub(crate) struct PreparedMultiSourceWorld {
@@ -309,6 +354,12 @@ impl MultiSourceRenderGraph {
         &mut self,
     ) -> Option<fightbox_runtime::SnapshotWriter<f32>> {
         self.active.take_echo_output_gain_writer()
+    }
+
+    pub(crate) fn take_live_stage_energy_reader(
+        &mut self,
+    ) -> Option<fightbox_runtime::SnapshotReader<crate::LiveStageEnergySnapshot>> {
+        self.active.take_live_stage_energy_reader()
     }
 
     fn flush_retirement(&mut self) {

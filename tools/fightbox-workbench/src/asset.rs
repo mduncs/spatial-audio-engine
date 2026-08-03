@@ -65,6 +65,8 @@ pub struct PreparedAsset {
     pub samples: Vec<f32>,
     pub analysis: AssetAnalysis,
     pub onset_frames: Vec<u32>,
+    /// Hash of the descriptor that declares generation settings or the verified WAV hash.
+    pub descriptor_sha256: String,
 }
 
 impl PreparedAsset {
@@ -234,6 +236,7 @@ pub fn load_asset(asset_id: &str) -> Result<PreparedAsset, String> {
         samples,
         analysis,
         onset_frames,
+        descriptor_sha256: sha256_hex(&bytes),
     })
 }
 

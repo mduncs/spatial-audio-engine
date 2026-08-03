@@ -1,4 +1,5 @@
 mod acoustic_state;
+mod anomaly_field;
 mod asset;
 mod capture;
 mod fixture;

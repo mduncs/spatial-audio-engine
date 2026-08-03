@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use fightbox_steam_audio::{BackendAvailability, ReflectionEffectConfig};
 use fightbox_steam_audio::{CapabilityStatus, runtime_status, steam_audio_provenance};
 
+mod anomaly_field;
 mod asset;
 mod atomicio;
 #[cfg(test)]
@@ -86,6 +87,10 @@ city bake        Bake probes for a city package (requires linked-sdk)\n    \
                   defaults: 100m, 6m, 1, 0.5, 4m, 1.5m, 3m, no layers, 1 thread\n    \
 city render      Render a fixture through a packaged and baked city\n\n\
 city metamorphic Jitter assumed heights, bake, and assert the occlusion percept\n\n\
+anomaly-field sweep\n    \
+                  Cheap direct-ray/baked-path proxy; --package --baked --fixture\n    \
+                  --source [--source-height-m] [--listener-height-m] [--spacing-m]\n    \
+                  [--inspect-position east,north,up] --output <absolute-directory>\n\n\
 SWEEP OUTPUT:\n    <report-directory>/report.json\n    \
 <report-directory>/artifacts.json\n    \
 <report-directory>/cases/<case-id>/child.json\n";
@@ -111,6 +116,7 @@ fn dispatch(args: &[String]) -> error::Result<()> {
         Some("phase-b") => dispatch_phase_b(&args[1..]),
         Some("listening") => listening::run(&args[1..]),
         Some("city") => dispatch_city(&args[1..]),
+        Some("anomaly-field") => anomaly_field::run(&args[1..]),
         Some(command) => Err(error::CliError::new(format!(
             "unknown command: {command}\n\n{HELP}"
         ))),

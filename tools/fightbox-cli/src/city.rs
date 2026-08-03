@@ -791,7 +791,7 @@ pub fn render(package: &Path, baked_path: &Path, fixture: &Path, output: &Path) 
     crate::phase_b::run_city_render(fixture, output, scene_mesh(&loaded)?, &baked, identity)
 }
 
-fn scene_mesh(loaded: &fightbox_world::LoadedPackage) -> Result<SceneMesh> {
+pub(crate) fn scene_mesh(loaded: &fightbox_world::LoadedPackage) -> Result<SceneMesh> {
     let mut triangles = Vec::with_capacity(loaded.mesh.triangles.len());
     for triangle in &loaded.mesh.triangles {
         triangles.push([
@@ -859,7 +859,7 @@ fn probe_volume(mesh: &SceneMesh, config: &BakeConfig) -> Result<ProbeVolume> {
     })
 }
 
-fn load_baked(path: &Path) -> Result<BakedProbeBatch> {
+pub(crate) fn load_baked(path: &Path) -> Result<BakedProbeBatch> {
     let bytes = std::fs::read(path.join("probe-batch.bin"))
         .map_err(|error| CliError::new(format!("cannot read probe batch: {error}")))?;
     let metadata_text = std::fs::read_to_string(path.join("probe-batch-metadata.json"))
@@ -908,7 +908,7 @@ struct ProbeMetadataWire {
     final_bake_progress_millionths: u32,
 }
 
-fn verify_bake_identity(
+pub(crate) fn verify_bake_identity(
     loaded: &fightbox_world::LoadedPackage,
     baked_path: &Path,
     baked: &BakedProbeBatch,

@@ -26,6 +26,7 @@ use crate::acoustic_state::{
     SourceAcousticState, path_diagnostics_text, probe_text, probe_tone, quality_text, quality_tone,
     stage_chips,
 };
+use crate::anomaly_field::{FieldContext, FieldController, SourceQuery, source_query};
 use crate::asset::{PreparedAsset, load_asset};
 use crate::capture::{
     BakeProvenance, BrowserScan, CaptureBrowserEntry, CaptureController, CaptureDraft,
@@ -292,6 +293,8 @@ pub struct Workbench {
     source_height_levels: SourceHeightLevels,
     probe_coverage: ProbeCoverageQuery,
     acoustic_telemetry: SnapshotReader<AcousticTelemetry>,
+    live_stage_energy: SnapshotReader<fightbox_steam_audio::LiveStageEnergySnapshot>,
+    anomaly_field: FieldController,
     visibility_range: VisibilityRangeAdoption,
     startup_started: Instant,
     reflection_warmup_started: Instant,
@@ -313,6 +316,8 @@ struct SourceView {
     trajectory: Option<SourceTrajectory>,
     acoustic: SourceAcousticState,
     occlusion_mode: DirectOcclusionMode,
+    anomaly_descriptor: MultiSourceDescriptor,
+    anomaly_asset_identity: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -647,13 +652,12 @@ impl Workbench {
                     })
                     .unwrap_or(0.0),
             };
-            descriptors.push(
-                MultiSourceDescriptor::at(profile.pose.position)
-                    .with_reference_level(profile.reference_level)
-                    .with_directivity(profile.directivity)
-                    .with_extent(profile.extent)
-                    .with_echo_profile(echo_profile),
-            );
+            let descriptor = MultiSourceDescriptor::at(profile.pose.position)
+                .with_reference_level(profile.reference_level)
+                .with_directivity(profile.directivity)
+                .with_extent(profile.extent)
+                .with_echo_profile(echo_profile);
+            descriptors.push(descriptor);
             prepared_sources.push((profile, asset.samples));
             source_motion[index] = SourceMotion {
                 active: true,
@@ -674,6 +678,8 @@ impl Workbench {
                 trajectory,
                 acoustic: SourceAcousticState::UNKNOWN,
                 occlusion_mode: occlusion_mode_for_extent(simulation_config, source.extent),
+                anomaly_descriptor: descriptor,
+                anomaly_asset_identity: format!("{}:{}", source.asset_id, asset.descriptor_sha256),
             });
         }
         // User mix defaults are resolved only after calibrated profiles and
@@ -725,6 +731,9 @@ impl Workbench {
         let stage_output_gain_control = backend
             .take_stage_output_gain_control()
             .ok_or("Steam Audio render graph did not expose stage-gain control")?;
+        let live_stage_energy = backend
+            .take_live_stage_energy_reader()
+            .ok_or("Steam Audio render graph did not expose live stage-energy telemetry")?;
         eprintln!(
             "[startup] steam scene + simulator build: {} ms",
             phase_started.elapsed().as_millis()
@@ -809,7 +818,7 @@ impl Workbench {
             entries: vec![],
             warnings: vec![error],
         });
-        let (capture, capture_tap) = CaptureController::new(capture_root);
+        let (capture, capture_tap) = CaptureController::new(capture_root.clone());
         let processor = LateBoundProcessor::new(
             graph,
             pose_reader,
@@ -851,13 +860,24 @@ impl Workbench {
         let phase_started = Instant::now();
         let faces = mesh_faces(&package.mesh);
         let camera = Camera::for_mesh(&package.mesh);
-        let autopilot = Autopilot::for_scene(
-            Bounds2::for_mesh(&package.mesh),
-            fixture,
-            &scene_spec.id,
-            listener.position,
-        );
+        let scene_bounds = Bounds2::for_mesh(&package.mesh);
+        let autopilot =
+            Autopilot::for_scene(scene_bounds, fixture, &scene_spec.id, listener.position);
         let source_height_levels = SourceHeightLevels::for_mesh(&package.mesh);
+        let anomaly_field = FieldController::new(FieldContext::new(
+            package.clone(),
+            scene_mesh.clone(),
+            args.baked.clone(),
+            simulation_config,
+            [scene_bounds.min, scene_bounds.max],
+            capture_static.fixture_content_sha256.clone(),
+            baked.metadata.content_sha256.clone(),
+            format!(
+                "{:?}:dirty={:?}",
+                capture_static.engine_commit, capture_static.engine_dirty
+            ),
+            capture_root.join("anomaly-fields"),
+        ));
         eprintln!(
             "[startup] workbench view preparation: {} ms",
             phase_started.elapsed().as_millis()
@@ -893,6 +913,8 @@ impl Workbench {
             source_height_levels,
             probe_coverage,
             acoustic_telemetry,
+            live_stage_energy,
+            anomaly_field,
             visibility_range,
             startup_started,
             reflection_warmup_started,
@@ -969,11 +991,16 @@ impl Workbench {
     }
 
     fn update_source_position(&mut self, index: usize, position: EnuVector3) {
+        let changed = self.sources[index].position != position;
         self.sources[index].position = position;
         self.source_motion[index].pose.position = position;
         self.output_safety_controller
             .set_source_position(index, position)
             .expect("workbench source positions remain finite");
+        if changed && index == self.anomaly_field.selected_source {
+            self.anomaly_field
+                .invalidate("selected source pose changed");
+        }
     }
 
     fn apply_source_height(&mut self, index: usize, selection: SourceHeight) {
@@ -983,6 +1010,17 @@ impl Workbench {
             .source_height_levels
             .height_m(selection, self.sources[index].street_height_m);
         self.update_source_position(index, position);
+    }
+
+    fn anomaly_source_query(&self, index: usize) -> SourceQuery {
+        let source = &self.sources[index];
+        source_query(
+            &source.id,
+            source.position,
+            source.declared_spl_at_one_meter_db,
+            source.anomaly_descriptor,
+            source.anomaly_asset_identity.clone(),
+        )
     }
 
     fn select_source_comparison(&mut self, source_index: usize, mode: SourceComparisonMode) {
@@ -1066,6 +1104,7 @@ impl Workbench {
             })
             .collect::<Vec<_>>();
         paint_faces(&painter, &mut faces);
+        self.draw_anomaly_overlay(&painter, rect);
         for source in &self.sources {
             self.draw_map_trajectory(&painter, rect, source);
         }
@@ -1094,6 +1133,198 @@ impl Workbench {
                 Stroke::new(2.5, Color32::from_rgb(64, 211, 176)),
             );
         }
+    }
+
+    fn draw_anomaly_overlay(&self, painter: &egui::Painter, rect: Rect) {
+        if !self.anomaly_field.overlay_enabled {
+            return;
+        }
+        let selected = self
+            .anomaly_field
+            .selected_source
+            .min(self.sources.len().saturating_sub(1));
+        let current = self.anomaly_field.identity(
+            &self.anomaly_source_query(selected),
+            self.listener.position.up_m,
+        );
+        let mut mesh = egui::Mesh::default();
+        let mut hovered = None;
+        let pointer = painter.ctx().pointer_hover_pos();
+        if let Some(layer) = &self.anomaly_field.field {
+            let stale = layer.is_stale(&current) || self.anomaly_field.stale_reason().is_some();
+            for cell in &layer.cells {
+                if cell.score <= 0.0 && cell.flags.is_empty() {
+                    continue;
+                }
+                let half = layer.grid.spacing_m * 0.5;
+                let min_east = (cell.position_enu.x - half).max(layer.grid.min_enu[0]);
+                let max_east = (cell.position_enu.x + half).min(layer.grid.max_enu[0]);
+                let min_north = (cell.position_enu.y - half).max(layer.grid.min_enu[1]);
+                let max_north = (cell.position_enu.y + half).min(layer.grid.max_enu[1]);
+                let corners = [
+                    EnuVector3::new(min_east, min_north, cell.position_enu.z),
+                    EnuVector3::new(max_east, min_north, cell.position_enu.z),
+                    EnuVector3::new(max_east, max_north, cell.position_enu.z),
+                    EnuVector3::new(min_east, max_north, cell.position_enu.z),
+                ];
+                let projected = corners.map(|corner| self.camera.project(corner, rect));
+                let [Some(a), Some(b), Some(c), Some(d)] = projected else {
+                    continue;
+                };
+                let color = anomaly_cell_color(*cell, stale);
+                let first = mesh.vertices.len() as u32;
+                for point in [a, b, c, d] {
+                    mesh.colored_vertex(point, color);
+                }
+                mesh.add_triangle(first, first + 1, first + 2);
+                mesh.add_triangle(first, first + 2, first + 3);
+                if let Some(pointer) = pointer
+                    && point_in_quad(pointer, [a, b, c, d])
+                {
+                    hovered = Some(*cell);
+                }
+            }
+        }
+        if let Some(trail) = &self.anomaly_field.trail {
+            for cell in &trail.cells {
+                let center = EnuVector3::new(
+                    cell.position_enu.x,
+                    cell.position_enu.y,
+                    cell.position_enu.z + 0.15,
+                );
+                let half = 1.0;
+                let corners = [
+                    add(center, EnuVector3::new(-half, -half, 0.0)),
+                    add(center, EnuVector3::new(half, -half, 0.0)),
+                    add(center, EnuVector3::new(half, half, 0.0)),
+                    add(center, EnuVector3::new(-half, half, 0.0)),
+                ];
+                let projected = corners.map(|corner| self.camera.project(corner, rect));
+                let [Some(a), Some(b), Some(c), Some(d)] = projected else {
+                    continue;
+                };
+                let color = anomaly_cell_color(*cell, false);
+                let first = mesh.vertices.len() as u32;
+                for point in [a, b, c, d] {
+                    mesh.colored_vertex(point, color);
+                }
+                mesh.add_triangle(first, first + 1, first + 2);
+                mesh.add_triangle(first, first + 2, first + 3);
+            }
+        }
+        if !mesh.vertices.is_empty() {
+            painter.add(egui::Shape::mesh(mesh));
+            let stale = self.anomaly_field.stale_reason().is_some()
+                || self
+                    .anomaly_field
+                    .field
+                    .as_ref()
+                    .is_some_and(|layer| layer.is_stale(&current));
+            painter.text(
+                rect.left_bottom() + egui::vec2(8.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                if stale {
+                    "SHADOW + WEAK PATH · STALE"
+                } else {
+                    "SHADOW + WEAK PATH · LIVE TRAIL"
+                },
+                egui::FontId::monospace(9.0),
+                if stale {
+                    Color32::from_rgb(255, 172, 90)
+                } else {
+                    Color32::from_rgb(182, 202, 211)
+                },
+            );
+        }
+        if let Some(cell) = hovered {
+            painter.text(
+                rect.left_top() + egui::vec2(8.0, 24.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "ENU {:.1}, {:.1}, {:.1} · loss {:.1} dB · path {:.1} dB · free {:.1} dB · {}",
+                    cell.position_enu.x,
+                    cell.position_enu.y,
+                    cell.position_enu.z,
+                    cell.direct_loss_db,
+                    cell.path_strength_db,
+                    cell.free_field_db,
+                    anomaly_ids(cell),
+                ),
+                egui::FontId::monospace(9.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    fn anomaly_field_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Anomaly field");
+        ui.checkbox(
+            &mut self.anomaly_field.overlay_enabled,
+            "Show SHADOW + WEAK PATH",
+        );
+        let previous_source = self.anomaly_field.selected_source;
+        ui.horizontal(|ui| {
+            ui.label("source");
+            egui::ComboBox::from_id_salt("anomaly-field-source")
+                .selected_text(&self.sources[self.anomaly_field.selected_source].id)
+                .show_ui(ui, |ui| {
+                    for (index, source) in self.sources.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.anomaly_field.selected_source,
+                            index,
+                            &source.id,
+                        );
+                    }
+                });
+        });
+        if self.anomaly_field.selected_source != previous_source {
+            self.anomaly_field.invalidate("selected source changed");
+        }
+        let previous_spacing = self.anomaly_field.spacing_m;
+        ui.horizontal(|ui| {
+            ui.label("grid spacing");
+            ui.add(
+                egui::DragValue::new(&mut self.anomaly_field.spacing_m)
+                    .range(2.0..=32.0)
+                    .speed(1.0)
+                    .suffix(" m"),
+            );
+            if ui.button("Run proxy sweep").clicked() {
+                let source = self.anomaly_source_query(self.anomaly_field.selected_source);
+                self.anomaly_field
+                    .start_sweep(source, self.listener.position.up_m);
+            }
+        });
+        if self.anomaly_field.spacing_m.to_bits() != previous_spacing.to_bits() {
+            self.anomaly_field.invalidate("grid spacing changed");
+        }
+        ui.checkbox(
+            &mut self.anomaly_field.trail_enabled,
+            "Record persistent live trail (5 Hz)",
+        );
+        ui.checkbox(
+            &mut self.anomaly_field.adaptive_enabled,
+            "Densify near occlusion transitions (≤5 samples/s)",
+        );
+        ui.monospace(&self.anomaly_field.status);
+        if let Some(field) = &self.anomaly_field.field {
+            ui.small(format!(
+                "proxy {}×{} · {} cells · sequential risk ramp",
+                field.grid.width(),
+                field.grid.height(),
+                field.cells.len()
+            ));
+        }
+        if let Some(trail) = &self.anomaly_field.trail {
+            ui.small(format!(
+                "trail {} samples · {} adaptive",
+                trail.cells.len(),
+                trail.adaptive_cells
+            ));
+        }
+        ui.small(
+            "Warm = deep shadow + weak baked fill; magenta = computation anomaly. This is a susceptibility proxy, not reflected-energy measurement.",
+        );
     }
 
     fn draw_first_person(&self, painter: &egui::Painter, rect: Rect) {
@@ -1427,6 +1658,8 @@ impl Workbench {
             "yaw  {:6.1}°",
             self.listener.yaw_radians.to_degrees()
         ));
+        ui.separator();
+        self.anomaly_field_panel(ui);
         ui.separator();
         ui.heading("Output safety");
         let mix_controls_enabled = matches!(self.capture_state, CaptureUiState::Idle);
@@ -1784,6 +2017,21 @@ impl Workbench {
     fn update_ui(&mut self, ctx: &egui::Context) {
         self.update_source_motion();
         self.refresh_acoustic_state();
+        self.anomaly_field.poll();
+        let selected = self
+            .anomaly_field
+            .selected_source
+            .min(self.sources.len().saturating_sub(1));
+        let source = self.anomaly_source_query(selected);
+        let acoustic = self.sources[selected].acoustic;
+        let energy = self.live_stage_energy.read();
+        self.anomaly_field.observe_live(
+            Instant::now(),
+            self.listener.position,
+            source,
+            acoustic,
+            energy,
+        );
         self.update_capture_lifecycle();
         egui::SidePanel::right("performance")
             .resizable(true)
@@ -2513,6 +2761,59 @@ fn picture_in_picture_rect(container: Rect) -> Rect {
         ),
         size,
     )
+}
+
+fn anomaly_cell_color(cell: fightbox_steam_audio::ProxyCell, stale: bool) -> Color32 {
+    let computation = [
+        fightbox_steam_audio::AnomalyClass::InvalidEnergy,
+        fightbox_steam_audio::AnomalyClass::InvalidCoefficient,
+        fightbox_steam_audio::AnomalyClass::NeighborSpike,
+        fightbox_steam_audio::AnomalyClass::ExcessiveDiscontinuity,
+        fightbox_steam_audio::AnomalyClass::ZeroPathWithCoverage,
+        fightbox_steam_audio::AnomalyClass::ReflectionEnergyExcess,
+    ]
+    .into_iter()
+    .any(|class| cell.flags.contains(class));
+    let alpha_scale = if stale { 0.35 } else { 1.0 };
+    if computation {
+        return Color32::from_rgba_unmultiplied(232, 72, 196, (170.0 * alpha_scale) as u8);
+    }
+    let risk = cell.score.clamp(0.0, 1.0);
+    let red = (214.0 + 41.0 * risk) as u8;
+    let green = (178.0 - 112.0 * risk) as u8;
+    Color32::from_rgba_unmultiplied(red, green, 48, ((28.0 + risk * 120.0) * alpha_scale) as u8)
+}
+
+fn anomaly_ids(cell: fightbox_steam_audio::ProxyCell) -> String {
+    let ids = fightbox_steam_audio::AnomalyClass::ALL
+        .into_iter()
+        .filter(|class| cell.flags.contains(*class))
+        .map(fightbox_steam_audio::AnomalyClass::id)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        "no flags".into()
+    } else {
+        ids.join(", ")
+    }
+}
+
+fn point_in_quad(point: Pos2, quad: [Pos2; 4]) -> bool {
+    let mut sign = 0.0_f32;
+    for index in 0..4 {
+        let start = quad[index];
+        let end = quad[(index + 1) % 4];
+        let cross =
+            (end.x - start.x) * (point.y - start.y) - (end.y - start.y) * (point.x - start.x);
+        if cross.abs() <= f32::EPSILON {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
