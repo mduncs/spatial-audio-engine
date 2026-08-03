@@ -937,7 +937,9 @@ mod tests {
         assert_eq!(fixture.sources[0].extent, ExtentDescriptor::Point);
         assert_eq!(fixture.sources[1].asset_id, "artillery-impact");
         assert_eq!(fixture.sources[1].reference_level.db_spl, 155.0);
-        assert!(fixture.sources[1].default_enabled);
+        // Launch default (md, 2026-08-02): only Tom's Diner starts enabled;
+        // everything else is opt-in via checkbox or a saved mix-defaults file.
+        assert!(!fixture.sources[1].default_enabled);
         assert_eq!(
             fixture.sources[1].directivity,
             FixtureDirectivity::default()
@@ -952,7 +954,7 @@ mod tests {
         );
         assert_eq!(fixture.sources[2].asset_id, "ff-siren");
         assert_eq!(fixture.sources[2].reference_level.db_spl, 118.0);
-        assert!(fixture.sources[2].default_enabled);
+        assert!(!fixture.sources[2].default_enabled);
         assert_eq!(
             fixture.sources[2].directivity,
             FixtureDirectivity {
@@ -971,7 +973,7 @@ mod tests {
         );
         assert_eq!(fixture.sources[3].asset_id, "church-bells");
         assert_eq!(fixture.sources[3].reference_level.db_spl, 115.0);
-        assert!(fixture.sources[3].default_enabled);
+        assert!(!fixture.sources[3].default_enabled);
         assert_eq!(
             fixture.sources[3].directivity,
             FixtureDirectivity::default()
@@ -982,6 +984,7 @@ mod tests {
             EnuVector3::new(482.5, 292.5, 60.0)
         );
         assert_eq!(fixture.sources[4].id, "dshk-street-gun");
+        assert!(!fixture.sources[4].default_enabled);
         assert_eq!(fixture.sources[4].asset_id, "squad-dshk-burst-loop");
         assert_eq!(fixture.sources[4].reference_level.db_spl, 154.0);
         assert_eq!(

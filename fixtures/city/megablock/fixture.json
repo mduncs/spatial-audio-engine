@@ -28,6 +28,7 @@
     },
     {
       "id": "artillery-sw-map-corner",
+      "default_enabled": false,
       "asset_id": "artillery-impact",
       "reference_level": {
         "mode": "SplAtOneMeter",
@@ -45,6 +46,7 @@
     },
     {
       "id": "siren-circling-center-block",
+      "default_enabled": false,
       "asset_id": "ff-siren",
       "reference_level": {
         "mode": "SplAtOneMeter",
@@ -67,6 +69,7 @@
     },
     {
       "id": "bell-two-blocks-east",
+      "default_enabled": false,
       "asset_id": "church-bells",
       "reference_level": {
         "mode": "SplAtOneMeter",
@@ -80,6 +83,7 @@
     },
     {
       "id": "dshk-street-gun",
+      "default_enabled": false,
       "asset_id": "squad-dshk-burst-loop",
       "reference_level": {
         "mode": "SplAtOneMeter",
