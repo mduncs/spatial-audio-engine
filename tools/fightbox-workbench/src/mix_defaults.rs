@@ -22,6 +22,17 @@ pub(crate) struct SourceMixDefault {
     pub(crate) muted: bool,
     pub(crate) soloed: bool,
     pub(crate) monitor_offset_db: f32,
+    #[serde(default)]
+    pub(crate) height: SourceHeightDefault,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceHeightDefault {
+    #[default]
+    Street,
+    Medium,
+    AboveRooves,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +139,7 @@ mod tests {
                     muted: false,
                     soloed: true,
                     monitor_offset_db: -6.0,
+                    height: SourceHeightDefault::Medium,
                 },
                 SourceMixDefault {
                     id: "stale-id".into(),
@@ -135,6 +147,7 @@ mod tests {
                     muted: true,
                     soloed: false,
                     monitor_offset_db: 8.0,
+                    height: SourceHeightDefault::AboveRooves,
                 },
             ],
         }
@@ -159,9 +172,49 @@ mod tests {
         let resolved = parsed.resolve(["bells".to_owned(), "siren".to_owned()]);
         assert_eq!(resolved.monitor_gain_db, -7.5);
         assert_eq!(resolved.sources["bells"].monitor_offset_db, -6.0);
+        assert_eq!(
+            resolved.sources["bells"].height,
+            SourceHeightDefault::Medium
+        );
         assert_eq!(resolved.ignored_source_ids, ["stale-id"]);
 
         std::fs::remove_file(expected_path).unwrap();
+    }
+
+    #[test]
+    fn version_one_sidecars_without_height_keep_the_street_default() {
+        let parsed: MixDefaults = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "monitor_gain_db": 0.0,
+                "sources": [{
+                    "id": "moving-source",
+                    "enabled": true,
+                    "muted": false,
+                    "soloed": false,
+                    "monitor_offset_db": 0.0
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        parsed.validate().unwrap();
+        assert_eq!(parsed.sources[0].height, SourceHeightDefault::Street);
+    }
+
+    #[test]
+    fn source_heights_use_the_stable_sidecar_strings() {
+        for (height, expected) in [
+            (SourceHeightDefault::Street, r#""street""#),
+            (SourceHeightDefault::Medium, r#""medium""#),
+            (SourceHeightDefault::AboveRooves, r#""above_rooves""#),
+        ] {
+            assert_eq!(serde_json::to_string(&height).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_str::<SourceHeightDefault>(expected).unwrap(),
+                height
+            );
+        }
     }
 
     #[test]

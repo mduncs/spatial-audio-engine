@@ -43,7 +43,7 @@ use crate::fixture::{
     load_baked, occlusion_mode_for_extent, scene_mesh,
 };
 use crate::mix_defaults::{
-    MAX_SOURCE_OFFSET_DB, MIN_SOURCE_OFFSET_DB, MixDefaults, SourceMixDefault,
+    MAX_SOURCE_OFFSET_DB, MIN_SOURCE_OFFSET_DB, MixDefaults, SourceHeightDefault, SourceMixDefault,
     clamp_source_offset_db,
 };
 use crate::pose::{ListenerControl, PoseMailbox};
@@ -452,6 +452,26 @@ impl SourceHeight {
             Self::Street => "street",
             Self::Medium => "medium",
             Self::AboveRooves => "above rooves",
+        }
+    }
+}
+
+impl From<SourceHeightDefault> for SourceHeight {
+    fn from(height: SourceHeightDefault) -> Self {
+        match height {
+            SourceHeightDefault::Street => Self::Street,
+            SourceHeightDefault::Medium => Self::Medium,
+            SourceHeightDefault::AboveRooves => Self::AboveRooves,
+        }
+    }
+}
+
+impl From<SourceHeight> for SourceHeightDefault {
+    fn from(height: SourceHeight) -> Self {
+        match height {
+            SourceHeight::Street => Self::Street,
+            SourceHeight::Medium => Self::Medium,
+            SourceHeight::AboveRooves => Self::AboveRooves,
         }
     }
 }
@@ -942,10 +962,12 @@ impl Workbench {
             });
         }
         // User mix defaults are resolved only after calibrated profiles and
-        // backend descriptors are complete. They can affect playback controls,
-        // never the fixture's physical source declarations.
+        // backend descriptors are complete. They never alter the fixture's
+        // calibrated source declarations; saved heights are applied to runtime
+        // positions through the same control path as a UI selection below.
         let mut monitor_gain_db = OutputSafetyConfig::DEFAULT_MONITOR_GAIN_DB;
         let mut mix_defaults_status = None;
+        let mut saved_source_heights = Vec::new();
         match MixDefaults::read(&scene_spec.path) {
             Ok(Some(defaults)) => {
                 let valid_source_ids = fixture
@@ -961,7 +983,7 @@ impl Workbench {
                     }));
                 let resolved = defaults.resolve(valid_source_ids);
                 monitor_gain_db = resolved.monitor_gain_db;
-                for source in &mut source_views {
+                for (index, source) in source_views.iter_mut().enumerate() {
                     if let Some(saved) = resolved.sources.get(&source.id) {
                         if source.event_role.is_none() {
                             source.enabled = saved.enabled;
@@ -969,6 +991,7 @@ impl Workbench {
                         source.muted = saved.muted;
                         source.soloed = saved.soloed;
                         source.monitor_offset_db = saved.monitor_offset_db;
+                        saved_source_heights.push((index, saved.height.into()));
                     }
                 }
                 mix_defaults_status = if resolved.ignored_source_ids.is_empty() {
@@ -1173,6 +1196,9 @@ impl Workbench {
             transient_event_scene: mode.is_ballistic_transient(),
             scene_action: None,
         };
+        for (index, height) in saved_source_heights {
+            workbench.apply_source_height(index, height);
+        }
         if mode.is_ballistic_transient() {
             workbench.trigger_ballistic_event(initial_listener.pose.position)?;
         }
@@ -1782,6 +1808,7 @@ impl Workbench {
                     muted: source.muted,
                     soloed: source.soloed,
                     monitor_offset_db: source.monitor_offset_db,
+                    height: source.height.into(),
                 })
                 .collect(),
         };
@@ -3524,27 +3551,17 @@ mod tests {
         let steady = SceneBuildMode::Steady {
             listener_override: None,
         };
-        let transient = SceneBuildMode::BallisticTransient {
-            listener: ListenerControl::at(
-                EnuVector3::new(292.5, 330.0, 1.5),
-                EnuVector3::new(0.0, 1.0, 0.0),
-            ),
-            omitted_source_ids: vec![
-                "fob-radio-checkpoint".into(),
-                "camo-net-flap-checkpoint".into(),
-            ],
-        };
 
+        // The production fixtures are eventless as of the burst-loop gunfire
+        // change; ballistic-transient slot planning is covered by tests that
+        // carry their own event-bearing fixture.
         let megablock_ids = planned_physical_source_ids(&megablock, &steady);
         let checkpoint_ids = planned_physical_source_ids(&checkpoint, &steady);
-        let transient_ids = planned_physical_source_ids(&checkpoint, &transient);
-        assert_eq!(megablock_ids.len(), 6);
-        assert_eq!(checkpoint_ids.len(), 8);
-        assert_eq!(transient_ids.len(), 8);
-        assert!(transient_ids.contains(&"checkpoint-m2-shot-crack".into()));
-        assert!(transient_ids.contains(&"checkpoint-m2-shot-blast".into()));
-        assert!(!transient_ids.contains(&"fob-radio-checkpoint".into()));
-        assert!(!transient_ids.contains(&"camo-net-flap-checkpoint".into()));
+        assert_eq!(megablock_ids.len(), 5);
+        assert_eq!(checkpoint_ids.len(), 5);
+        assert!(megablock_ids.contains(&"dshk-street-gun".into()));
+        assert!(checkpoint_ids.contains(&"m2-checkpoint-gun".into()));
+        assert!(checkpoint_ids.contains(&"dshk-return-fire".into()));
 
         let mut slots = SceneSlotState::default();
         slots.replace(megablock_ids.clone());
@@ -3815,6 +3832,22 @@ mod tests {
             elapsed.as_secs_f64() * 1_000.0 / 30.0
         );
         assert_eq!(index_count, 4_096 * 3);
+    }
+
+    #[test]
+    fn every_source_height_selector_uses_the_same_three_options() {
+        assert_eq!(
+            SourceHeight::ALL,
+            [
+                SourceHeight::Street,
+                SourceHeight::Medium,
+                SourceHeight::AboveRooves,
+            ]
+        );
+        assert_eq!(
+            SourceHeight::ALL.map(SourceHeight::label),
+            ["street", "medium", "above rooves"]
+        );
     }
 
     #[test]

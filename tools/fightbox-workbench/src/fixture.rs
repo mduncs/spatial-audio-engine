@@ -921,22 +921,9 @@ mod tests {
             fixture.sources[0].initial_position().unwrap(),
             EnuVector3::new(292.5, 292.5, 1.5)
         );
-        assert_eq!(fixture.sources.len(), 4);
-        assert_eq!(fixture.declared_source_count(), 6);
-        assert_eq!(fixture.events.len(), 1);
-        let shot = fixture.events[0].ballistic_shot();
-        assert_eq!(shot.id, "megablock-supersonic-shot");
-        assert_eq!(shot.trigger_key, FixtureTriggerKey::Space);
-        assert_eq!(shot.muzzle_m, [30.0, 288.0, 1.5]);
-        assert_eq!(shot.direction_enu, [1.0, 0.0, 0.0]);
-        assert_eq!(shot.mach, 2.5);
-        assert_eq!(shot.asset_id, "artillery-impact");
-        assert_eq!(shot.levels.blast_spl_at_one_meter_db, 155.0);
-        assert_eq!(shot.levels.crack_over_blast_db_at_30_m, 3.0);
-        assert_eq!(shot.event_sources.crack.id, "megablock-shot-crack");
-        assert!(!shot.event_sources.crack.default_active);
-        assert_eq!(shot.event_sources.blast.id, "megablock-shot-blast");
-        assert!(!shot.event_sources.blast.default_active);
+        assert_eq!(fixture.sources.len(), 5);
+        assert_eq!(fixture.declared_source_count(), 5);
+        assert!(fixture.events.is_empty());
         assert!(fixture.sources[0].default_enabled);
         assert_eq!(fixture.sources[0].reference_level.db_spl, 105.0);
         assert_eq!(
@@ -994,8 +981,61 @@ mod tests {
             fixture.sources[3].initial_position().unwrap(),
             EnuVector3::new(482.5, 292.5, 60.0)
         );
+        assert_eq!(fixture.sources[4].id, "dshk-street-gun");
+        assert_eq!(fixture.sources[4].asset_id, "squad-dshk-burst-loop");
+        assert_eq!(fixture.sources[4].reference_level.db_spl, 154.0);
+        assert_eq!(
+            fixture.sources[4].extent,
+            ExtentDescriptor::LineSegment { length_m: 2.0 }
+        );
+        assert_eq!(
+            fixture.sources[4].initial_position().unwrap(),
+            EnuVector3::new(30.0, 288.0, 1.5)
+        );
         let text = std::fs::read_to_string(fixture_path).unwrap();
         assert!(text.contains("4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843"));
+    }
+
+    #[test]
+    fn test_local_ballistic_event_keeps_event_schema_coverage() {
+        let original = include_str!("../../../fixtures/city/megablock/fixture.json");
+        let event = r#""events": [{
+    "id": "test-supersonic-shot",
+    "kind": "ballistic_shot",
+    "trigger_key": "space",
+    "event_sources": {
+      "crack": {"id": "test-shot-crack", "default_active": false},
+      "blast": {"id": "test-shot-blast", "default_active": false}
+    },
+    "muzzle_m": [30.0, 288.0, 1.5],
+    "direction_enu": [1.0, 0.0, 0.0],
+    "mach": 2.5,
+    "asset_id": "artillery-impact",
+    "levels": {
+      "blast_spl_at_one_meter_db": 155.0,
+      "crack_over_blast_db_at_30_m": 3.0
+    }
+  }],
+  "#;
+        let text = original.replace(r#""listener": {"#, &format!("{event}\"listener\": {{"));
+        let fixture = Fixture::parse(text.as_bytes(), "test-local-ballistic-event").unwrap();
+
+        assert_eq!(fixture.events.len(), 1);
+        assert_eq!(fixture.declared_source_count(), 7);
+        assert!(!fixture.event_requires_transient_rebuild());
+        let shot = fixture.events[0].ballistic_shot();
+        assert_eq!(shot.id, "test-supersonic-shot");
+        assert_eq!(shot.trigger_key, FixtureTriggerKey::Space);
+        assert_eq!(shot.muzzle_m, [30.0, 288.0, 1.5]);
+        assert_eq!(shot.direction_enu, [1.0, 0.0, 0.0]);
+        assert_eq!(shot.mach, 2.5);
+        assert_eq!(shot.asset_id, "artillery-impact");
+        assert_eq!(shot.levels.blast_spl_at_one_meter_db, 155.0);
+        assert_eq!(shot.levels.crack_over_blast_db_at_30_m, 3.0);
+        assert_eq!(shot.event_sources.crack.id, "test-shot-crack");
+        assert!(!shot.event_sources.crack.default_active);
+        assert_eq!(shot.event_sources.blast.id, "test-shot-blast");
+        assert!(!shot.event_sources.blast.default_active);
     }
 
     #[test]
@@ -1005,10 +1045,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixture.fixture_id.as_deref(), Some("checkpoint-block"));
-        assert_eq!(fixture.sources.len(), 8);
-        assert_eq!(fixture.events.len(), 1);
-        assert_eq!(fixture.declared_source_count(), 8);
-        assert!(fixture.event_requires_transient_rebuild());
+        assert_eq!(fixture.sources.len(), 5);
+        assert!(fixture.events.is_empty());
+        assert_eq!(fixture.declared_source_count(), 5);
+        assert!(!fixture.event_requires_transient_rebuild());
         assert_eq!(
             fixture.initial_listener_position().unwrap(),
             EnuVector3::new(197.5, 292.5, 1.5)
@@ -1028,13 +1068,10 @@ mod tests {
 
         let expected = [
             ("abrams-idle-checkpoint", "squad-abrams-idle", 90.0),
-            ("ural-truck-idle-north", "squad-ural-idle", 84.0),
-            ("generator-parallel-street", "squad-generator-diesel", 84.0),
-            ("burning-car-west-leg", "squad-fire-car", 85.0),
-            ("building-fire-far-east", "squad-fire-building-large", 96.0),
             ("fob-radio-checkpoint", "squad-fob-radio-static", 70.0),
-            ("camo-net-flap-checkpoint", "squad-camo-tent-flap", 65.0),
             ("mi8-orbit", "squad-mi8-rotor-close", 126.0),
+            ("m2-checkpoint-gun", "squad-m2-burst-loop", 153.0),
+            ("dshk-return-fire", "squad-dshk-burst-loop", 154.0),
         ];
         for (source, (id, asset_id, spl)) in fixture.sources.iter().zip(expected) {
             assert_eq!(source.id, id);
@@ -1045,12 +1082,28 @@ mod tests {
             fixture.sources[0].extent,
             ExtentDescriptor::LineSegment { length_m: 8.0 }
         );
+        assert_eq!(fixture.sources[1].extent, ExtentDescriptor::Point);
+        // Mi-8: 21 m extent models the rotor disc as a 10.5 m occlusion
+        // sphere so building shadowing is gradual, not a 1 m point gate.
         assert_eq!(
-            fixture.sources[4].extent,
-            ExtentDescriptor::LineSegment { length_m: 12.0 }
+            fixture.sources[2].extent,
+            ExtentDescriptor::LineSegment { length_m: 21.0 }
         );
-        assert_eq!(fixture.sources[5].extent, ExtentDescriptor::Point);
-        let orbit = fixture.sources[7].trajectory.as_ref().unwrap();
+        for source in &fixture.sources[3..] {
+            assert_eq!(
+                source.extent,
+                ExtentDescriptor::LineSegment { length_m: 2.0 }
+            );
+        }
+        assert_eq!(
+            fixture.sources[3].initial_position().unwrap(),
+            EnuVector3::new(289.0, 102.5, 2.0)
+        );
+        assert_eq!(
+            fixture.sources[4].initial_position().unwrap(),
+            EnuVector3::new(292.5, 342.5, 2.0)
+        );
+        let orbit = fixture.sources[2].trajectory.as_ref().unwrap();
         assert_eq!(orbit.speed_mps, 30.0);
         assert_eq!(orbit.max_speed_mps, Some(30.0));
         assert_eq!(
@@ -1062,15 +1115,6 @@ mod tests {
                 [102.5, 482.5, 55.0],
             ]
         );
-
-        let shot = fixture.events[0].ballistic_shot();
-        assert_eq!(shot.id, "checkpoint-m2-shot");
-        assert_eq!(shot.muzzle_m, [289.0, 102.5, 2.0]);
-        assert_eq!(shot.direction_enu, [0.0, 1.0, 0.0]);
-        assert_eq!(shot.mach, 2.6);
-        assert_eq!(shot.asset_id, "squad-m2-blast");
-        assert_eq!(shot.levels.blast_spl_at_one_meter_db, 155.0);
-        assert_eq!(shot.levels.crack_over_blast_db_at_30_m, 3.0);
     }
 
     #[test]

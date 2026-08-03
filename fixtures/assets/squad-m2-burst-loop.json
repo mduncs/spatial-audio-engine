@@ -1,0 +1,29 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-m2-burst-loop",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-m2-burst-loop.wav",
+      "sha256": "b284d05165a539f674f9c4d8358fc4bf9dc080b7b6a5510058ed59035a1e75b4",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 26.400833333,
+  "target_rms_dbfs": -22.036692,
+  "expected_reference_rms_dbfs": -20.558544,
+  "calibration": {
+    "applied_gain_db": -1.478147
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of Squad v8.1 game assets; this descriptor grants no right to redistribute audio bytes.",
+    "The fixed offline M2 composition uses close third-person Default/Initial round slices and tails only; Mid, Far, and Echo_Close layers are excluded because the engine supplies distance and reflection effects.",
+    "The fixture's 153 dB SplAtOneMeter steady-source control is anchored to the 153 dB M2 HB .50-cal impulse-noise value in U.S. Army ATP 4-25.12, Unit Field Sanitation Teams, 30 April 2014, chapter 10: https://rdl.train.army.mil/catalog-ws/view/100.ATSC/6FDDE4EE-4362-464B-AEA0-1EC3A3D90D88-1399551821430/atp4_25x12.pdf",
+    "Peak-to-reference rationale: the cited per-shot operator peak is used directly as a conservative steady-source scene anchor; it is not a claim that the loop has a continuous physical SPL or that its duty-cycle energy was measured."
+  ]
+}

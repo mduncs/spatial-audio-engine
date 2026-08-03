@@ -77,39 +77,23 @@
         292.5,
         60.0
       ]
-    }
-  ],
-  "events": [
+    },
     {
-      "id": "megablock-supersonic-shot",
-      "kind": "ballistic_shot",
-      "trigger_key": "space",
-      "event_sources": {
-        "crack": {
-          "id": "megablock-shot-crack",
-          "default_active": false
-        },
-        "blast": {
-          "id": "megablock-shot-blast",
-          "default_active": false
-        }
+      "id": "dshk-street-gun",
+      "asset_id": "squad-dshk-burst-loop",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 154
       },
-      "muzzle_m": [
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 2.0
+      },
+      "position_m": [
         30.0,
         288.0,
         1.5
-      ],
-      "direction_enu": [
-        1.0,
-        0.0,
-        0.0
-      ],
-      "mach": 2.5,
-      "asset_id": "artillery-impact",
-      "levels": {
-        "blast_spl_at_one_meter_db": 155.0,
-        "crack_over_blast_db_at_30_m": 3.0
-      }
+      ]
     }
   ],
   "listener": {
@@ -195,9 +179,9 @@
         ],
         "scattering": 0.1,
         "transmission": [
-          0.0,
-          0.0,
-          0.0
+          0.0251,
+          0.00562,
+          0.00178
         ]
       }
     }
@@ -258,6 +242,7 @@
       "The moving siren follows its four waypoints as a closed cycle at 8 m/s; after the last waypoint it traverses the closing segment back to the first.",
       "The static bell is two 95 m grid pitches east of the central Tom's Diner source and elevated to 60 m, above the nearby 26–38 m rooftops and inside the 63 m probe layer's influence shell.",
       "The artillery source sits at the southwest-most interior street intersection [102.5, 102.5, 1.5], roughly 212 m from the listener spawn, inside the compiled mesh bounds so reflections and pathing have surrounding geometry; the map-edge intersection [7.5, 7.5] lies outside the building mesh and produces no reflected energy.",
+      "The DShK at the former ballistic muzzle [30.0, 288.0, 1.5] is an ordinary fixed offline-composed burst-loop WAV source; there is no space-triggered ballistic event in this fixture.",
       "The local metre coordinate frame is shared byte-for-byte in meaning by city synth, city compile, city render, and the workbench."
     ],
     "non_claims": [

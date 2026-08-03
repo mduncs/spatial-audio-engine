@@ -220,7 +220,12 @@ impl OutputSafetyConfig {
     pub const DEFAULT_SCENE_SPL_CEILING_DB: f32 = 130.0;
     pub const DEFAULT_SCENE_SPL_KNEE_WIDTH_DB: f32 = 12.0;
     pub const DEFAULT_SOURCE_RADIUS_M: f32 = ONE_METER;
-    pub const DEFAULT_MONITOR_GAIN_DB: f32 = 0.0;
+    // +30 dB monitor default (md, 2026-08-02): the physically calibrated
+    // anchor (120 dB SPL -> -24 dBFS) leaves everyday 60-90 dB SPL ambience
+    // at -84..-54 dBFS, which is too quiet for normal playback chains. +30
+    // re-anchors full scale to ~114 dB SPL for monitoring; the safety
+    // limiter still owns the ceiling. Saved mix-defaults sidecars override.
+    pub const DEFAULT_MONITOR_GAIN_DB: f32 = 30.0;
 
     pub fn validate(self) -> Result<(), OutputSafetyConfigError> {
         if !self.scene_spl_ceiling_db.is_finite() {

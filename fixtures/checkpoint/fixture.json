@@ -31,74 +31,6 @@
       ]
     },
     {
-      "id": "ural-truck-idle-north",
-      "asset_id": "squad-ural-idle",
-      "reference_level": {
-        "mode": "SplAtOneMeter",
-        "db_spl": 84
-      },
-      "extent": {
-        "kind": "line_segment",
-        "length_m": 6.0
-      },
-      "position_m": [
-        292.5,
-        387.5,
-        1.5
-      ]
-    },
-    {
-      "id": "generator-parallel-street",
-      "asset_id": "squad-generator-diesel",
-      "reference_level": {
-        "mode": "SplAtOneMeter",
-        "db_spl": 84
-      },
-      "extent": {
-        "kind": "line_segment",
-        "length_m": 3.0
-      },
-      "position_m": [
-        197.5,
-        340.0,
-        1.5
-      ]
-    },
-    {
-      "id": "burning-car-west-leg",
-      "asset_id": "squad-fire-car",
-      "reference_level": {
-        "mode": "SplAtOneMeter",
-        "db_spl": 85
-      },
-      "extent": {
-        "kind": "line_segment",
-        "length_m": 4.0
-      },
-      "position_m": [
-        245.0,
-        292.5,
-        1.5
-      ]
-    },
-    {
-      "id": "building-fire-far-east",
-      "asset_id": "squad-fire-building-large",
-      "reference_level": {
-        "mode": "SplAtOneMeter",
-        "db_spl": 96
-      },
-      "extent": {
-        "kind": "line_segment",
-        "length_m": 12.0
-      },
-      "position_m": [
-        482.5,
-        387.5,
-        8.0
-      ]
-    },
-    {
       "id": "fob-radio-checkpoint",
       "asset_id": "squad-fob-radio-static",
       "reference_level": {
@@ -115,22 +47,6 @@
       ]
     },
     {
-      "id": "camo-net-flap-checkpoint",
-      "asset_id": "squad-camo-tent-flap",
-      "reference_level": {
-        "mode": "SplAtOneMeter",
-        "db_spl": 65
-      },
-      "extent": {
-        "kind": "point"
-      },
-      "position_m": [
-        298.0,
-        288.5,
-        3.0
-      ]
-    },
-    {
       "id": "mi8-orbit",
       "asset_id": "squad-mi8-rotor-close",
       "reference_level": {
@@ -138,7 +54,8 @@
         "db_spl": 126
       },
       "extent": {
-        "kind": "point"
+        "kind": "line_segment",
+        "length_m": 21.0
       },
       "trajectory": {
         "waypoints_m": [
@@ -150,39 +67,40 @@
         "speed_mps": 30.0,
         "max_speed_mps": 30.0
       }
-    }
-  ],
-  "events": [
+    },
     {
-      "id": "checkpoint-m2-shot",
-      "kind": "ballistic_shot",
-      "trigger_key": "space",
-      "event_sources": {
-        "crack": {
-          "id": "checkpoint-m2-shot-crack",
-          "default_active": false
-        },
-        "blast": {
-          "id": "checkpoint-m2-shot-blast",
-          "default_active": false
-        }
+      "id": "m2-checkpoint-gun",
+      "asset_id": "squad-m2-burst-loop",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 153
       },
-      "muzzle_m": [
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 2.0
+      },
+      "position_m": [
         289.0,
         102.5,
         2.0
-      ],
-      "direction_enu": [
-        0.0,
-        1.0,
-        0.0
-      ],
-      "mach": 2.6,
-      "asset_id": "squad-m2-blast",
-      "levels": {
-        "blast_spl_at_one_meter_db": 155.0,
-        "crack_over_blast_db_at_30_m": 3.0
-      }
+      ]
+    },
+    {
+      "id": "dshk-return-fire",
+      "asset_id": "squad-dshk-burst-loop",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 154
+      },
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 2.0
+      },
+      "position_m": [
+        292.5,
+        342.5,
+        2.0
+      ]
     }
   ],
   "listener": {
@@ -257,9 +175,9 @@
         ],
         "scattering": 0.1,
         "transmission": [
-          0.0,
-          0.0,
-          0.0
+          0.0251,
+          0.00562,
+          0.00178
         ]
       }
     }
@@ -316,8 +234,8 @@
   "expected": {
     "properties": [
       "The listener follows a four-leg closed loop through the megablock streets at 1.5 m/s, returning from the final waypoint to the first.",
-      "Eight ordinary sources fill the workbench fixture cap; the Mi-8 follows its four-waypoint square orbit at 30 m/s and 55 m elevation.",
-      "Space triggers the checkpoint M2 event at Mach 2.6; the crack is synthesized by the engine and squad-m2-blast supplies only the muzzle blast.",
+      "Five ordinary sources run continuously under the workbench fixture cap; the Mi-8 follows its four-waypoint square orbit at 30 m/s and 55 m elevation.",
+      "The M2 at [289.0, 102.5, 2.0] and opposing DShK at [292.5, 342.5, 2.0] use fixed offline-composed burst-loop WAV assets; there is no space-triggered ballistic event in this fixture.",
       "The geometry, materials, simulation settings, probe volume, and megablock-city-bake-v1 identity match the megablock-walk fixture."
     ],
     "non_claims": [

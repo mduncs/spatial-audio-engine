@@ -846,7 +846,18 @@ mod tests {
             block_size_frames: block_size,
             ..EngineConfig::default()
         };
-        (writer, RuntimeGraph::new(config, reader).unwrap())
+        // Pin the monitor gain to unity: these tests assert render mechanics
+        // (calibrated drive, slew bounds, limiter behavior) and must not
+        // depend on the tunable DEFAULT_MONITOR_GAIN_DB monitoring default.
+        let (_, output_safety_reader) = OutputSafetyPublication::new(OutputSafetyConfig {
+            monitor_gain_db: 0.0,
+            ..OutputSafetyConfig::default()
+        })
+        .unwrap();
+        (
+            writer,
+            RuntimeGraph::new_with_output_safety(config, reader, output_safety_reader).unwrap(),
+        )
     }
 
     #[test]
@@ -901,7 +912,12 @@ mod tests {
         let (mut propagation_writer, propagation_reader) =
             SnapshotPublication::new(PropagationSnapshot::default());
         let (mut safety_control, safety_reader) =
-            OutputSafetyPublication::new(OutputSafetyConfig::default()).unwrap();
+            OutputSafetyPublication::new(OutputSafetyConfig {
+                // Unity start so the slew assertions are default-independent.
+                monitor_gain_db: 0.0,
+                ..OutputSafetyConfig::default()
+            })
+            .unwrap();
         let physical = source_profile(ReferenceLevel::SplAtOneMeter { db_spl: 120.0 });
         let creative = source_profile(ReferenceLevel::CreativeDb { db: 0.0 });
         safety_control.set_source(0, &physical, None).unwrap();

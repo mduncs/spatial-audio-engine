@@ -1,0 +1,29 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-dshk-burst-loop",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-dshk-burst-loop.wav",
+      "sha256": "a9f33718b2539271d8f87d9affc23bcc0f237d9d9f7eff34cb8655676c1f1ffa",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 28.198583333,
+  "target_rms_dbfs": -20.0,
+  "expected_reference_rms_dbfs": -18.427648,
+  "calibration": {
+    "applied_gain_db": -1.572352
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of Squad v8.1 game assets; this descriptor grants no right to redistribute audio bytes.",
+    "The DShK 3p Default/Initial folder has only a start recording plus silence, not a per-round variant set, so this fixed offline composition uses the requested 1p Default/Initial fallback; Mech and silence files are excluded.",
+    "No direct DShK operator-peak measurement was located. The fixture's 154 dB SplAtOneMeter steady-source control is an explicit 12.7 mm heavy-machine-gun class inference: 1 dB above the 153 dB M2 HB .50-cal value in U.S. Army ATP 4-25.12 (30 April 2014, chapter 10, https://rdl.train.army.mil/catalog-ws/view/100.ATSC/6FDDE4EE-4362-464B-AEA0-1EC3A3D90D88-1399551821430/atp4_25x12.pdf) and below the 160.7 dB(C) bridge-wing peak measured for a 12.7 mm L111A1 by Paddan (2015), doi:10.1093/annhyg/mev053, https://doi.org/10.1093/annhyg/mev053.",
+    "Peak-to-reference rationale: the class-inferred per-shot peak is used as a conservative steady-source scene anchor; it is not a direct DShK measurement, continuous physical SPL, or delivered-ear-SPL claim."
+  ]
+}
