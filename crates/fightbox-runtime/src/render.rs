@@ -6,7 +6,9 @@ use crate::backend::{
 use crate::safety::{
     OutputSafetyPublication, OutputSafetyReader, SafetyTelemetry, TruePeakLimiter,
 };
-use crate::{FractionalDelayLine, SnapshotReader};
+use crate::{
+    FractionalDelayLine, MonitorRoute, MonitorRouteReader, RAW_MONITOR_PAD_GAIN, SnapshotReader,
+};
 use fightbox_api::{
     CalibrationError, EngineConfig, ListenerState, OutputSafetyConfig, SceneCalibration,
     SourceDrive, SourceError, SourceProfile,
@@ -357,6 +359,7 @@ pub struct RuntimeGraph {
     config: EngineConfig,
     snapshot_reader: SnapshotReader<PropagationSnapshot>,
     output_safety_reader: OutputSafetyReader,
+    monitor_route_reader: Option<MonitorRouteReader>,
     sources: [SourceNode; MAX_ACTIVE_SOURCES],
     listener: Option<ListenerState>,
     backend: Option<Box<dyn BackendRenderGraph>>,
@@ -405,6 +408,7 @@ impl RuntimeGraph {
             config,
             snapshot_reader,
             output_safety_reader,
+            monitor_route_reader: None,
             sources,
             listener: None,
             backend: None,
@@ -443,6 +447,12 @@ impl RuntimeGraph {
 
     pub fn set_backend_render_graph(&mut self, backend: Option<Box<dyn BackendRenderGraph>>) {
         self.backend = backend;
+    }
+
+    /// Installs the callback endpoint for workbench raw/spatial monitoring.
+    /// The route defaults to [`MonitorRoute::Spatial`] when this is not called.
+    pub fn set_monitor_route_reader(&mut self, reader: MonitorRouteReader) {
+        self.monitor_route_reader = Some(reader);
     }
 
     /// Configures the source's sole physical drive from the API-owned scene
@@ -544,6 +554,10 @@ impl BlockProcessor for RuntimeGraph {
 
         let snapshot = self.snapshot_reader.read();
         let (source_safety_targets, monitor_gain_target) = self.output_safety_reader.read();
+        let monitor_route = self
+            .monitor_route_reader
+            .as_mut()
+            .map_or(MonitorRoute::Spatial, MonitorRouteReader::read);
         if block.now_ns.saturating_sub(snapshot.simulated_at_ns) > self.snapshot_stale_after_ns {
             self.telemetry.faults.snapshot_stale =
                 self.telemetry.faults.snapshot_stale.saturating_add(1);
@@ -688,6 +702,25 @@ impl BlockProcessor for RuntimeGraph {
             }
         }
 
+        if let MonitorRoute::RawSource { source_index } = monitor_route {
+            // Keep the backend running normally so switching back to SPATIAL
+            // does not pause its source/effect state, but expose no spatial
+            // tail on the raw-only monitor route.
+            block.output_left.fill(0.0);
+            block.output_right.fill(0.0);
+            if let Some(input) = block
+                .sources
+                .iter()
+                .find(|input| input.source_index == source_index)
+            {
+                for frame in 0..block_size {
+                    let raw = input.decoded_mono[frame] * RAW_MONITOR_PAD_GAIN;
+                    block.output_left[frame] += raw;
+                    block.output_right[frame] += raw;
+                }
+            }
+        }
+
         if !self.monitor_gain_initialized {
             self.applied_monitor_gain = monitor_gain_target;
             self.monitor_gain_initialized = true;
@@ -751,8 +784,10 @@ impl BlockProcessor for RuntimeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SnapshotPublication;
     use crate::backend::{BackendRenderError, PropagationRenderBlock};
+    use crate::{
+        MonitorRoutePublication, SnapshotPublication, TRUE_PEAK_LIMITER_LOOKAHEAD_SAMPLES,
+    };
     use fightbox_api::{
         AssetAnalysis, AssetMeasurementProvenance, EnuVector3, ExtentDescriptor, Pose,
         ReferenceLevel, SourceId,
@@ -1032,6 +1067,165 @@ mod tests {
         assert!(telemetry.limiter_engagements > 0);
         assert!(telemetry.pre_limiter_peak >= 2.0);
         assert!(telemetry.post_limiter_peak <= ceiling + 1.0e-6);
+    }
+
+    #[test]
+    fn raw_monitor_stem_reaches_both_output_channels_bit_exact_at_the_fixed_pad() {
+        let (mut writer, mut graph) = test_graph(128);
+        graph
+            .set_source(
+                0,
+                &source_profile(ReferenceLevel::CreativeDb { db: 12.0 }),
+                SceneCalibration::default(),
+            )
+            .unwrap();
+        writer.publish(PropagationSnapshot {
+            sequence: 1,
+            simulated_at_ns: 0,
+            sources: std::array::from_fn(|index| SourcePropagation {
+                active: index == 0,
+                target_delay_samples: 0.0,
+                left_gain: 0.75,
+                right_gain: -0.25,
+            }),
+        });
+        let (mut route_control, route_reader) = MonitorRoutePublication::new();
+        route_control.select_raw_source(0).unwrap();
+        graph.set_monitor_route_reader(route_reader);
+
+        let input = std::array::from_fn::<_, 128, _>(|index| index as f32 * 0.001);
+        let source_blocks = [SourceBlock {
+            source_index: 0,
+            decoded_mono: &input,
+        }];
+        let mut left = [0.0_f32; 128];
+        let mut right = [0.0_f32; 128];
+        let allocations = count_allocations(|| {
+            graph
+                .process_block(ProcessBlock {
+                    now_ns: 0,
+                    sources: &source_blocks,
+                    output_left: &mut left,
+                    output_right: &mut right,
+                })
+                .unwrap();
+        });
+
+        assert_eq!(allocations, 0);
+        for frame in 0..TRUE_PEAK_LIMITER_LOOKAHEAD_SAMPLES {
+            assert_eq!(left[frame].to_bits(), 0.0_f32.to_bits());
+            assert_eq!(right[frame].to_bits(), 0.0_f32.to_bits());
+        }
+        for frame in TRUE_PEAK_LIMITER_LOOKAHEAD_SAMPLES..128 {
+            let expected =
+                input[frame - TRUE_PEAK_LIMITER_LOOKAHEAD_SAMPLES] * RAW_MONITOR_PAD_GAIN;
+            assert_eq!(left[frame].to_bits(), expected.to_bits());
+            assert_eq!(right[frame].to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn hot_raw_monitor_stem_is_contained_by_the_existing_final_limiter() {
+        let (_writer, mut graph) = test_graph(128);
+        graph
+            .set_source(
+                0,
+                &source_profile(ReferenceLevel::CreativeDb { db: 0.0 }),
+                SceneCalibration::default(),
+            )
+            .unwrap();
+        let (mut route_control, route_reader) = MonitorRoutePublication::new();
+        route_control.select_raw_source(0).unwrap();
+        graph.set_monitor_route_reader(route_reader);
+        let input = [100.0_f32; 128];
+        let source_blocks = [SourceBlock {
+            source_index: 0,
+            decoded_mono: &input,
+        }];
+        let mut left = [0.0_f32; 128];
+        let mut right = [0.0_f32; 128];
+
+        graph
+            .process_block(ProcessBlock {
+                now_ns: 0,
+                sources: &source_blocks,
+                output_left: &mut left,
+                output_right: &mut right,
+            })
+            .unwrap();
+
+        let telemetry = graph.safety_telemetry();
+        let ceiling = 10.0_f32.powf(crate::TRUE_PEAK_LIMITER_CEILING_DBTP / 20.0);
+        assert!(telemetry.limiter_engagements > 0);
+        assert!(telemetry.pre_limiter_peak > 1.0);
+        assert!(telemetry.post_limiter_peak <= ceiling + 1.0e-6);
+    }
+
+    #[test]
+    fn explicit_spatial_monitor_route_is_bit_identical_to_the_existing_processed_path() {
+        fn configured_graph() -> (crate::SnapshotWriter<PropagationSnapshot>, RuntimeGraph) {
+            let (mut writer, mut graph) = test_graph(64);
+            graph
+                .set_source(
+                    0,
+                    &source_profile(ReferenceLevel::CreativeDb { db: -6.0 }),
+                    SceneCalibration::default(),
+                )
+                .unwrap();
+            writer.publish(PropagationSnapshot {
+                sequence: 1,
+                simulated_at_ns: 0,
+                sources: std::array::from_fn(|index| SourcePropagation {
+                    active: index == 0,
+                    target_delay_samples: 7.25,
+                    left_gain: 0.75,
+                    right_gain: 0.25,
+                }),
+            });
+            (writer, graph)
+        }
+
+        let (_reference_writer, mut reference) = configured_graph();
+        let (_routed_writer, mut routed) = configured_graph();
+        let (mut route_control, route_reader) = MonitorRoutePublication::new();
+        route_control.select_spatial();
+        routed.set_monitor_route_reader(route_reader);
+        let input = std::array::from_fn::<_, 64, _>(|index| ((index as f32 * 0.071).sin()) * 0.01);
+        let blocks = [SourceBlock {
+            source_index: 0,
+            decoded_mono: &input,
+        }];
+        let mut reference_left = [0.0_f32; 64];
+        let mut reference_right = [0.0_f32; 64];
+        let mut routed_left = [0.0_f32; 64];
+        let mut routed_right = [0.0_f32; 64];
+
+        for now_ns in [0, 2_666_667, 5_333_334] {
+            reference
+                .process_block(ProcessBlock {
+                    now_ns,
+                    sources: &blocks,
+                    output_left: &mut reference_left,
+                    output_right: &mut reference_right,
+                })
+                .unwrap();
+            routed
+                .process_block(ProcessBlock {
+                    now_ns,
+                    sources: &blocks,
+                    output_left: &mut routed_left,
+                    output_right: &mut routed_right,
+                })
+                .unwrap();
+            assert_eq!(
+                reference_left.map(f32::to_bits),
+                routed_left.map(f32::to_bits)
+            );
+            assert_eq!(
+                reference_right.map(f32::to_bits),
+                routed_right.map(f32::to_bits)
+            );
+        }
     }
 
     #[test]

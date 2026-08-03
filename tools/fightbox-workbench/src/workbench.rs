@@ -9,10 +9,10 @@ use fightbox_api::{
 };
 use fightbox_runtime::backend::{SimulationUpdate, SourceMotion};
 use fightbox_runtime::{
-    BlockProcessor, OutputSafetyController, OutputSafetyPublication, OutputSafetyReader,
-    ProcessBlock, PropagationSnapshot, RenderError, RuntimeGraph, SafetyTelemetry,
-    SimulationCadences, SimulationWorker, SnapshotPublication, SnapshotReader, SnapshotWriter,
-    SourcePropagation,
+    BlockProcessor, MonitorRouteController, MonitorRoutePublication, OutputSafetyController,
+    OutputSafetyPublication, OutputSafetyReader, ProcessBlock, PropagationSnapshot,
+    RAW_MONITOR_PAD_DB, RenderError, RuntimeGraph, SafetyTelemetry, SimulationCadences,
+    SimulationWorker, SnapshotPublication, SnapshotReader, SnapshotWriter, SourcePropagation,
 };
 use fightbox_steam_audio::{
     AudioConfig, BakedProbeBatch, DirectOcclusionMode, MultiSourceDescriptor, S3SimulationConfig,
@@ -275,6 +275,8 @@ pub struct Workbench {
     output_safety_controller: OutputSafetyController,
     meter_reader: SnapshotReader<MeterReading>,
     source_mix_writer: SnapshotWriter<SourceMix>,
+    monitor_route_controller: MonitorRouteController,
+    source_comparison: Option<SourceComparison>,
     stage_mix: StageMix,
     stage_output_gain_control: StageOutputGainControl,
     audio_block_reader: SnapshotReader<u64>,
@@ -311,6 +313,18 @@ struct SourceView {
     trajectory: Option<SourceTrajectory>,
     acoustic: SourceAcousticState,
     occlusion_mode: DirectOcclusionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceComparisonMode {
+    Raw,
+    Spatial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceComparison {
+    source_index: usize,
+    mode: SourceComparisonMode,
 }
 
 /// The sidecar spells the raised option `above_rooves`; that token is frozen for
@@ -774,6 +788,8 @@ impl Workbench {
             Box::new(backend),
         )
         .map_err(|error| format!("cannot create runtime graph: {error:?}"))?;
+        let (monitor_route_controller, monitor_route_reader) = MonitorRoutePublication::new();
+        graph.set_monitor_route_reader(monitor_route_reader);
         graph.set_listener_state(initial_listener);
         for (index, (profile, _)) in prepared_sources.iter().enumerate() {
             graph
@@ -860,6 +876,8 @@ impl Workbench {
             output_safety_controller,
             meter_reader,
             source_mix_writer,
+            monitor_route_controller,
+            source_comparison: None,
             stage_mix: StageMix::ALL_ENABLED,
             stage_output_gain_control,
             audio_block_reader,
@@ -965,6 +983,28 @@ impl Workbench {
             .source_height_levels
             .height_m(selection, self.sources[index].street_height_m);
         self.update_source_position(index, position);
+    }
+
+    fn select_source_comparison(&mut self, source_index: usize, mode: SourceComparisonMode) {
+        for (index, source) in self.sources.iter_mut().enumerate() {
+            source.soloed = index == source_index;
+            if index == source_index {
+                source.enabled = true;
+                source.muted = false;
+            }
+        }
+        self.source_mix_writer
+            .publish(SourceMix::from_sources(&self.sources));
+        match mode {
+            SourceComparisonMode::Raw => self
+                .monitor_route_controller
+                .select_raw_source(source_index)
+                .expect("workbench sources always fit the runtime source capacity"),
+            SourceComparisonMode::Spatial => {
+                self.monitor_route_controller.select_spatial();
+            }
+        }
+        self.source_comparison = Some(SourceComparison { source_index, mode });
     }
 
     fn update_control(&mut self, ctx: &egui::Context, drag_delta_x: f32) {
@@ -1297,6 +1337,12 @@ impl Workbench {
                 self.capture_state = CaptureUiState::Stopping;
                 self.capture_status = Some("Draining capture blocks…".into());
             } else {
+                // Evidence captures remain normal engine output. A/B RAW is a
+                // listening monitor route and is intentionally not captured.
+                self.monitor_route_controller.select_spatial();
+                if let Some(comparison) = &mut self.source_comparison {
+                    comparison.mode = SourceComparisonMode::Spatial;
+                }
                 let draft = self.capture_draft();
                 match self.capture.start(draft) {
                     Ok(bundle) => {
@@ -1457,6 +1503,8 @@ impl Workbench {
         }
         let mut source_mix_changed = false;
         let mut source_height_changed = None;
+        let mut comparison_requested = None;
+        let source_comparison = self.source_comparison;
         let source_height_levels = self.source_height_levels;
         for (index, source) in self.sources.iter_mut().enumerate() {
             ui.add_enabled_ui(mix_controls_enabled, |ui| {
@@ -1539,11 +1587,45 @@ impl Workbench {
                         source_height_levels.height_m(source.height, source.street_height_m);
                     ui.monospace(format!("z {resulting_height_m:.1} m"));
                 });
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    ui.small("A/B monitor");
+                    let raw_selected = source_comparison == Some(SourceComparison {
+                        source_index: index,
+                        mode: SourceComparisonMode::Raw,
+                    });
+                    if ui
+                        .selectable_label(raw_selected, "RAW")
+                        .on_hover_text(format!(
+                            "Decoded mono in both ears at {RAW_MONITOR_PAD_DB:.0} dB before the current monitor gain; bypasses source drive, distance, HRTF, occlusion, pathing, and reflections. The final limiter remains active."
+                        ))
+                        .clicked()
+                    {
+                        comparison_requested = Some((index, SourceComparisonMode::Raw));
+                    }
+                    let spatial_selected = source_comparison == Some(SourceComparison {
+                        source_index: index,
+                        mode: SourceComparisonMode::Spatial,
+                    });
+                    if ui
+                        .selectable_label(spatial_selected, "SPATIAL")
+                        .on_hover_text(
+                            "Normal processed engine path. Selecting either A/B route enables, unmutes, and solos this source.",
+                        )
+                        .clicked()
+                    {
+                        comparison_requested = Some((index, SourceComparisonMode::Spatial));
+                    }
+                });
             });
             acoustic_badge_row(ui, source.acoustic, source.occlusion_mode);
         }
         if let Some((index, height)) = source_height_changed {
             self.apply_source_height(index, height);
+        }
+        if let Some((index, mode)) = comparison_requested {
+            self.select_source_comparison(index, mode);
+            source_mix_changed = false;
         }
         if source_mix_changed {
             self.source_mix_writer

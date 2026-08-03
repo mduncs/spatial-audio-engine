@@ -12,6 +12,7 @@ pub mod backend;
 mod delay;
 #[cfg(feature = "live-output")]
 pub mod live;
+mod monitor;
 mod render;
 mod safety;
 mod snapshot;
@@ -19,6 +20,10 @@ mod soak;
 mod workers;
 
 pub use delay::FractionalDelayLine;
+pub use monitor::{
+    MonitorRoute, MonitorRouteController, MonitorRouteError, MonitorRoutePublication,
+    MonitorRouteReader, RAW_MONITOR_PAD_DB, RAW_MONITOR_PAD_GAIN,
+};
 pub use render::{
     BlockProcessor, FaultCounters, MAX_ACTIVE_SOURCES, MAX_TIMING_RECORDS, OfflineDriver,
     ProcessBlock, PropagationSnapshot, RUN_TIMING_HISTOGRAM_BUCKETS, RenderError,
