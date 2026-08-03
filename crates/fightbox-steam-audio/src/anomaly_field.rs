@@ -91,7 +91,7 @@ impl AnomalyClass {
                 "the spatial slope exceeds the simulator's volumetric resolution"
             }
             Self::ZeroPathWithCoverage => {
-                "covered source and listener endpoints should not yield an exact zero path"
+                "covered, outdoor source and listener endpoints should not yield an exact zero path"
             }
             Self::ReflectionEnergyExcess => {
                 "reflection energy far above direct plus path exceeds the declared physical bound"
@@ -107,7 +107,9 @@ impl AnomalyClass {
             Self::InvalidCoefficient => "outside [0,1]",
             Self::NeighborSpike => "occlusion delta>=0.70 or path delta>=24dB",
             Self::ExcessiveDiscontinuity => "occlusion slope>0.26/m",
-            Self::ZeroPathWithCoverage => "path_sh_energy==0 with both endpoints covered",
+            Self::ZeroPathWithCoverage => {
+                "path_sh_energy==0 with both endpoints covered and outside static solids"
+            }
             Self::ReflectionEnergyExcess => "reflection/(direct+path)>12dB",
         }
     }
@@ -149,6 +151,13 @@ pub struct AnomalyRawSample {
     pub path_coefficient_max: f32,
     pub source_probe_covered: bool,
     pub listener_probe_covered: bool,
+    /// True when an upward ray from the source meets static scene geometry.
+    /// Provider-generated city solids use this to reject emitter poses inside buildings.
+    pub source_endpoint_inside_static_geometry: bool,
+    /// True when an upward ray from the listener meets static scene geometry.
+    /// Probe influence can extend through a wall, so coverage alone does not make
+    /// such an endpoint a physically meaningful pathing query.
+    pub listener_endpoint_inside_static_geometry: bool,
     /// Actual rendered stage energy when a live tap has a single audible source.
     pub direct_path_energy: Option<f64>,
     pub reflection_energy: Option<f64>,
@@ -301,7 +310,12 @@ pub fn classify_sample_at_distance(
     {
         flags.insert(AnomalyClass::InvalidCoefficient);
     }
-    if raw.path_sh_energy == 0.0 && raw.source_probe_covered && raw.listener_probe_covered {
+    if raw.path_sh_energy == 0.0
+        && raw.source_probe_covered
+        && raw.listener_probe_covered
+        && !raw.source_endpoint_inside_static_geometry
+        && !raw.listener_endpoint_inside_static_geometry
+    {
         flags.insert(AnomalyClass::ZeroPathWithCoverage);
     }
     if reflection_excess_db.is_some_and(|value| value > MAX_PLAUSIBLE_REFLECTION_EXCESS_DB) {
@@ -467,6 +481,10 @@ pub struct AnomalyQuerySession {
     source_probe_covered: bool,
     #[cfg(feature = "linked-sdk")]
     probe_spheres: Vec<(EnuVector3, f32)>,
+    #[cfg(feature = "linked-sdk")]
+    source_endpoint_inside_static_geometry: bool,
+    #[cfg(feature = "linked-sdk")]
+    static_geometry_endpoints: StaticGeometryEndpoints,
     #[cfg(not(feature = "linked-sdk"))]
     _private: (),
 }
@@ -490,6 +508,9 @@ impl AnomalyQuerySession {
             let coverage = baked.probe_coverage()?;
             let probe_spheres = coverage.spheres().collect::<Vec<_>>();
             let source_probe_covered = covered_by_spheres(&probe_spheres, source_position);
+            let static_geometry_endpoints = StaticGeometryEndpoints::new(mesh);
+            let source_endpoint_inside_static_geometry =
+                static_geometry_endpoints.contains(source_position);
             let inner = crate::linked::build_anomaly_query_simulation(
                 mesh,
                 baked,
@@ -505,6 +526,8 @@ impl AnomalyQuerySession {
                 source_position,
                 source_probe_covered,
                 probe_spheres,
+                source_endpoint_inside_static_geometry,
+                static_geometry_endpoints,
             })
         }
         #[cfg(not(feature = "linked-sdk"))]
@@ -533,6 +556,10 @@ impl AnomalyQuerySession {
                     .fold(f32::NEG_INFINITY, f32::max),
                 source_probe_covered: self.source_probe_covered,
                 listener_probe_covered: covered_by_spheres(&self.probe_spheres, listener),
+                source_endpoint_inside_static_geometry: self.source_endpoint_inside_static_geometry,
+                listener_endpoint_inside_static_geometry: self
+                    .static_geometry_endpoints
+                    .contains(listener),
                 direct_path_energy: None,
                 reflection_energy: None,
             });
@@ -550,6 +577,98 @@ impl AnomalyQuerySession {
         let dy = self.source_position.y - listener.y;
         let dz = self.source_position.z - listener.z;
         (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+}
+
+#[cfg(feature = "linked-sdk")]
+struct StaticGeometryEndpoints {
+    projected_surfaces: Vec<ProjectedSurface>,
+}
+
+#[cfg(feature = "linked-sdk")]
+impl StaticGeometryEndpoints {
+    fn new(mesh: &SceneMesh) -> Self {
+        let projected_surfaces = mesh
+            .triangles
+            .iter()
+            .filter_map(|indices| {
+                let [a, b, c] = indices.map(|index| {
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|index| mesh.vertices_enu_m.get(index))
+                        .copied()
+                });
+                ProjectedSurface::new(a?, b?, c?)
+            })
+            .collect();
+        Self { projected_surfaces }
+    }
+
+    fn contains(&self, position: EnuVector3) -> bool {
+        self.projected_surfaces.iter().any(|surface| {
+            surface
+                .height_at(position.x, position.y)
+                .is_some_and(|height| height > position.z + STATIC_GEOMETRY_ENDPOINT_EPSILON_M)
+        })
+    }
+}
+
+#[cfg(feature = "linked-sdk")]
+const STATIC_GEOMETRY_ENDPOINT_EPSILON_M: f32 = 1.0e-3;
+
+#[cfg(feature = "linked-sdk")]
+struct ProjectedSurface {
+    a: EnuVector3,
+    b: EnuVector3,
+    c: EnuVector3,
+    denominator: f32,
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+}
+
+#[cfg(feature = "linked-sdk")]
+impl ProjectedSurface {
+    fn new(a: EnuVector3, b: EnuVector3, c: EnuVector3) -> Option<Self> {
+        let denominator = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if !denominator.is_finite() || denominator.abs() <= f32::EPSILON {
+            return None;
+        }
+        Some(Self {
+            a,
+            b,
+            c,
+            denominator,
+            min_x: a.x.min(b.x).min(c.x),
+            max_x: a.x.max(b.x).max(c.x),
+            min_y: a.y.min(b.y).min(c.y),
+            max_y: a.y.max(b.y).max(c.y),
+        })
+    }
+
+    fn height_at(&self, x: f32, y: f32) -> Option<f32> {
+        if x < self.min_x - STATIC_GEOMETRY_ENDPOINT_EPSILON_M
+            || x > self.max_x + STATIC_GEOMETRY_ENDPOINT_EPSILON_M
+            || y < self.min_y - STATIC_GEOMETRY_ENDPOINT_EPSILON_M
+            || y > self.max_y + STATIC_GEOMETRY_ENDPOINT_EPSILON_M
+        {
+            return None;
+        }
+        let a_weight = ((self.b.y - self.c.y) * (x - self.c.x)
+            + (self.c.x - self.b.x) * (y - self.c.y))
+            / self.denominator;
+        let b_weight = ((self.c.y - self.a.y) * (x - self.c.x)
+            + (self.a.x - self.c.x) * (y - self.c.y))
+            / self.denominator;
+        let c_weight = 1.0 - a_weight - b_weight;
+        if a_weight < -STATIC_GEOMETRY_ENDPOINT_EPSILON_M
+            || b_weight < -STATIC_GEOMETRY_ENDPOINT_EPSILON_M
+            || c_weight < -STATIC_GEOMETRY_ENDPOINT_EPSILON_M
+        {
+            return None;
+        }
+        Some(a_weight * self.a.z + b_weight * self.b.z + c_weight * self.c.z)
     }
 }
 
@@ -577,6 +696,8 @@ mod tests {
             path_coefficient_max: 0.5,
             source_probe_covered: true,
             listener_probe_covered: true,
+            source_endpoint_inside_static_geometry: false,
+            listener_endpoint_inside_static_geometry: false,
             direct_path_energy: Some(1.0),
             reflection_energy: Some(1.0),
         }
@@ -642,6 +763,19 @@ mod tests {
                 .flags
                 .contains(AnomalyClass::ZeroPathWithCoverage)
         );
+        zero_path.listener_endpoint_inside_static_geometry = true;
+        assert!(
+            !classified(zero_path)
+                .flags
+                .contains(AnomalyClass::ZeroPathWithCoverage)
+        );
+        zero_path.listener_endpoint_inside_static_geometry = false;
+        zero_path.source_endpoint_inside_static_geometry = true;
+        assert!(
+            !classified(zero_path)
+                .flags
+                .contains(AnomalyClass::ZeroPathWithCoverage)
+        );
 
         let mut reflection = clean_raw();
         reflection.reflection_energy = Some(100.0);
@@ -671,6 +805,28 @@ mod tests {
             grid.position(grid.cell_count() - 1),
             EnuVector3::new(584.5, 584.5, 1.5)
         );
+    }
+
+    #[cfg(feature = "linked-sdk")]
+    #[test]
+    fn static_geometry_endpoint_test_distinguishes_under_roof_outside_and_above() {
+        let mesh = SceneMesh {
+            vertices_enu_m: vec![
+                EnuVector3::new(0.0, 0.0, 10.0),
+                EnuVector3::new(10.0, 0.0, 10.0),
+                EnuVector3::new(10.0, 10.0, 10.0),
+                EnuVector3::new(0.0, 10.0, 10.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 3]],
+            material_indices: vec![0, 0],
+            materials: vec![],
+        };
+        let endpoints = StaticGeometryEndpoints::new(&mesh);
+
+        assert!(endpoints.contains(EnuVector3::new(5.0, 5.0, 1.5)));
+        assert!(!endpoints.contains(EnuVector3::new(11.0, 5.0, 1.5)));
+        assert!(!endpoints.contains(EnuVector3::new(5.0, 5.0, 10.0)));
+        assert!(!endpoints.contains(EnuVector3::new(5.0, 5.0, 11.0)));
     }
 
     #[test]

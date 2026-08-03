@@ -1358,6 +1358,8 @@ mod tests {
             path_coefficient_max: 0.1,
             source_probe_covered: true,
             listener_probe_covered: true,
+            source_endpoint_inside_static_geometry: false,
+            listener_endpoint_inside_static_geometry: false,
             direct_path_energy: None,
             reflection_energy: None,
         }

@@ -24,6 +24,7 @@ use crate::fixture::load_baked;
 
 const FIELD_SCHEMA: &str = "fightbox.anomaly-field.v1";
 const TRAIL_SCHEMA: &str = "fightbox.anomaly-trail.v1";
+const CLASSIFIER_SCHEMA: u32 = 2;
 const ADAPTIVE_RADIUS_M: f32 = 3.0;
 const ADAPTIVE_SPACING_M: f32 = 2.0;
 const SOURCE_COVERED_BIT: u32 = 1 << 31;
@@ -127,7 +128,7 @@ impl FieldIdentity {
                 grid.spacing_m.to_bits(),
             ],
             simulation_key: format!(
-                "engine={}:steam={}/{}:hrtf=steam-default:ray-v1:path-M{}:samples={}:radius={:08x}:threshold={:08x}:range={:08x}:validate={}:alternate={}:schema=1",
+                "engine={}:steam={}/{}:hrtf=steam-default:ray-v1:path-M{}:samples={}:radius={:08x}:threshold={:08x}:range={:08x}:validate={}:alternate={}:schema={CLASSIFIER_SCHEMA}",
                 context.engine_key,
                 fightbox_steam_audio::STEAM_AUDIO_VERSION,
                 fightbox_steam_audio::STEAM_AUDIO_UPSTREAM_COMMIT,
@@ -392,6 +393,10 @@ impl FieldController {
             path_coefficient_max: path_eq.into_iter().fold(f32::NEG_INFINITY, f32::max),
             source_probe_covered: acoustic.source_probes == ProbeCoverage::Covered,
             listener_probe_covered: acoustic.listener_probes == ProbeCoverage::Covered,
+            // Live poses come from the operator/trajectory rather than a synthetic
+            // field grid. Query-only sweeps perform the static-solid endpoint test.
+            source_endpoint_inside_static_geometry: false,
+            listener_endpoint_inside_static_geometry: false,
             direct_path_energy: (energy.audible_source_count == 1)
                 .then_some(energy.direct_path_energy),
             reflection_energy: (energy.audible_source_count == 1)

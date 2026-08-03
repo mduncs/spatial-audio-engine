@@ -10,10 +10,10 @@ use fightbox_runtime::backend::{
 };
 use fightbox_steam_audio::EnuVector3 as SteamEnuVector3;
 use fightbox_steam_audio::{
-    AcousticMaterial, AudioConfig, BakedProbeBatch, DirectOcclusionMode, MultiSourceDescriptor,
-    PROBE_BATCH_METADATA_SCHEMA, ProbeBatchMetadata, ReflectionEffectConfig, S3SimulationConfig,
-    STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION, SceneMesh, StageOutputGains,
-    build_multi_source_session,
+    AcousticMaterial, AnomalyQuerySession, AudioConfig, BakedProbeBatch, DirectOcclusionMode,
+    MultiSourceDescriptor, PROBE_BATCH_METADATA_SCHEMA, ProbeBatchMetadata, ReflectionEffectConfig,
+    S3SimulationConfig, STEAM_AUDIO_UPSTREAM_COMMIT, STEAM_AUDIO_VERSION, SceneMesh,
+    StageOutputGains, build_multi_source_session,
 };
 use serde_json::Value;
 use std::env;
@@ -29,6 +29,25 @@ const EFFECTIVE_SPL_AT_ONE_METER_DB: f32 = 129.0;
 const TARGET_SOURCE_RMS_DBFS: f32 = -15.0;
 const SETTLE_BLOCKS: usize = 800;
 const MEASURE_BLOCKS: usize = 750;
+const ZERO_PATH_EXEMPLARS: [EnuVector3; 7] = [
+    EnuVector3::new(275.0, 280.0, 1.5),
+    EnuVector3::new(310.0, 281.0, 1.5),
+    EnuVector3::new(279.0, 310.0, 1.5),
+    EnuVector3::new(305.0, 310.0, 1.5),
+    EnuVector3::new(280.0, 280.0, 1.5),
+    EnuVector3::new(303.0, 281.0, 1.5),
+    EnuVector3::new(292.5, 292.5, 1.5),
+];
+const ZERO_PATH_GEOMETRY_CASES: [(&str, EnuVector3, bool); 8] = [
+    ("zero-sw", EnuVector3::new(275.0, 280.0, 1.5), true),
+    ("zero-se", EnuVector3::new(310.0, 281.0, 1.5), true),
+    ("zero-nw", EnuVector3::new(279.0, 310.0, 1.5), true),
+    ("zero-ne", EnuVector3::new(305.0, 310.0, 1.5), true),
+    ("street-sw", EnuVector3::new(280.0, 280.0, 1.5), false),
+    ("street-se", EnuVector3::new(303.0, 281.0, 1.5), false),
+    ("street-ne", EnuVector3::new(304.0, 305.0, 1.5), false),
+    ("source", EnuVector3::new(292.5, 292.5, 1.5), false),
+];
 
 const DIRECT_ONLY: StageOutputGains = StageOutputGains {
     direct: 1.0,
@@ -127,6 +146,106 @@ fn megablock_above_rooves_reflection_inversion() {
     );
 }
 
+#[test]
+#[ignore = "requires FIGHTBOX_DIAG_PACKAGE/FIGHTBOX_DIAG_BAKE and linked Steam Audio"]
+fn megablock_zero_path_cluster_real_render() {
+    let package = required_path("FIGHTBOX_DIAG_PACKAGE");
+    let bake = required_path("FIGHTBOX_DIAG_BAKE");
+    let mesh = load_mesh(&package);
+    let baked = load_baked(&bake);
+    let coverage = baked
+        .probe_coverage()
+        .expect("parse probe influence spheres");
+    let config = S3SimulationConfig {
+        pathing_visibility_range_m: 10.0,
+        simulation_threads: 1,
+        ..S3SimulationConfig::default()
+    };
+    let audio = AudioConfig {
+        sample_rate_hz: SAMPLE_RATE,
+        frame_size: BLOCK_FRAMES,
+    };
+
+    for source_height_m in [1.5_f32, 63.0] {
+        let source = EnuVector3::new(SOURCE_EAST_M, SOURCE_NORTH_M, source_height_m);
+        let descriptor = MultiSourceDescriptor::at(source)
+            .with_reference_level(ReferenceLevel::SplAtOneMeter { db_spl: 105.0 });
+        let mut query = AnomalyQuerySession::new(&mesh, &baked, config, descriptor)
+            .expect("build anomaly query session");
+        let (mut simulation, mut render) =
+            build_multi_source_session(&mesh, &baked, audio, config, &[descriptor])
+                .expect("build retained render session");
+        let mut stage_control = render
+            .take_stage_output_gain_control()
+            .expect("take stage output control");
+        stage_control
+            .publish(PATH_ONLY)
+            .expect("select path-only output");
+        let source_probes = influencing_probes(&coverage, to_steam_enu(source));
+
+        for listener in ZERO_PATH_EXEMPLARS {
+            let query_sample = query
+                .sample(SteamEnuVector3::new(
+                    listener.east_m,
+                    listener.north_m,
+                    listener.up_m,
+                ))
+                .expect("query exemplar");
+            simulation.update_inputs(&one_source_update_at(source, listener));
+            simulation.run_direct().expect("direct simulation");
+            simulation.run_pathing().expect("path simulation");
+            let render_diagnostics = simulation
+                .source_diagnostics(0)
+                .expect("source zero diagnostics");
+            let mut noise = Noise {
+                state: 0x9e37_79b9_7f4a_7c15,
+            };
+            let path_dbfs = measure_stage(&mut render, &mut stage_control, &mut noise, PATH_ONLY);
+            let listener_probes = influencing_probes(&coverage, to_steam_enu(listener));
+            println!(
+                "ZERO_PATH_COMPARE source_z={source_height_m:.1} listener=[{:.1},{:.1},{:.1}] query_direct={:.9e} query_sh_energy={:.9e} render_direct={:.9e} render_sh_energy={:.9e} render_path_dbfs={path_dbfs:.6} source_influences={} listener_influences={} shared_influences={} nearest_source_probe={} nearest_listener_probe={}",
+                listener.east_m,
+                listener.north_m,
+                listener.up_m,
+                query_sample.direct_audibility,
+                query_sample.path_sh_energy,
+                render_diagnostics.occlusion,
+                render_diagnostics.path_sh_energy,
+                source_probes.len(),
+                listener_probes.len(),
+                shared_probe_count(&source_probes, &listener_probes),
+                nearest_probe(&source_probes),
+                nearest_probe(&listener_probes),
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires FIGHTBOX_DIAG_PACKAGE"]
+fn megablock_zero_path_exemplars_are_inside_building_solids() {
+    let package = required_path("FIGHTBOX_DIAG_PACKAGE");
+    let mesh = load_mesh(&package);
+    for (label, listener, expected_inside) in ZERO_PATH_GEOMETRY_CASES {
+        let above = EnuVector3::new(listener.east_m, listener.north_m, 1_000.0);
+        let mut roof_heights = segment_hits(&mesh, listener, above)
+            .into_iter()
+            .map(|(_, height)| height)
+            .collect::<Vec<_>>();
+        roof_heights.sort_by(f32::total_cmp);
+        roof_heights.dedup_by(|left, right| (*left - *right).abs() < 1.0e-3);
+        let inside = !roof_heights.is_empty();
+        println!(
+            "ZERO_PATH_GEOMETRY label={label} listener=[{:.1},{:.1},{:.1}] inside_building={inside} overhead_surface_heights_m={roof_heights:?}",
+            listener.east_m, listener.north_m, listener.up_m,
+        );
+        assert_eq!(
+            inside, expected_inside,
+            "geometry classification for {label}"
+        );
+    }
+}
+
 fn measure(
     mesh: &SceneMesh,
     baked: &BakedProbeBatch,
@@ -165,7 +284,7 @@ fn measure(
     let mut stage_control = render
         .take_stage_output_gain_control()
         .expect("take stage output control");
-    simulation.update_inputs(&one_source_update(source));
+    simulation.update_inputs(&one_source_update_at(source, LISTENER));
     simulation.run_direct().expect("direct simulation");
     simulation.run_pathing().expect("path simulation");
     simulation.run_reflections().expect("reflection simulation");
@@ -267,11 +386,11 @@ fn render_noise_block(
     }
 }
 
-fn one_source_update(source: EnuVector3) -> SimulationUpdate {
+fn one_source_update_at(source: EnuVector3, listener_position: EnuVector3) -> SimulationUpdate {
     let yaw = 176.3_f32.to_radians();
     let listener = ListenerState {
         pose: Pose {
-            position: LISTENER,
+            position: listener_position,
             forward: EnuVector3::new(yaw.sin(), yaw.cos(), 0.0),
             up: EnuVector3::new(0.0, 0.0, 1.0),
         },
@@ -288,6 +407,41 @@ fn one_source_update(source: EnuVector3) -> SimulationUpdate {
         linear_velocity_mps: EnuVector3::default(),
     };
     SimulationUpdate { listener, sources }
+}
+
+fn influencing_probes(
+    coverage: &fightbox_steam_audio::ProbeCoverage<'_>,
+    position: SteamEnuVector3,
+) -> Vec<(usize, f32)> {
+    coverage
+        .spheres()
+        .enumerate()
+        .filter_map(|(index, (center, radius))| {
+            let distance = ((center.x - position.x).powi(2)
+                + (center.y - position.y).powi(2)
+                + (center.z - position.z).powi(2))
+            .sqrt();
+            (distance <= radius).then_some((index, distance))
+        })
+        .collect()
+}
+
+fn shared_probe_count(left: &[(usize, f32)], right: &[(usize, f32)]) -> usize {
+    left.iter()
+        .filter(|(left_index, _)| {
+            right
+                .iter()
+                .any(|(right_index, _)| left_index == right_index)
+        })
+        .count()
+}
+
+fn nearest_probe(probes: &[(usize, f32)]) -> String {
+    probes
+        .iter()
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(index, distance)| format!("{index}@{distance:.3}m"))
+        .unwrap_or_else(|| "none".into())
 }
 
 fn segment_hits(mesh: &SceneMesh, from: EnuVector3, to: EnuVector3) -> Vec<(f32, f32)> {

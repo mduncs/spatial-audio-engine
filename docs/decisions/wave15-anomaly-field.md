@@ -286,3 +286,45 @@ visibly stale; and the audio callback performs only fixed-buffer arithmetic and
 wait-free snapshot publication. Live deadline behavior while a sweep is active
 remains an operator test because this implementation lane was forbidden from
 launching or disturbing the running workbench.
+
+## ζ. Static-solid endpoint exclusion
+
+The 2026-08-03 thoroughfare-corner scan exposed 2,695
+`zero_path_with_coverage` dots at both the 1.5 m and 63 m Tom's Diner source
+heights. This was not a second baked lookup in the query-only session. An
+offline retained-render comparison at `[275,280,1.5]`, `[310,281,1.5]`,
+`[279,310,1.5]`, and `[305,310,1.5]` produced the same exact-zero SH field and
+silent path-only render as the query. Changing the source height selected a
+different source probe neighborhood but left every zero in the same listener
+cell.
+
+Those cells are inside the provider-generated building prisms. Upward geometry
+tests from the four exemplars hit roofs at 9.6 m, 45 m, 59 m, and 48 m. Adjacent
+street-side controls such as `[280,280,1.5]` and `[303,281,1.5]` have no static
+surface overhead and return nonzero baked paths. The corner scanner deliberately
+samples complete squares around each facade corner, including non-walkable
+building interiors. A probe influence sphere can extend through a wall into
+one of those cells, but that geometric coverage test does not prove that the
+endpoint can reach its influencing probe. Steam Audio consequently has no
+valid endpoint-to-probe path and returns silence.
+
+`zero_path_with_coverage` now requires both covered endpoints to be outside
+static solids. The query session precomputes the non-vertical scene triangles
+and rejects the exact-zero class when an upward ray from either endpoint meets
+a static surface. This rule is intentionally limited to the exact-zero
+coverage class; it does not rewrite the raw direct/path measurements or hide
+the real facade discontinuity from the other classes.
+
+The boundary remains audible-relevant on its outdoor side: direct visibility
+and path fill can change sharply as a listener rounds a facade corner. The
+interior side is not an auditionable listener pose, so its exact-zero result is
+not evidence of a bake hole or an engine failure. The rule changes anomaly
+classification only. It does not change simulation, rendering, smoothing,
+stage gain, or limiter behavior. The workbench classifier cache key advances
+to schema 2 so a pre-fix field or adaptive trail is not restored under the new
+rule.
+
+Same-configuration 190,260-dot rescans reduced
+`zero_path_with_coverage` from 2,695 to 0 at each source height. Direct/path
+samples and every other class count were unchanged; only the invalid endpoint
+interpretation was removed.
