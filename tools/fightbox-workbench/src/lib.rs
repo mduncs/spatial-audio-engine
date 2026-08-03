@@ -1,6 +1,5 @@
 mod acoustic_state;
 mod asset;
-mod ballistic_event;
 mod capture;
 mod fixture;
 mod mix_defaults;
