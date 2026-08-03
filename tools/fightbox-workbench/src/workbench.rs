@@ -804,7 +804,16 @@ impl Workbench {
         );
         let playback = source_views
             .iter()
-            .map(|source| SourcePlayback::for_asset(&source.asset_id, SAMPLE_RATE))
+            .zip(&fixture.sources)
+            .zip(&prepared_sources)
+            .map(|((source, fixture_source), (_, samples))| {
+                SourcePlayback::for_asset(
+                    &source.asset_id,
+                    SAMPLE_RATE,
+                    fixture_source.playback_start_offset_s,
+                    samples.len(),
+                )
+            })
             .collect();
         let signals = prepared_sources
             .into_iter()
@@ -2141,7 +2150,13 @@ struct SourcePlayback {
 }
 
 impl SourcePlayback {
-    fn for_asset(asset_id: &str, sample_rate: u32) -> Self {
+    fn for_asset(
+        asset_id: &str,
+        sample_rate: u32,
+        start_offset_s: f64,
+        signal_frames: usize,
+    ) -> Self {
+        debug_assert!(signal_frames > 0);
         let mode = if asset_id == ARTILLERY_ASSET_ID {
             PlaybackMode::PeriodicOneShot {
                 interval_frames: artillery_retrigger_frames(sample_rate),
@@ -2149,9 +2164,15 @@ impl SourcePlayback {
         } else {
             PlaybackMode::Looping
         };
+        let cursor = match mode {
+            PlaybackMode::Looping => {
+                ((start_offset_s * f64::from(sample_rate)).round() as usize) % signal_frames
+            }
+            PlaybackMode::PeriodicOneShot { .. } => 0,
+        };
         Self {
             mode,
-            cursor: 0,
+            cursor,
             was_enabled: false,
         }
     }
@@ -2891,13 +2912,15 @@ mod tests {
         let megablock_ids = planned_physical_source_ids(&megablock);
         let checkpoint_ids = planned_physical_source_ids(&checkpoint);
         assert_eq!(megablock_ids.len(), 5);
-        // 7 = original 5 plus the A-10 gun-run pair (sky pass + strike line).
-        assert_eq!(checkpoint_ids.len(), 7);
+        // The two phase-locked A-10 pairs consume the full physical-source cap.
+        assert_eq!(checkpoint_ids.len(), 8);
         assert!(megablock_ids.contains(&"dshk-street-gun".into()));
         assert!(checkpoint_ids.contains(&"m2-checkpoint-gun".into()));
         assert!(checkpoint_ids.contains(&"dshk-return-fire".into()));
         assert!(checkpoint_ids.contains(&"a10-gunrun-sky".into()));
         assert!(checkpoint_ids.contains(&"a10-strike-line".into()));
+        assert!(checkpoint_ids.contains(&"a10-gunrun-sky-west".into()));
+        assert!(checkpoint_ids.contains(&"a10-strike-line-west".into()));
 
         let mut slots = SceneSlotState::default();
         slots.replace(megablock_ids.clone());
@@ -3453,6 +3476,35 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_a10_racetrack_is_phase_locked_to_both_strike_streets() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture = Fixture::read(&root.join("fixtures/checkpoint/fixture.json")).unwrap();
+        let trajectory =
+            SourceTrajectory::from_fixture(fixture.sources[4].trajectory.as_ref().unwrap())
+                .unwrap();
+
+        assert!((trajectory.cycle_length_m / trajectory.speed_mps - 84.0).abs() < 1.0e-4);
+
+        let east_impact = trajectory.sample_at_block(38 * 375);
+        assert!((east_impact.position.east_m - 292.5).abs() < 1.0e-3);
+        assert!((east_impact.position.north_m - 312.025).abs() < 0.02);
+        assert!(east_impact.direction.north_m > 0.999);
+
+        let east_report = trajectory.sample_at_block(14_985);
+        assert!((east_report.position.east_m - 292.5).abs() < 1.0e-3);
+        assert!((east_report.position.north_m - 332.5).abs() < 0.02);
+
+        let west_impact = trajectory.sample_at_block(80 * 375);
+        assert!((west_impact.position.east_m - 197.5).abs() < 1.0e-3);
+        assert!((west_impact.position.north_m - 372.975).abs() < 0.02);
+        assert!(west_impact.direction.north_m < -0.999);
+
+        let west_report = trajectory.sample_at_block(30_735);
+        assert!((west_report.position.east_m - 197.5).abs() < 1.0e-3);
+        assert!((west_report.position.north_m - 352.5).abs() < 0.02);
+    }
+
+    #[test]
     fn meter_accumulates_peak_and_rms_over_rolling_window() {
         let mut meter = MeterAccumulator::new(4, 2, 1.0);
         let first = meter.observe(&[1.0, 0.0], &[0.0, 0.0]);
@@ -3542,7 +3594,7 @@ mod tests {
     #[test]
     fn artillery_one_shot_retriggers_on_sample_clock_and_rearms_after_disable() {
         assert_eq!(artillery_retrigger_frames(48_000), 144_000);
-        let configured = SourcePlayback::for_asset(ARTILLERY_ASSET_ID, 48_000);
+        let configured = SourcePlayback::for_asset(ARTILLERY_ASSET_ID, 48_000, 0.0, 1);
         assert_eq!(
             configured.mode,
             PlaybackMode::PeriodicOneShot {
@@ -3550,7 +3602,7 @@ mod tests {
             }
         );
         assert_eq!(
-            SourcePlayback::for_asset("toms-diner", 48_000).mode,
+            SourcePlayback::for_asset("toms-diner", 48_000, 0.0, 1).mode,
             PlaybackMode::Looping
         );
         let mut playback = SourcePlayback {
@@ -3565,5 +3617,14 @@ mod tests {
         assert_eq!(enabled, vec![1.0, 0.5, 0.0, 0.0, 1.0, 0.5]);
         assert_eq!(playback.next_sample(&signal, false), 0.0);
         assert_eq!(playback.next_sample(&signal, true), 1.0);
+    }
+
+    #[test]
+    fn looping_playback_start_offset_selects_an_exact_sample_phase() {
+        let signal = [0.0, 1.0, 2.0, 3.0];
+        let mut playback = SourcePlayback::for_asset("squad-a10-pass", 2, 1.5, signal.len());
+
+        assert_eq!(playback.next_sample(&signal, true), 3.0);
+        assert_eq!(playback.next_sample(&signal, true), 0.0);
     }
 }

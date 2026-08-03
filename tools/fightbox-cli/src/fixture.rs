@@ -733,7 +733,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             checkpoint_impulsive,
-            ["m2-checkpoint-gun", "dshk-return-fire", "a10-strike-line"]
+            [
+                "m2-checkpoint-gun",
+                "dshk-return-fire",
+                "a10-strike-line",
+                "a10-strike-line-west",
+            ]
         );
     }
 

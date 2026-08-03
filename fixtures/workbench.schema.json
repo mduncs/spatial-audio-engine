@@ -196,6 +196,13 @@
           "default": false,
           "description": "Explicitly opts this source into onset-scheduled echo taps when its asset descriptor carries onsets_s. Defaults false in the Rust loader."
         },
+        "playback_start_offset_s": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3.4028234663852886e+38,
+          "default": 0,
+          "description": "Initial phase of a looping source asset in seconds. Sources with the same value remain sample-synchronized."
+        },
         "directivity": {
           "$ref": "#/$defs/directivity"
         },

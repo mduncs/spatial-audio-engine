@@ -31,6 +31,8 @@ pub struct FixtureSource {
     #[serde(default)]
     pub impulsive: bool,
     #[serde(default)]
+    pub playback_start_offset_s: f64,
+    #[serde(default)]
     pub directivity: FixtureDirectivity,
     #[serde(default, deserialize_with = "deserialize_extent")]
     pub extent: ExtentDescriptor,
@@ -250,6 +252,12 @@ impl Fixture {
         for source in &fixture.sources {
             source.initial_position()?;
             source.reference_level.validate(&source.id)?;
+            if !source.playback_start_offset_s.is_finite() || source.playback_start_offset_s < 0.0 {
+                return Err(format!(
+                    "source {} playback_start_offset_s must be finite and non-negative",
+                    source.id
+                ));
+            }
             source.directivity.validate(&source.id)?;
             validate_extent(source.extent, &source.id)?;
             if let Some(trajectory) = &source.trajectory {
@@ -883,8 +891,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixture.fixture_id.as_deref(), Some("checkpoint-block"));
-        assert_eq!(fixture.sources.len(), 7);
-        assert_eq!(fixture.declared_source_count(), 7);
+        assert_eq!(fixture.sources.len(), 8);
+        assert_eq!(fixture.declared_source_count(), 8);
         assert_eq!(
             fixture.initial_listener_position().unwrap(),
             EnuVector3::new(197.5, 292.5, 1.5)
@@ -904,81 +912,94 @@ mod tests {
 
         let expected = [
             ("abrams-idle-checkpoint", "squad-abrams-idle", 90.0),
-            ("fob-radio-checkpoint", "squad-fob-radio-static", 70.0),
             ("mi8-orbit", "squad-mi8-rotor-close", 126.0),
             ("m2-checkpoint-gun", "squad-m2-burst-loop", 153.0),
             ("dshk-return-fire", "squad-dshk-burst-loop", 154.0),
             ("a10-gunrun-sky", "squad-a10-pass", 127.0),
             ("a10-strike-line", "squad-a10-impacts", 163.0),
+            ("a10-gunrun-sky-west", "squad-a10-pass", 127.0),
+            ("a10-strike-line-west", "squad-a10-impacts", 163.0),
         ];
         for (source, (id, asset_id, spl)) in fixture.sources.iter().zip(expected) {
             assert_eq!(source.id, id);
             assert_eq!(source.asset_id, asset_id);
             assert_eq!(source.reference_level.db_spl, spl);
         }
-        assert!(fixture.sources[3].impulsive);
-        assert!(fixture.sources[4].impulsive);
-        assert!(fixture.sources[6].impulsive);
-        assert!(!fixture.sources[5].impulsive);
         assert!(
             fixture
                 .sources
                 .iter()
                 .enumerate()
-                .all(|(index, source)| [3, 4, 6].contains(&index) == source.impulsive)
+                .all(|(index, source)| [2, 3, 5, 7].contains(&index) == source.impulsive)
         );
         assert_eq!(
             fixture.sources[0].extent,
             ExtentDescriptor::LineSegment { length_m: 8.0 }
         );
-        assert_eq!(fixture.sources[1].extent, ExtentDescriptor::Point);
+        assert_eq!(
+            fixture.sources[0].initial_position().unwrap(),
+            EnuVector3::new(285.0, 305.0, 1.5)
+        );
         // Mi-8: 21 m extent models the rotor disc as a 10.5 m occlusion
         // sphere so building shadowing is gradual, not a 1 m point gate.
         assert_eq!(
-            fixture.sources[2].extent,
+            fixture.sources[1].extent,
             ExtentDescriptor::LineSegment { length_m: 21.0 }
         );
-        for source in &fixture.sources[3..5] {
+        for source in &fixture.sources[2..4] {
             assert_eq!(
                 source.extent,
                 ExtentDescriptor::LineSegment { length_m: 2.0 }
             );
         }
         assert_eq!(
-            fixture.sources[3].initial_position().unwrap(),
+            fixture.sources[2].initial_position().unwrap(),
             EnuVector3::new(289.0, 102.5, 2.0)
         );
         assert_eq!(
-            fixture.sources[4].initial_position().unwrap(),
+            fixture.sources[3].initial_position().unwrap(),
             EnuVector3::new(292.5, 342.5, 2.0)
         );
-        assert_eq!(fixture.sources[5].extent, ExtentDescriptor::Point);
-        assert_eq!(
-            fixture.sources[5].initial_position().unwrap(),
-            EnuVector3::new(292.5, 342.5, 127.0)
-        );
-        assert!(!fixture.sources[5].default_enabled);
-        assert_eq!(
-            fixture.sources[6].extent,
-            ExtentDescriptor::LineSegment { length_m: 35.0 }
-        );
-        assert_eq!(
-            fixture.sources[6].initial_position().unwrap(),
-            EnuVector3::new(292.5, 342.5, 2.0)
-        );
-        assert!(!fixture.sources[6].default_enabled);
-        let orbit = fixture.sources[2].trajectory.as_ref().unwrap();
+        for index in [4, 6] {
+            assert_eq!(fixture.sources[index].extent, ExtentDescriptor::Point);
+            assert_eq!(
+                fixture.sources[index].initial_position().unwrap(),
+                EnuVector3::new(197.5, 331.167, 127.0)
+            );
+            assert!(!fixture.sources[index].default_enabled);
+        }
+        for (index, position) in [
+            (5, EnuVector3::new(292.5, 342.5, 2.0)),
+            (7, EnuVector3::new(197.5, 342.5, 2.0)),
+        ] {
+            assert_eq!(
+                fixture.sources[index].extent,
+                ExtentDescriptor::LineSegment { length_m: 35.0 }
+            );
+            assert_eq!(fixture.sources[index].initial_position().unwrap(), position);
+            assert!(!fixture.sources[index].default_enabled);
+        }
+        assert_eq!(fixture.sources[4].playback_start_offset_s, 0.0);
+        assert_eq!(fixture.sources[5].playback_start_offset_s, 0.0);
+        assert_eq!(fixture.sources[6].playback_start_offset_s, 42.0);
+        assert_eq!(fixture.sources[7].playback_start_offset_s, 42.0);
+
+        let orbit = fixture.sources[1].trajectory.as_ref().unwrap();
         assert_eq!(orbit.speed_mps, 30.0);
         assert_eq!(orbit.max_speed_mps, Some(30.0));
-        assert_eq!(
-            orbit.waypoints_m,
-            vec![
-                [102.5, 102.5, 55.0],
-                [482.5, 102.5, 55.0],
-                [482.5, 482.5, 55.0],
-                [102.5, 482.5, 55.0],
-            ]
-        );
+        assert_eq!(orbit.waypoints_m.len(), 48);
+        assert!(orbit.waypoints_m.iter().all(|point| {
+            let east = point[0] - 292.5;
+            let north = point[1] - 292.5;
+            (east.hypot(north) - 190.0).abs() < 1.0e-3 && point[2] == 55.0
+        }));
+
+        let east_racetrack = fixture.sources[4].trajectory.as_ref().unwrap();
+        let west_racetrack = fixture.sources[6].trajectory.as_ref().unwrap();
+        assert_eq!(east_racetrack.waypoints_m, west_racetrack.waypoints_m);
+        assert_eq!(east_racetrack.waypoints_m.len(), 36);
+        assert_eq!(east_racetrack.speed_mps, 10.452049);
+        assert_eq!(east_racetrack.max_speed_mps, Some(10.452049));
     }
 
     #[test]
