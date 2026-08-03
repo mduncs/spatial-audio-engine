@@ -62,6 +62,11 @@ const DIRECT_ONLY: StageOutputGains = StageOutputGains {
     pathing: 0.0,
     reflections: 0.0,
 };
+const PATH_ONLY: StageOutputGains = StageOutputGains {
+    direct: 0.0,
+    pathing: 1.0,
+    reflections: 0.0,
+};
 
 const LISTENERS: [ListenerCase; 3] = [
     ListenerCase {
@@ -158,12 +163,16 @@ struct MeasurementRow {
     boot: QualityGovernorTelemetry,
     delivered: QualityGovernorTelemetry,
     direct_occlusion: f32,
+    path_eq: [f32; 3],
+    path_sh_energy: f32,
     source_has_probe: bool,
     listener_has_probe: bool,
     sdk_ir_frames: i32,
     sdk_reverb_times_s: [f32; 3],
     tick_cost: TickCost,
     direct_peak_dbfs: f64,
+    path: TailMetrics,
+    all_stages: TailMetrics,
     tail: TailMetrics,
     tail_below_direct_db: f64,
     crack_window_energy: f64,
@@ -286,6 +295,8 @@ fn measure_case(
     let propagation = simulation.snapshot.sources[BLAST_SOURCE];
     let reflection = propagation.reflections;
     let direct_occlusion = propagation.direct.occlusion;
+    let path_eq = propagation.path_eq;
+    let path_sh_energy = coefficient_energy(propagation.path_sh);
     let source_has_probe = simulation
         .world
         .has_influencing_probe(simulation.frame.sources[BLAST_SOURCE].position);
@@ -310,6 +321,24 @@ fn measure_case(
         plan.blast.arrival_time_s,
         delivered_ir_s,
         listener_case.inspect_echoes,
+    );
+
+    settle_event_sources(&mut render, &mut stage_gains, PATH_ONLY);
+    let path_capture = render_source_program(&mut render, BLAST_SOURCE, &blast_program);
+    let path = analyze_tail(
+        &path_capture,
+        plan.blast.arrival_time_s,
+        delivered_ir_s,
+        false,
+    );
+
+    settle_event_sources(&mut render, &mut stage_gains, StageOutputGains::UNITY);
+    let all_stages_capture = render_source_program(&mut render, BLAST_SOURCE, &blast_program);
+    let all_stages = analyze_tail(
+        &all_stages_capture,
+        plan.blast.arrival_time_s,
+        delivered_ir_s,
+        false,
     );
 
     // Measure the direct stage with the identical source, unit impulse, distance
@@ -346,12 +375,16 @@ fn measure_case(
         boot,
         delivered,
         direct_occlusion,
+        path_eq,
+        path_sh_energy,
         source_has_probe,
         listener_has_probe,
         sdk_ir_frames: reflection.ir_size,
         sdk_reverb_times_s: reflection.reverb_times,
         tick_cost,
         direct_peak_dbfs,
+        path,
+        all_stages,
         tail,
         tail_below_direct_db,
         crack_window_energy,
@@ -751,6 +784,13 @@ fn stereo_energy(stereo: &[f32]) -> f64 {
         .sum()
 }
 
+fn coefficient_energy(coefficients: [f32; 16]) -> f32 {
+    coefficients
+        .into_iter()
+        .map(|coefficient| coefficient * coefficient)
+        .sum()
+}
+
 fn peak_dbfs(stereo: &[f32]) -> f64 {
     let peak_frame_energy = stereo
         .chunks_exact(2)
@@ -805,7 +845,7 @@ fn print_configuration(package: &Path, bake: &Path, mesh: &SceneMesh) {
 
 fn print_measurement_table(rows: &[MeasurementRow]) {
     println!(
-        "WAVE14_TABLE config\trepeat\tlistener\tposition\tdistance_m\tdirect_occlusion\tdirect_stage_peak_dbfs\ttail_below_direct_db\tsource_probe\tlistener_probe\tboot_level\tdelivered_level\trays\tbounces\trequested_ir_s\tdelivered_ir_s\tcadence\tsdk_ir_frames\tsdk_ir_s\tcapacity_clamped\treverb_times_s\texecuted_tick_median_ms\texecuted_tick_p95_ms\texecuted_tick_max_ms\ttail_energy\ttail_peak_dbfs\ttail_above_signal_floor\tfirst_after_blast_ms\tedc_t20_s\tedc_t40_s\tedc_t60_s\tdiscrete_count"
+        "WAVE14_TABLE config\trepeat\tlistener\tposition\tdistance_m\tdirect_occlusion\tdirect_stage_peak_dbfs\tpath_energy\tpath_peak_dbfs\tpath_first_after_blast_ms\tpath_below_direct_db\tall_stages_energy\tall_stages_peak_dbfs\tall_stages_first_after_blast_ms\tpath_sh_energy\tpath_eq\ttail_below_direct_db\tsource_probe\tlistener_probe\tboot_level\tdelivered_level\trays\tbounces\trequested_ir_s\tdelivered_ir_s\tcadence\tsdk_ir_frames\tsdk_ir_s\tcapacity_clamped\treverb_times_s\texecuted_tick_median_ms\texecuted_tick_p95_ms\texecuted_tick_max_ms\ttail_energy\ttail_peak_dbfs\ttail_above_signal_floor\tfirst_after_blast_ms\tedc_t20_s\tedc_t40_s\tedc_t60_s\tdiscrete_count"
     );
     for row in rows {
         let delivered = row.delivered.reflections;
@@ -813,7 +853,7 @@ fn print_measurement_table(rows: &[MeasurementRow]) {
         let capacity_clamped = row.config.force_full
             && (sdk_ir_s - f64::from(row.config.requested_ir_s)).abs() > 1.0 / SAMPLE_RATE as f64;
         println!(
-            "WAVE14_TABLE {}\t{}\t{}\t[{:.1},{:.1},{:.1}]\t{:.3}\t{:.9e}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{sdk_ir_s:.6}\t{}\t{:.3}/{:.3}/{:.3}\t{:.6}\t{:.6}\t{:.6}\t{:.9e}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "WAVE14_TABLE {}\t{}\t{}\t[{:.1},{:.1},{:.1}]\t{:.3}\t{:.9e}\t{}\t{:.9e}\t{}\t{}\t{}\t{:.9e}\t{}\t{}\t{:.9e}\t{:.6}/{:.6}/{:.6}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{sdk_ir_s:.6}\t{}\t{:.3}/{:.3}/{:.3}\t{:.6}\t{:.6}\t{:.6}\t{:.9e}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.config.label,
             row.config.honest_repeat,
             row.listener.label,
@@ -823,6 +863,17 @@ fn print_measurement_table(rows: &[MeasurementRow]) {
             distance(MUZZLE, row.listener.position),
             row.direct_occlusion,
             format_db(row.direct_peak_dbfs),
+            row.path.energy,
+            format_db(row.path.peak_dbfs),
+            format_option(row.path.first_arrival_after_blast_ms, 3),
+            format_db(row.path.peak_dbfs - row.direct_peak_dbfs),
+            row.all_stages.energy,
+            format_db(row.all_stages.peak_dbfs),
+            format_option(row.all_stages.first_arrival_after_blast_ms, 3),
+            row.path_sh_energy,
+            row.path_eq[0],
+            row.path_eq[1],
+            row.path_eq[2],
             format_db(row.tail_below_direct_db),
             row.source_has_probe,
             row.listener_has_probe,
