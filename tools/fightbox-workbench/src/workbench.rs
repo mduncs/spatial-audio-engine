@@ -3587,6 +3587,74 @@ mod tests {
     }
 
     #[test]
+    fn ballistic_transient_plans_test_local_crack_and_blast_slots() {
+        let fixture = Fixture::parse(
+            br#"{
+                "fixture_id": "test-local-ballistic-slots",
+                "sources": [
+                    {"id":"steady-0","asset_id":"unused","reference_level":{"mode":"SplAtOneMeter","db_spl":90.0},"position_m":[0.0,0.0,1.5]},
+                    {"id":"steady-1","asset_id":"unused","reference_level":{"mode":"SplAtOneMeter","db_spl":90.0},"position_m":[1.0,0.0,1.5]},
+                    {"id":"steady-2","asset_id":"unused","reference_level":{"mode":"SplAtOneMeter","db_spl":90.0},"position_m":[2.0,0.0,1.5]},
+                    {"id":"steady-3","asset_id":"unused","reference_level":{"mode":"SplAtOneMeter","db_spl":90.0},"position_m":[3.0,0.0,1.5]},
+                    {"id":"steady-4","asset_id":"unused","reference_level":{"mode":"SplAtOneMeter","db_spl":90.0},"position_m":[4.0,0.0,1.5]},
+                    {"id":"steady-5","asset_id":"unused","reference_level":{"mode":"SplAtOneMeter","db_spl":90.0},"position_m":[5.0,0.0,1.5]},
+                    {"id":"steady-6","asset_id":"unused","reference_level":{"mode":"SplAtOneMeter","db_spl":90.0},"position_m":[6.0,0.0,1.5]}
+                ],
+                "events": [{
+                    "kind": "ballistic_shot",
+                    "id": "test-shot",
+                    "trigger_key": "space",
+                    "event_sources": {
+                        "crack": {"id": "test-shot-crack", "default_active": false},
+                        "blast": {"id": "test-shot-blast", "default_active": false}
+                    },
+                    "muzzle_m": [0.0, 0.0, 1.5],
+                    "direction_enu": [1.0, 0.0, 0.0],
+                    "mach": 2.0,
+                    "asset_id": "unused",
+                    "levels": {
+                        "blast_spl_at_one_meter_db": 140.0,
+                        "crack_over_blast_db_at_30_m": 3.0
+                    }
+                }],
+                "listener": {"position_m":[0.0,5.0,1.5],"forward_enu":[0.0,1.0,0.0]},
+                "simulation": {
+                    "direct": {},
+                    "reflections": {},
+                    "pathing": {},
+                    "probe_volume": {"spacing_m": 4.0}
+                }
+            }"#,
+            "test-local-ballistic-slots",
+        )
+        .unwrap();
+        assert!(fixture.event_requires_transient_rebuild());
+
+        let steady = SceneBuildMode::Steady {
+            listener_override: None,
+        };
+        let steady_ids = planned_physical_source_ids(&fixture, &steady);
+        assert_eq!(steady_ids.len(), 7);
+        assert!(!steady_ids.iter().any(|id| id == "test-shot-crack"));
+        assert!(!steady_ids.iter().any(|id| id == "test-shot-blast"));
+
+        let transient = SceneBuildMode::BallisticTransient {
+            listener: ListenerControl::at(
+                EnuVector3::new(0.0, 5.0, 1.5),
+                EnuVector3::new(0.0, 1.0, 0.0),
+            ),
+            omitted_source_ids: vec!["steady-6".into()],
+        };
+        let transient_ids = planned_physical_source_ids(&fixture, &transient);
+        assert_eq!(transient_ids.len(), fightbox_runtime::MAX_ACTIVE_SOURCES);
+        assert!(!transient_ids.iter().any(|id| id == "steady-6"));
+        assert_eq!(
+            &transient_ids[transient_ids.len() - 2..],
+            ["test-shot-crack", "test-shot-blast"]
+        );
+    }
+
+    #[test]
     fn checkpoint_autopilot_uses_the_fixture_loop_and_walking_speed() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let fixture = Fixture::read(&root.join("fixtures/checkpoint/fixture.json")).unwrap();

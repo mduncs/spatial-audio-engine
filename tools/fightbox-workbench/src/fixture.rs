@@ -319,7 +319,7 @@ impl Fixture {
         Self::parse(&bytes, &path.display().to_string())
     }
 
-    fn parse(bytes: &[u8], source: &str) -> Result<Self, String> {
+    pub(crate) fn parse(bytes: &[u8], source: &str) -> Result<Self, String> {
         let fixture: Self = serde_json::from_slice(bytes)
             .map_err(|error| format!("invalid fixture {source}: {error}"))?;
         if fixture.sources.is_empty()
@@ -1048,9 +1048,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixture.fixture_id.as_deref(), Some("checkpoint-block"));
-        assert_eq!(fixture.sources.len(), 5);
+        assert_eq!(fixture.sources.len(), 7);
         assert!(fixture.events.is_empty());
-        assert_eq!(fixture.declared_source_count(), 5);
+        assert_eq!(fixture.declared_source_count(), 7);
         assert!(!fixture.event_requires_transient_rebuild());
         assert_eq!(
             fixture.initial_listener_position().unwrap(),
@@ -1075,6 +1075,8 @@ mod tests {
             ("mi8-orbit", "squad-mi8-rotor-close", 126.0),
             ("m2-checkpoint-gun", "squad-m2-burst-loop", 153.0),
             ("dshk-return-fire", "squad-dshk-burst-loop", 154.0),
+            ("a10-gunrun-sky", "squad-a10-pass", 127.0),
+            ("a10-strike-line", "squad-a10-impacts", 163.0),
         ];
         for (source, (id, asset_id, spl)) in fixture.sources.iter().zip(expected) {
             assert_eq!(source.id, id);
@@ -1092,7 +1094,7 @@ mod tests {
             fixture.sources[2].extent,
             ExtentDescriptor::LineSegment { length_m: 21.0 }
         );
-        for source in &fixture.sources[3..] {
+        for source in &fixture.sources[3..5] {
             assert_eq!(
                 source.extent,
                 ExtentDescriptor::LineSegment { length_m: 2.0 }
@@ -1106,6 +1108,21 @@ mod tests {
             fixture.sources[4].initial_position().unwrap(),
             EnuVector3::new(292.5, 342.5, 2.0)
         );
+        assert_eq!(fixture.sources[5].extent, ExtentDescriptor::Point);
+        assert_eq!(
+            fixture.sources[5].initial_position().unwrap(),
+            EnuVector3::new(292.5, 342.5, 127.0)
+        );
+        assert!(!fixture.sources[5].default_enabled);
+        assert_eq!(
+            fixture.sources[6].extent,
+            ExtentDescriptor::LineSegment { length_m: 35.0 }
+        );
+        assert_eq!(
+            fixture.sources[6].initial_position().unwrap(),
+            EnuVector3::new(292.5, 342.5, 2.0)
+        );
+        assert!(!fixture.sources[6].default_enabled);
         let orbit = fixture.sources[2].trajectory.as_ref().unwrap();
         assert_eq!(orbit.speed_mps, 30.0);
         assert_eq!(orbit.max_speed_mps, Some(30.0));

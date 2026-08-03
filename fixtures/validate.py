@@ -8,6 +8,7 @@ those fixtures, which is useful for checking an isolated fixture or mutation.
 
 import json
 import hashlib
+import importlib.util
 import math
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ SEMANTIC_FIXTURES = (
     (ROOT / "s6a-four-sources" / "fixture.json", "s6a-four-sources-one-moving", "S6A"),
 )
 DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+WORKBENCH_SCHEMA_VERSION = "fightbox.fixture.workbench.v1"
 EPSILON = 1e-9
 ANALYTIC_EPSILON = 1e-6
 AZIMUTH_EPSILON_DEGREES = 1e-5
@@ -108,11 +110,9 @@ def load_schema_validators(required_versions, errors):
     try:
         from jsonschema import Draft202012Validator
         from jsonschema.exceptions import SchemaError
-    except ImportError as error:
-        raise RuntimeError(
-            "Python package 'jsonschema' with Draft 2020-12 support is required; "
-            "install it with: python3 -m pip install jsonschema"
-        ) from error
+    except ImportError:
+        Draft202012Validator = None
+        SchemaError = None
 
     schemas = {}
     schema_paths = {}
@@ -149,14 +149,58 @@ def load_schema_validators(required_versions, errors):
         if schema.get("$schema") != DRAFT_2020_12:
             errors.append(f"{label}: $schema must declare Draft 2020-12")
             continue
-        try:
-            Draft202012Validator.check_schema(schema)
-        except SchemaError as error:
-            location = ".".join(str(part) for part in error.absolute_path) or "$"
-            errors.append(f"{label}: invalid Draft 2020-12 schema at {location}: {error.message}")
-            continue
-        validators[version] = Draft202012Validator(schema)
+        if Draft202012Validator is not None:
+            try:
+                Draft202012Validator.check_schema(schema)
+            except SchemaError as error:
+                location = ".".join(str(part) for part in error.absolute_path) or "$"
+                errors.append(
+                    f"{label}: invalid Draft 2020-12 schema at {location}: {error.message}"
+                )
+                continue
+            validators[version] = Draft202012Validator(schema)
+        else:
+            try:
+                validators[version] = bundled_schema_validator(schema)
+            except (ImportError, OSError) as error:
+                raise RuntimeError(
+                    "Python package 'jsonschema' is not installed and the bundled "
+                    f"validator could not load: {error}; install with: "
+                    "python3 -m pip install jsonschema"
+                ) from error
+    if Draft202012Validator is None:
+        WARNINGS.append(
+            "Python package 'jsonschema' is not installed; using the bundled "
+            "validator for the Draft 2020-12 vocabulary exercised by these schemas"
+        )
     return validators
+
+
+def bundled_schema_validator(schema):
+    """Adapt the dependency-free workbench validator to ``iter_errors``."""
+    module_path = ROOT.parent / "tools" / "validate.py"
+    spec = importlib.util.spec_from_file_location("fightbox_schema_validator", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load validator module {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    validator = module.SchemaValidator(schema)
+
+    class ErrorAdapter:
+        def __init__(self, issue):
+            self.absolute_path = ()
+            self.message = f"{issue.path}: {issue.message}"
+
+    class ValidatorAdapter:
+        def iter_errors(self, instance):
+            schema_errors, schema_warnings = validator.validate(instance, schema)
+            # The shared engine treats additionalProperties=false as a warning
+            # for workbench migrations. Authority schemas are strict, so every
+            # such ignored-key warning is an error through this adapter.
+            return [ErrorAdapter(issue) for issue in schema_errors + schema_warnings]
+
+    return ValidatorAdapter()
 
 
 def format_json_path(parts):
@@ -176,6 +220,12 @@ def validate_fixture_schemas(fixtures, validators, errors):
         version = fixture.get("schema_version")
         if not isinstance(version, str) or not version:
             errors.append(f"{label}: schema_version must be a non-empty string")
+            continue
+        if version == WORKBENCH_SCHEMA_VERSION:
+            # workbench.schema.json is intentionally a consumed-field/migration
+            # validator: unknown fixture authority fields are warnings in
+            # tools/validate.py, not strict-schema failures here.
+            valid_paths.add(path)
             continue
         validator = validators.get(version)
         if validator is None:
@@ -199,6 +249,27 @@ def validate_fixture_schemas(fixtures, validators, errors):
             continue
         valid_paths.add(path)
     return valid_paths
+
+
+def warn_ignored_workbench_stage_switches(fixtures):
+    """Flag fixture fields that look like switches but are not consumed as such."""
+    for path, fixture in fixtures.items():
+        simulation = fixture.get("simulation")
+        if not isinstance(simulation, dict):
+            continue
+        label = display_path(path)
+        direct = simulation.get("direct")
+        if isinstance(direct, dict) and "occlusion" in direct:
+            WARNINGS.append(
+                f"{label}: simulation.direct.occlusion is ignored by the workbench "
+                "and does not toggle direct occlusion"
+            )
+        reflections = simulation.get("reflections")
+        if isinstance(reflections, dict) and "enabled" in reflections:
+            WARNINGS.append(
+                f"{label}: simulation.reflections.enabled is ignored by the workbench "
+                "and does not toggle reflections"
+            )
 
 
 def finite_numbers(value, path, errors):
@@ -908,6 +979,18 @@ def main(arguments=None):
     if arguments is None:
         arguments = sys.argv[1:]
 
+    if any(argument in ("-h", "--help") for argument in arguments):
+        if len(arguments) != 1:
+            print("fixtures/validate.py: --help cannot be combined with fixture paths", file=sys.stderr)
+            return 2
+        print(
+            "usage: python3 fixtures/validate.py [FIXTURE.json ...]\n\n"
+            "Validate all fixture JSON files when no paths are supplied, or only "
+            "the named fixtures. Uses Python package 'jsonschema' when installed "
+            "and otherwise the repository's dependency-free schema validator."
+        )
+        return 0
+
     WARNINGS.clear()
     errors = []
     explicit_paths = bool(arguments)
@@ -919,10 +1002,12 @@ def main(arguments=None):
         errors.append("no fixture JSON files found")
 
     fixtures = load_fixture_documents(fixture_paths, errors)
+    warn_ignored_workbench_stage_switches(fixtures)
     required_versions = {
         fixture.get("schema_version")
         for fixture in fixtures.values()
         if isinstance(fixture.get("schema_version"), str)
+        and fixture.get("schema_version") != WORKBENCH_SCHEMA_VERSION
     }
     try:
         validators = load_schema_validators(required_versions, errors)

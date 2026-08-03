@@ -2,6 +2,7 @@
 //! probe baking, and package-backed S6a offline capture rendering.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use fightbox_api::EnuVector3;
 use fightbox_steam_audio::{
@@ -535,6 +536,46 @@ impl Default for BakeConfig {
     }
 }
 
+fn city_bake_manifest(
+    materials_content_sha256: &str,
+    mesh_content_sha256: &str,
+    probe_batch_sha256: &str,
+    config: &BakeConfig,
+    bake_duration_s: f64,
+) -> Value {
+    let elevated_spacing_m = config
+        .elevated_probe_spacing_m
+        .unwrap_or(config.probe_spacing_m);
+    let elevated_probe_layers = config
+        .elevated_probe_layers_m
+        .iter()
+        .map(|height_enu_m| {
+            json!({
+                "height_enu_m": height_enu_m,
+                "spacing_m": elevated_spacing_m,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": "fightbox.city-bake.v1",
+        "materials_content_sha256": materials_content_sha256,
+        "mesh_content_sha256": mesh_content_sha256,
+        "probe_batch_sha256": probe_batch_sha256,
+        "bake_config": {
+            "probe_ceiling_m": config.probe_ceiling_m,
+            "floor_probe_spacing_m": config.probe_spacing_m,
+            "probe_height_above_floor_m": config.probe_height_above_floor_m,
+            "elevated_probe_layers": elevated_probe_layers,
+            "path_range_m": config.path_range_m,
+            "visibility_range_m": config.visibility_range_m,
+            "visibility_samples": config.visibility_samples,
+            "visibility_threshold": config.visibility_threshold,
+            "threads": config.bake_threads,
+        },
+        "bake_duration_s": bake_duration_s,
+    })
+}
+
 /// The mid-air layers `config` asks for, at their effective spacing.
 ///
 /// Probe positions are a pure function of the layer, the probe volume, and the
@@ -676,6 +717,7 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
     );
 
     let defaults = PathBakeConfig::default();
+    let bake_started = Instant::now();
     let baked = bake_s3(&S3BakeRequest {
         mesh: scene,
         probes,
@@ -690,6 +732,7 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
         },
     })
     .map_err(|error| CliError::new(format!("city bake failed: {error}")))?;
+    let bake_duration_s = bake_started.elapsed().as_secs_f64();
     baked
         .validate()
         .map_err(|error| CliError::new(format!("city bake validation failed: {error}")))?;
@@ -708,12 +751,13 @@ pub(crate) fn bake_with_config(package: &Path, output: &Path, config: BakeConfig
         &temp.join("probe-batch-metadata.json"),
         &baked.metadata.to_json(),
     )?;
-    let city_manifest = json!({
-        "schema_version": "fightbox.city-bake.v1",
-        "materials_content_sha256": loaded.manifest.materials_content_sha256,
-        "mesh_content_sha256": loaded.manifest.mesh_content_sha256,
-        "probe_batch_sha256": baked.metadata.content_sha256,
-    });
+    let city_manifest = city_bake_manifest(
+        &loaded.manifest.materials_content_sha256,
+        &loaded.manifest.mesh_content_sha256,
+        &baked.metadata.content_sha256,
+        &config,
+        bake_duration_s,
+    );
     write_json_string_atomic(
         &temp.join("city-bake-manifest.json"),
         &city_manifest.to_string(),
@@ -1371,6 +1415,45 @@ mod tests {
         );
         assert!(BakeConfig::default().elevated_probe_layers_m.is_empty());
         assert!(BakeConfig::default().elevated_probe_spacing_m.is_none());
+    }
+
+    #[test]
+    fn city_bake_manifest_records_the_effective_bake_configuration() {
+        let config = BakeConfig {
+            path_range_m: 600.0,
+            visibility_range_m: 20.0,
+            visibility_samples: 4,
+            visibility_threshold: 0.25,
+            probe_spacing_m: 8.0,
+            probe_height_above_floor_m: 3.0,
+            probe_ceiling_m: 63.0,
+            elevated_probe_layers_m: vec![30.0, 80.0],
+            elevated_probe_spacing_m: Some(16.0),
+            bake_threads: 10,
+        };
+        let manifest = city_bake_manifest("materials", "mesh", "probes", &config, 12.5);
+
+        assert_eq!(manifest["materials_content_sha256"], "materials");
+        assert_eq!(manifest["mesh_content_sha256"], "mesh");
+        assert_eq!(manifest["probe_batch_sha256"], "probes");
+        assert_eq!(manifest["bake_duration_s"], 12.5);
+        assert_eq!(
+            manifest["bake_config"],
+            json!({
+                "probe_ceiling_m": 63.0,
+                "floor_probe_spacing_m": 8.0,
+                "probe_height_above_floor_m": 3.0,
+                "elevated_probe_layers": [
+                    {"height_enu_m": 30.0, "spacing_m": 16.0},
+                    {"height_enu_m": 80.0, "spacing_m": 16.0},
+                ],
+                "path_range_m": 600.0,
+                "visibility_range_m": 20.0,
+                "visibility_samples": 4,
+                "visibility_threshold": 0.25,
+                "threads": 10,
+            })
+        );
     }
 
     #[test]

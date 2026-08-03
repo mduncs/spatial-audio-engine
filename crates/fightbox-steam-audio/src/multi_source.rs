@@ -3702,7 +3702,7 @@ mod tests {
     }
 
     #[test]
-    fn weight_zero_direct_render_is_bit_identical_to_the_prechange_fingerprint() {
+    fn weight_zero_unbaked_direct_render_is_bit_identical_to_the_prechange_fingerprint() {
         let toward = ApiEnuVector3::new(2.0, 3.0, 0.0);
         let (legacy_default, legacy_direct) = directivity_capture(None, toward, None);
         let (explicit_omni, explicit_direct) =
@@ -3730,6 +3730,8 @@ mod tests {
 
         // Captured before directivity was plumbed through `source_inputs`: this
         // pins the same deterministic scene, tone, direct effect, and HRTF PCM.
+        // `directivity_capture` deliberately constructs no baked probe batch,
+        // so this golden covers the unbaked direct chain, not pathing.
         let hash = crate::sha256_hex(&sample_bytes(&explicit_omni));
         assert_eq!(
             hash,

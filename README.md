@@ -42,7 +42,7 @@ Acquire the Steam Audio SDK (verified download into ignored `.cache/`):
 
 ```sh
 scripts/acquire-steam-audio.sh
-export STEAM_AUDIO_SDK_DIR="$PWD/.cache/steam-audio/steamaudio-4.8.1"
+export STEAM_AUDIO_SDK_DIR="$PWD/.cache/steam-audio/steamaudio-4.8.1/steamaudio"
 cargo test --workspace --features linked-sdk
 ```
 

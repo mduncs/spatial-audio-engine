@@ -6,6 +6,8 @@ Dependency-free (stdlib only). Enforces the structural contract in
 
   * the selected ``kind`` must carry *exactly* its matching generator block, and
     no other generator block (no mismatched kind/generator);
+  * file-backed WAV descriptors must carry the pinned path/hash/frame/loop
+    contract and the workbench's mono 48 kHz decode format;
   * generator frequencies must be finite, positive, below Nyquist for the
     declared sample rate, and unique;
   * ``target_rms_dbfs`` must be a finite JSON number strictly below 0 dBFS;
@@ -26,7 +28,7 @@ from pathlib import Path
 MANDATORY_NON_CLAIM = (
     "This descriptor makes no delivered-ear-SPL claim without output calibration."
 )
-KINDS = ("sine", "multitone", "pink_like")
+KINDS = ("sine", "multitone", "pink_like", "wav")
 
 
 class Invalid(Exception):
@@ -92,7 +94,10 @@ def _check_common(record: dict) -> None:
     generator = record["generator"]
     if not isinstance(generator, dict):
         raise Invalid("generator must be an object")
-    if generator.get("module") != "fightbox_evidence::signal":
+    if record["kind"] == "wav":
+        if "module" in generator:
+            raise Invalid("wav kind must not declare generator.module")
+    elif generator.get("module") != "fightbox_evidence::signal":
         raise Invalid("generator.module must be 'fightbox_evidence::signal'")
 
 
@@ -143,6 +148,38 @@ def _check_generator(record: dict) -> None:
         seed = block.get("seed")
         if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
             raise Invalid("generator.pink_like.seed must be a non-negative integer")
+    elif kind == "wav":
+        required = {"path", "sha256", "start_frame", "loop"}
+        missing = sorted(required - set(block))
+        unknown = sorted(set(block) - required)
+        if missing:
+            raise Invalid(f"generator.wav missing fields: {', '.join(missing)}")
+        if unknown:
+            raise Invalid(f"generator.wav unknown fields: {', '.join(unknown)}")
+        path = block["path"]
+        sha256 = block["sha256"]
+        start_frame = block["start_frame"]
+        loop = block["loop"]
+        if not isinstance(path, str) or not path:
+            raise Invalid("generator.wav.path must be a non-empty string")
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise Invalid("generator.wav.sha256 must be 64 lowercase hex characters")
+        if (
+            not isinstance(start_frame, int)
+            or isinstance(start_frame, bool)
+            or start_frame < 0
+        ):
+            raise Invalid("generator.wav.start_frame must be a non-negative integer")
+        if not isinstance(loop, bool):
+            raise Invalid("generator.wav.loop must be boolean")
+        if record["channels"] != 1:
+            raise Invalid("wav assets must declare channels=1")
+        if record["sample_rate_hz"] != 48_000:
+            raise Invalid("wav assets must declare sample_rate_hz=48000")
 
 
 def validate_descriptor(record: object) -> None:

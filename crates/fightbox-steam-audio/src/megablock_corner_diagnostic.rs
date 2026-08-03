@@ -41,6 +41,9 @@ const STAGE_MEASURE_BLOCKS: usize = 192;
 const SIMULATION_SETTLE_PASSES: usize = 4;
 const TOP_RECOVERY_TIMING_NS: u64 = 100_000;
 const TOP_RECOVERY_MAX_OBSERVATIONS: usize = 30_000;
+const BOTTOM_DEGRADE_TIMING_NS: u64 = 10_000_000;
+const BOTTOM_SETTLE_TIMING_NS: u64 = 100_000;
+const BOTTOM_DEGRADE_MAX_CYCLES: usize = 64;
 const STOCHASTIC_REPEAT_COUNT: usize = 5;
 
 const FULL_REFLECTION_RAYS: i32 = 4_096;
@@ -242,7 +245,7 @@ fn megablock_corner_stage_energy_diagnostic() {
          requested_point_source_differs_from_fixture_artillery_LineSegment(6m); \
          continuous_deterministic_noise_replaces_workbench_retriggered_artillery_asset; \
          offline_explicit_simulation_passes_replace_live_60/15/5Hz_scheduler; \
-         startup-bottom_receives_no_timing_samples; reduced-delivered_and_headroom-top_are_held_after_0.100ms \
+         startup-bottom_is_driven_down_by_10ms/0.1ms/0.1ms_timing_cycles; reduced-delivered_and_headroom-top_are_held_after_0.100ms \
          synthetic_callback_observations; reduced-cadence2_is_reported_not_scheduled; \
          no_cpal_device_or_live_callback_jitter"
     );
@@ -343,23 +346,15 @@ fn run_sweep_repeat(
     let mut stage_gains = render
         .take_stage_output_gain_writer()
         .expect("take corner diagnostic stage control");
-    let initial = simulation.quality_governor_telemetry();
-    assert_eq!(initial.sources[0].quality, SourceQualityLevel::DirectOnly);
-    assert_eq!(initial.reflections.level, ReflectionQualityLevel::Minimum);
-    assert_eq!(initial.reflections.bounces, 0);
-    assert_eq!(initial.pathing, PathQualityLevel::PrimaryOnly);
-    assert_eq!(initial.ambisonic_order, 0);
-    assert_eq!(initial.reverb, ReverbStrategy::ShortIrLowerOrder);
-
     let recovery_observations = match mode {
-        SweepMode::StartupBottom => 0,
+        SweepMode::StartupBottom => force_governor_to_bottom(&mut simulation),
         SweepMode::ReducedDelivered | SweepMode::HeadroomTop => {
             recover_governor_to_top(&mut simulation, config)
         }
     };
     let expected = simulation.quality_governor_telemetry();
     match mode {
-        SweepMode::StartupBottom => assert!(expected.ladder_position > 0),
+        SweepMode::StartupBottom => assert_bottom_quality(expected),
         SweepMode::ReducedDelivered | SweepMode::HeadroomTop => {
             assert_top_quality(expected, config)
         }
@@ -469,6 +464,42 @@ fn recover_governor_to_top(
     panic!(
         "governor did not recover to top: {:?}",
         simulation.quality_governor_telemetry()
+    );
+}
+
+fn force_governor_to_bottom(simulation: &mut MultiSourceSimulation) -> usize {
+    let mut observations = 0;
+    for _ in 0..BOTTOM_DEGRADE_MAX_CYCLES {
+        if is_bottom_quality(simulation.quality_governor_telemetry()) {
+            return observations;
+        }
+        simulation.observe_render_timing(BOTTOM_DEGRADE_TIMING_NS);
+        simulation.observe_render_timing(BOTTOM_SETTLE_TIMING_NS);
+        simulation.observe_render_timing(BOTTOM_SETTLE_TIMING_NS);
+        observations += 3;
+    }
+    panic!(
+        "governor did not reach the startup-bottom control: {:?}",
+        simulation.quality_governor_telemetry()
+    );
+}
+
+fn is_bottom_quality(quality: QualityGovernorTelemetry) -> bool {
+    quality.reflections.level == ReflectionQualityLevel::Minimum
+        && quality.reflections.bounces == 0
+        && quality.pathing == PathQualityLevel::PrimaryOnly
+        && quality.ambisonic_order == 0
+        && quality.reverb == ReverbStrategy::ShortIrLowerOrder
+        && (quality.reflection_output_gain - 1.0).abs() <= f32::EPSILON
+        && quality.sources[..usize::from(quality.source_count)]
+            .iter()
+            .all(|source| source.quality == SourceQualityLevel::DirectOnly)
+}
+
+fn assert_bottom_quality(quality: QualityGovernorTelemetry) {
+    assert!(
+        is_bottom_quality(quality),
+        "expected the complete startup-bottom rung: {quality:?}"
     );
 }
 

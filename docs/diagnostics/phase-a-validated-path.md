@@ -104,7 +104,7 @@ The SDK callback trace is opt-in through
 the blocking path run. Reproduce the focused cases and full bounded matrix with:
 
 ```sh
-export STEAM_AUDIO_SDK_DIR="$PWD/.cache/steam-audio/steamaudio-4.8.1"
+export STEAM_AUDIO_SDK_DIR="$PWD/.cache/steam-audio/steamaudio-4.8.1/steamaudio"
 rustup run stable cargo test -p fightbox-steam-audio --features linked-sdk \
   legacy_concave_s3_corner_exposes_validation_limit_and_unvalidated_path_moment
 rustup run stable cargo test -p fightbox-steam-audio --features linked-sdk \

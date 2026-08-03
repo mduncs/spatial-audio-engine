@@ -67,7 +67,8 @@ listening init --output <directory>\n    \
                   Write blank JSON and Markdown qualification forms\n    \
 listening validate <directory>\n    \
                   Validate completed observations and listener sign-off\n\n\
-city compile     Compile GeoJSON into a deterministic .fightbox package\n    \
+city compile --geojson <path> --output <path>\n    \
+                  Compile GeoJSON into a deterministic .fightbox package\n    \
 city synth       Generate a deterministic Manhattan-style GeoJSON city\n    \
 city inspect     Print a package manifest summary and assumptions\n    \
 city export-obj  Export a package mesh as deterministic triangulated OBJ\n    \
@@ -533,6 +534,14 @@ fn dispatch_phase_a(args: &[String]) -> error::Result<()> {
             println!("{result}");
             Ok(())
         }
+        Some("sweep")
+            if args
+                .get(1)
+                .is_some_and(|arg| matches!(arg.as_str(), "help" | "--help" | "-h")) =>
+        {
+            print!("{HELP}");
+            Ok(())
+        }
         Some("sweep") => sweep::run(sweep::parse_args(&args[1..])?),
         Some("__sweep-child") => sweep::run_child(&args[1..]),
         Some(sub) => Err(error::CliError::new(format!(
@@ -702,12 +711,18 @@ mod tests {
         assert!(HELP.contains("phase-b s6b-soak"));
         assert!(HELP.contains("listening init --output"));
         assert!(HELP.contains("listening validate <directory>"));
+        assert!(HELP.contains("city compile --geojson <path> --output <path>"));
     }
 
     #[test]
     fn dispatch_help_with_no_args() {
         // No args should print help and succeed.
         assert!(dispatch(&[]).is_ok());
+    }
+
+    #[test]
+    fn dispatch_phase_a_sweep_help_succeeds_without_running_a_sweep() {
+        assert!(dispatch(&["phase-a".into(), "sweep".into(), "--help".into()]).is_ok());
     }
 
     #[test]

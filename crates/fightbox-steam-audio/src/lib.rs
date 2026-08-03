@@ -371,6 +371,16 @@ impl AcousticMaterial {
     };
 }
 
+/// Converts per-band transmission loss in dB to Steam Audio material coefficients.
+///
+/// Steam Audio's direct effect applies `IPLMaterial::transmission` as an amplitude
+/// EQ gain, so the conversion is `10^(-TL/20)`, not the `/10` energy-ratio formula.
+/// Callers are responsible for supplying finite, non-negative loss values.
+#[must_use]
+pub fn transmission_coefficients_from_loss_db(loss_db: [f32; 3]) -> [f32; 3] {
+    loss_db.map(|loss_db| 10.0_f32.powf(-loss_db / 20.0))
+}
+
 /// Ordinary owned geometry used to construct an `IPL_SCENETYPE_DEFAULT` scene and static mesh.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneMesh {
@@ -2357,6 +2367,18 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn transmission_loss_uses_the_amplitude_coefficient_convention() {
+        let coefficients = transmission_coefficients_from_loss_db([0.0, 20.0, 60.0]);
+        for (actual, expected) in coefficients.into_iter().zip([1.0, 0.1, 0.001]) {
+            assert!((actual - expected).abs() <= expected * 1.0e-6);
+        }
+        assert!(
+            (coefficients[1] - 0.01).abs() > 0.08,
+            "must not use 10^(-TL/10)"
         );
     }
 

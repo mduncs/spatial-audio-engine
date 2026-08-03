@@ -437,14 +437,23 @@ mod tests {
         let second = smoother.advance(propagation(9.0), listener, 0.75);
 
         assert_bits_eq(first.endpoint(), second.start);
-        let expected_step = (second.end.direct.occlusion - second.start.direct.occlusion) / 128.0;
         assert_eq!(
             second.at_sample(0, 128).direct.occlusion.to_bits(),
-            (second.start.direct.occlusion + expected_step).to_bits()
+            slew_value(
+                second.start.direct.occlusion,
+                second.end.direct.occlusion,
+                127.0 / 128.0,
+            )
+            .to_bits()
         );
         assert_eq!(
             second.at_sample(63, 128).direct.occlusion.to_bits(),
-            (second.start.direct.occlusion + expected_step * 64.0).to_bits()
+            slew_value(
+                second.start.direct.occlusion,
+                second.end.direct.occlusion,
+                0.5,
+            )
+            .to_bits()
         );
         assert_bits_eq(second.at_sample(127, 128), second.endpoint());
     }

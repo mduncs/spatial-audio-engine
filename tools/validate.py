@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,26 @@ class SchemaValidator:
 
         errors: list[Issue] = []
         warnings: list[Issue] = []
+
+        for branch in schema.get("allOf", []):
+            branch_errors, branch_warnings = self.validate(instance, branch, path)
+            errors.extend(branch_errors)
+            warnings.extend(branch_warnings)
+
+        if "not" in schema:
+            branch_errors, _ = self.validate(instance, schema["not"], path)
+            if not branch_errors:
+                errors.append(Issue(path, "matched a forbidden not schema"))
+
+        if "if" in schema:
+            condition_errors, _ = self.validate(instance, schema["if"], path)
+            selected = "then" if not condition_errors else "else"
+            if selected in schema:
+                branch_errors, branch_warnings = self.validate(
+                    instance, schema[selected], path
+                )
+                errors.extend(branch_errors)
+                warnings.extend(branch_warnings)
 
         expected_type = schema.get("type")
         if expected_type is not None and not self._matches_type(instance, expected_type):
@@ -109,6 +130,17 @@ class SchemaValidator:
                     )
                     errors.extend(child_errors)
                     warnings.extend(child_warnings)
+            for key, dependencies in schema.get("dependentRequired", {}).items():
+                if key not in instance:
+                    continue
+                for dependency in dependencies:
+                    if dependency not in instance:
+                        errors.append(
+                            Issue(
+                                self._property_path(path, dependency),
+                                f"required when {key!r} is present",
+                            )
+                        )
 
         if isinstance(instance, list):
             if "minItems" in schema and len(instance) < schema["minItems"]:
@@ -130,12 +162,32 @@ class SchemaValidator:
                     )
                     errors.extend(child_errors)
                     warnings.extend(child_warnings)
+            for index, prefix_schema in enumerate(schema.get("prefixItems", [])):
+                if index >= len(instance):
+                    break
+                child_errors, child_warnings = self.validate(
+                    instance[index], prefix_schema, f"{path}[{index}]"
+                )
+                errors.extend(child_errors)
+                warnings.extend(child_warnings)
+            if "contains" in schema:
+                contains_results = [
+                    self.validate(value, schema["contains"], f"{path}[{index}]")
+                    for index, value in enumerate(instance)
+                ]
+                matching = [result for result in contains_results if not result[0]]
+                if not matching:
+                    errors.append(Issue(path, "no item matched the contains schema"))
+                else:
+                    warnings.extend(min(matching, key=lambda result: len(result[1]))[1])
 
         if isinstance(instance, str):
             if "minLength" in schema and len(instance) < schema["minLength"]:
                 errors.append(Issue(path, f"requires at least {schema['minLength']} characters"))
             if "maxLength" in schema and len(instance) > schema["maxLength"]:
                 errors.append(Issue(path, f"allows at most {schema['maxLength']} characters"))
+            if "pattern" in schema and re.search(schema["pattern"], instance) is None:
+                errors.append(Issue(path, f"must match pattern {schema['pattern']!r}"))
 
         if self._is_number(instance):
             number = instance
