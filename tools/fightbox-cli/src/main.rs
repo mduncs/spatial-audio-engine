@@ -91,6 +91,10 @@ anomaly-field sweep\n    \
                   Cheap direct-ray/baked-path proxy; --package --baked --fixture\n    \
                   --source [--source-height-m] [--listener-height-m] [--spacing-m]\n    \
                   [--inspect-position east,north,up] --output <absolute-directory>\n\n\
+anomaly-field corner-scan\n    \
+                  Two-tier megablock thoroughfare-corner scan; --package --baked\n    \
+                  --fixture --source [--source-height-m] [--listener-height-m]\n    \
+                  [--fine-corner-count] --output <absolute-directory>\n\n\
 SWEEP OUTPUT:\n    <report-directory>/report.json\n    \
 <report-directory>/artifacts.json\n    \
 <report-directory>/cases/<case-id>/child.json\n";

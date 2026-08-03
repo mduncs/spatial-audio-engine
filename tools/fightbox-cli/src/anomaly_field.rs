@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use fightbox_api::{Directivity, ExtentDescriptor, ReferenceLevel};
 use fightbox_steam_audio::{
-    AnomalyClass, AnomalyQuerySession, DirectOcclusionMode, GridSpec, MultiSourceDescriptor,
-    ProxyCell, S3SimulationConfig, classify_grid, classify_sample_at_distance,
+    AnomalyClass, AnomalyQuerySession, AnomalyRawSample, DirectOcclusionMode, GridSpec,
+    MultiSourceDescriptor, ProxyCell, S3SimulationConfig, classify_grid,
+    classify_sample_at_distance,
 };
 use fightbox_world::read_package;
 use serde::Serialize;
@@ -23,6 +24,16 @@ const RASTER_MAGIC: &[u8; 8] = b"FBXANOM\0";
 const SOURCE_COVERED_BIT: u32 = 1 << 31;
 const LISTENER_COVERED_BIT: u32 = 1 << 30;
 const ANOMALY_BITS: u32 = (1 << AnomalyClass::ALL.len()) - 1;
+const MEGABLOCK_BLOCKS_PER_AXIS: usize = 6;
+const MEGABLOCK_BLOCK_SIZE_M: f32 = 80.0;
+const MEGABLOCK_STREET_WIDTH_M: f32 = 15.0;
+const INNER_RADIUS_M: f32 = 4.0;
+const OUTER_RADIUS_M: f32 = 10.0;
+const FINE_INNER_SPACING_M: f32 = 0.1;
+const COARSE_INNER_SPACING_M: f32 = 0.25;
+const OUTER_SPACING_M: f32 = 1.0;
+const DEFAULT_FINE_CORNER_COUNT: usize = 20;
+const KNOWN_SPOT_ENU: [f32; 3] = [108.06, 303.91, 1.5];
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -40,11 +51,75 @@ struct Args {
 pub(crate) fn run(arguments: &[String]) -> Result<()> {
     match arguments.first().map(String::as_str) {
         Some("sweep") => sweep(parse_args(&arguments[1..])?),
+        Some("corner-scan") => corner_scan(parse_corner_args(&arguments[1..])?),
         Some(other) => Err(CliError::new(format!(
-            "unknown anomaly-field subcommand {other:?}; expected sweep"
+            "unknown anomaly-field subcommand {other:?}; expected sweep or corner-scan"
         ))),
-        None => Err(CliError::new("anomaly-field requires the sweep subcommand")),
+        None => Err(CliError::new(
+            "anomaly-field requires the sweep or corner-scan subcommand",
+        )),
     }
+}
+
+#[derive(Clone, Debug)]
+struct CornerArgs {
+    package: PathBuf,
+    baked: PathBuf,
+    fixture: PathBuf,
+    source_id: String,
+    source_height_m: Option<f32>,
+    listener_height_m: f32,
+    fine_corner_count: usize,
+    output: PathBuf,
+}
+
+fn parse_corner_args(arguments: &[String]) -> Result<CornerArgs> {
+    let mut package = None;
+    let mut baked = None;
+    let mut fixture = None;
+    let mut source_id = None;
+    let mut source_height_m = None;
+    let mut listener_height_m = None;
+    let mut fine_corner_count = None;
+    let mut output = None;
+    let mut iter = arguments.iter();
+    while let Some(flag) = iter.next() {
+        let value = iter
+            .next()
+            .ok_or_else(|| CliError::new(format!("{flag} requires a value")))?;
+        match flag.as_str() {
+            "--package" => set_once(&mut package, PathBuf::from(value), flag)?,
+            "--baked" => set_once(&mut baked, PathBuf::from(value), flag)?,
+            "--fixture" => set_once(&mut fixture, PathBuf::from(value), flag)?,
+            "--source" => set_once(&mut source_id, value.clone(), flag)?,
+            "--source-height-m" => set_once(&mut source_height_m, finite_f32(value, flag)?, flag)?,
+            "--listener-height-m" => {
+                set_once(&mut listener_height_m, finite_f32(value, flag)?, flag)?
+            }
+            "--fine-corner-count" => {
+                let count = value.parse::<usize>().map_err(|_| {
+                    CliError::new("--fine-corner-count requires a non-negative integer")
+                })?;
+                set_once(&mut fine_corner_count, count, flag)?;
+            }
+            "--output" => set_once(&mut output, PathBuf::from(value), flag)?,
+            other => {
+                return Err(CliError::new(format!(
+                    "unknown anomaly-field corner-scan argument {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(CornerArgs {
+        package: package.ok_or_else(|| CliError::new("missing required --package <path>"))?,
+        baked: baked.ok_or_else(|| CliError::new("missing required --baked <path>"))?,
+        fixture: fixture.ok_or_else(|| CliError::new("missing required --fixture <path>"))?,
+        source_id: source_id.ok_or_else(|| CliError::new("missing required --source <id>"))?,
+        source_height_m,
+        listener_height_m: listener_height_m.unwrap_or(DEFAULT_LISTENER_HEIGHT_M),
+        fine_corner_count: fine_corner_count.unwrap_or(DEFAULT_FINE_CORNER_COUNT),
+        output: output.ok_or_else(|| CliError::new("missing required --output <path>"))?,
+    })
 }
 
 fn parse_args(arguments: &[String]) -> Result<Args> {
@@ -349,6 +424,651 @@ struct InspectedPosition {
     nearest_grid_flagged: bool,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+struct CornerDefinition {
+    id: usize,
+    rank: usize,
+    intersection_enu: [f32; 2],
+    corner_enu: [f32; 2],
+    corridor_relation: &'static str,
+    clear_adjacent_segment_to_source: bool,
+    distance_to_source_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CornerTier {
+    Inner,
+    Outer,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScannedDot {
+    tier: CornerTier,
+    row: usize,
+    column: usize,
+    scan_index: usize,
+    spacing_m: f32,
+    cell: ProxyCell,
+}
+
+#[derive(Clone, Serialize)]
+struct CornerDotReport {
+    corner_id: usize,
+    corner_rank: usize,
+    tier: CornerTier,
+    row: usize,
+    column: usize,
+    scan_index: usize,
+    spacing_m: f32,
+    position_enu: [f32; 3],
+    direct_audibility: Value,
+    direct_loss_db: Value,
+    path_sh_energy: Value,
+    path_strength_db: Value,
+    free_field_db: Value,
+    score: Value,
+    source_probe_covered: bool,
+    listener_probe_covered: bool,
+    classes: Vec<&'static str>,
+}
+
+#[derive(Clone, Serialize)]
+struct GradientReport {
+    delta_direct_audibility: f32,
+    delta_direct_loss_db: Option<f32>,
+    distance_m: f32,
+    from_enu: [f32; 3],
+    to_enu: [f32; 3],
+}
+
+#[derive(Serialize)]
+struct CornerSummary {
+    corner: CornerDefinition,
+    inner_spacing_m: f32,
+    inner_dot_count: usize,
+    outer_dot_count: usize,
+    anomaly_counts: BTreeMap<&'static str, usize>,
+    sharpest_transition: Option<GradientReport>,
+    inversion_slice_min_width_m: Option<f32>,
+    inversion_slice_max_width_m: Option<f32>,
+    worst_dot: Option<CornerDotReport>,
+}
+
+#[derive(Serialize)]
+struct KnownSpotReport {
+    requested_enu: [f32; 3],
+    nearest_corner_id: usize,
+    nearest_corner_enu: [f32; 2],
+    nearest_dot: CornerDotReport,
+    nearest_dot_distance_m: f32,
+    reproduces_any_flag: bool,
+    reproduces_inversion_signature: bool,
+    inversion_slice_min_width_m: Option<f32>,
+    inversion_slice_max_width_m: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct CornerScanManifest {
+    schema_version: &'static str,
+    package: String,
+    baked: String,
+    fixture: String,
+    source_id: String,
+    source_position_enu: [f32; 3],
+    listener_height_m: f32,
+    ranking_rule: &'static str,
+    enumeration_rule: &'static str,
+    scan_pattern: &'static str,
+    inner_square_policy: &'static str,
+    outer_overlap_policy: &'static str,
+    fine_corner_count: usize,
+    fine_corner_policy: &'static str,
+    corner_count: usize,
+    dot_count: usize,
+    timings: TimingReport,
+    anomaly_counts: BTreeMap<&'static str, usize>,
+    computation_anomaly_count: usize,
+    corners: Vec<CornerSummary>,
+    top_hotspots: Vec<CornerDotReport>,
+    known_spot: KnownSpotReport,
+    samples_jsonl: &'static str,
+    thresholds: Vec<ThresholdReport>,
+}
+
+fn enumerate_main_thoroughfare_corners(source: [f32; 2]) -> Vec<CornerDefinition> {
+    let pitch = MEGABLOCK_BLOCK_SIZE_M + MEGABLOCK_STREET_WIDTH_M;
+    let first_center = MEGABLOCK_STREET_WIDTH_M * 0.5;
+    let half_street = MEGABLOCK_STREET_WIDTH_M * 0.5;
+    let centers = (0..=MEGABLOCK_BLOCKS_PER_AXIS)
+        .map(|index| first_center + index as f32 * pitch)
+        .collect::<Vec<_>>();
+    let source_axis = |value: f32, source_value: f32| (value - source_value).abs() < 0.01;
+    let mut corners = Vec::new();
+    for &east in &centers {
+        for &north in &centers {
+            let east_west = source_axis(north, source[1]);
+            let north_south = source_axis(east, source[0]);
+            if !east_west && !north_south {
+                continue;
+            }
+            let relation = match (east_west, north_south) {
+                (true, true) => "source_cross",
+                (true, false) => "east_west_source_corridor",
+                (false, true) => "north_south_source_corridor",
+                (false, false) => unreachable!(),
+            };
+            for [dx, dy] in [
+                [-half_street, -half_street],
+                [half_street, -half_street],
+                [-half_street, half_street],
+                [half_street, half_street],
+            ] {
+                let distance_to_source_m =
+                    ((east - source[0]).powi(2) + (north - source[1]).powi(2)).sqrt();
+                corners.push(CornerDefinition {
+                    id: 0,
+                    rank: 0,
+                    intersection_enu: [east, north],
+                    corner_enu: [east + dx, north + dy],
+                    corridor_relation: relation,
+                    clear_adjacent_segment_to_source: true,
+                    distance_to_source_m,
+                });
+            }
+        }
+    }
+    corners.sort_by(|left, right| {
+        right
+            .clear_adjacent_segment_to_source
+            .cmp(&left.clear_adjacent_segment_to_source)
+            .then_with(|| {
+                left.distance_to_source_m
+                    .total_cmp(&right.distance_to_source_m)
+            })
+            .then_with(|| left.corner_enu[1].total_cmp(&right.corner_enu[1]))
+            .then_with(|| left.corner_enu[0].total_cmp(&right.corner_enu[0]))
+    });
+    for (index, corner) in corners.iter_mut().enumerate() {
+        corner.id = index + 1;
+        corner.rank = index + 1;
+    }
+    corners
+}
+
+fn boustrophedon_indices(side: usize) -> Vec<usize> {
+    let mut indices = Vec::with_capacity(side * side);
+    for row in 0..side {
+        if row % 2 == 0 {
+            indices.extend((0..side).map(|column| row * side + column));
+        } else {
+            indices.extend((0..side).rev().map(|column| row * side + column));
+        }
+    }
+    indices
+}
+
+fn classify_exact_sample(
+    raw: AnomalyRawSample,
+    source_spl_db: f32,
+    source_position: fightbox_api::EnuVector3,
+) -> ProxyCell {
+    classify_sample_at_distance(
+        raw,
+        source_spl_db,
+        distance(source_position, raw.position_enu),
+    )
+}
+
+fn scan_square(
+    query: &mut AnomalyQuerySession,
+    fixture: &FixtureQuery,
+    corner: CornerDefinition,
+    listener_height_m: f32,
+    radius_m: f32,
+    spacing_m: f32,
+    tier: CornerTier,
+) -> Result<Vec<ScannedDot>> {
+    let side = ((radius_m * 2.0 / spacing_m).round() as usize) + 1;
+    let mut cells = vec![None; side * side];
+    for (scan_index, row_major_index) in boustrophedon_indices(side).into_iter().enumerate() {
+        let row = row_major_index / side;
+        let column = row_major_index % side;
+        let position = fightbox_steam_audio::EnuVector3::new(
+            corner.corner_enu[0] - radius_m + column as f32 * spacing_m,
+            corner.corner_enu[1] - radius_m + row as f32 * spacing_m,
+            listener_height_m,
+        );
+        let raw = query.sample(position).map_err(|error| {
+            CliError::new(format!(
+                "corner {} query failed at {position:?}: {error}",
+                corner.id
+            ))
+        })?;
+        cells[row_major_index] = Some((
+            scan_index,
+            classify_exact_sample(raw, fixture.source_spl_db, fixture.source_position),
+        ));
+    }
+    let mut row_major_cells = cells
+        .iter()
+        .map(|cell| cell.expect("all square cells queried").1)
+        .collect::<Vec<_>>();
+    classify_grid(&mut row_major_cells, side, side, spacing_m);
+    let mut dots = cells
+        .into_iter()
+        .enumerate()
+        .map(|(index, cell)| {
+            let (scan_index, _) = cell.expect("all square cells queried");
+            ScannedDot {
+                tier,
+                row: index / side,
+                column: index % side,
+                scan_index,
+                spacing_m,
+                cell: row_major_cells[index],
+            }
+        })
+        .collect::<Vec<_>>();
+    dots.sort_by_key(|dot| dot.scan_index);
+    Ok(dots)
+}
+
+fn corner_scan(args: CornerArgs) -> Result<()> {
+    let total_started = Instant::now();
+    let output = validate_output_path(&args.output)?;
+    let fixture = read_fixture(&args.fixture, &args.source_id, args.source_height_m)?;
+    let loaded = read_package(&args.package)
+        .map_err(|error| CliError::new(format!("cannot load package: {error}")))?;
+    let baked = crate::city::load_baked(&args.baked)?;
+    crate::city::verify_bake_identity(&loaded, &args.baked, &baked)?;
+    let scene = crate::city::scene_mesh(&loaded)?;
+    let mut query =
+        AnomalyQuerySession::new(&scene, &baked, fixture.simulation, fixture.descriptor).map_err(
+            |error| CliError::new(format!("cannot build anomaly query session: {error}")),
+        )?;
+    let load_and_session_seconds = total_started.elapsed().as_secs_f64();
+    let corners = enumerate_main_thoroughfare_corners([
+        fixture.source_position.east_m,
+        fixture.source_position.north_m,
+    ]);
+    let ranked_fine_corner_count = args.fine_corner_count.min(corners.len());
+    let fine_corner_count = corners
+        .iter()
+        .enumerate()
+        .filter(|(index, corner)| {
+            *index < ranked_fine_corner_count || is_known_spot_corner(**corner)
+        })
+        .count();
+    let query_started = Instant::now();
+    let mut scans = Vec::with_capacity(corners.len());
+    for (index, corner) in corners.iter().copied().enumerate() {
+        let inner_spacing_m = if index < ranked_fine_corner_count || is_known_spot_corner(corner) {
+            FINE_INNER_SPACING_M
+        } else {
+            COARSE_INNER_SPACING_M
+        };
+        let mut dots = scan_square(
+            &mut query,
+            &fixture,
+            corner,
+            args.listener_height_m,
+            INNER_RADIUS_M,
+            inner_spacing_m,
+            CornerTier::Inner,
+        )?;
+        let outer = scan_square(
+            &mut query,
+            &fixture,
+            corner,
+            args.listener_height_m,
+            OUTER_RADIUS_M,
+            OUTER_SPACING_M,
+            CornerTier::Outer,
+        )?;
+        dots.extend(outer.into_iter().filter(|dot| {
+            let dx = (dot.cell.position_enu.x - corner.corner_enu[0]).abs();
+            let dy = (dot.cell.position_enu.y - corner.corner_enu[1]).abs();
+            dx > INNER_RADIUS_M + 0.001 || dy > INNER_RADIUS_M + 0.001
+        }));
+        scans.push((corner, dots));
+        eprintln!(
+            "fightbox: corner scan {}/{} rank={} inner_step={:.2}m dots={}",
+            index + 1,
+            corners.len(),
+            corner.rank,
+            inner_spacing_m,
+            scans.last().map_or(0, |(_, dots)| dots.len())
+        );
+    }
+    let query_seconds = query_started.elapsed().as_secs_f64();
+
+    let directory = AtomicDir::create(output)?;
+    let write_started = Instant::now();
+    let mut jsonl = Vec::new();
+    let mut summaries = Vec::with_capacity(scans.len());
+    let mut total_counts = empty_class_counts();
+    let mut total_dots = 0;
+    let mut hotspot_candidates = Vec::new();
+    for (corner, dots) in &scans {
+        total_dots += dots.len();
+        for dot in dots {
+            for class in AnomalyClass::ALL {
+                if dot.cell.flags.contains(class) {
+                    *total_counts.get_mut(class.id()).expect("class key exists") += 1;
+                }
+            }
+            serde_json::to_writer(&mut jsonl, &corner_dot_report(*corner, *dot))
+                .map_err(|error| CliError::new(format!("cannot serialize corner dot: {error}")))?;
+            jsonl.push(b'\n');
+        }
+        let inner = dots
+            .iter()
+            .copied()
+            .filter(|dot| dot.tier == CornerTier::Inner)
+            .collect::<Vec<_>>();
+        let outer_count = dots.len() - inner.len();
+        let inner_spacing_m = inner
+            .first()
+            .map_or(COARSE_INNER_SPACING_M, |dot| dot.spacing_m);
+        let anomaly_counts = AnomalyClass::ALL
+            .into_iter()
+            .map(|class| {
+                (
+                    class.id(),
+                    dots.iter()
+                        .filter(|dot| dot.cell.flags.contains(class))
+                        .count(),
+                )
+            })
+            .collect();
+        let widths = inversion_slice_widths(&inner, inner_spacing_m);
+        let worst = dots
+            .iter()
+            .copied()
+            .filter(|dot| !dot.cell.flags.is_empty())
+            .max_by(|left, right| severity(left.cell).total_cmp(&severity(right.cell)));
+        if let Some(worst) = worst {
+            hotspot_candidates.push((*corner, worst));
+        }
+        summaries.push(CornerSummary {
+            corner: *corner,
+            inner_spacing_m,
+            inner_dot_count: inner.len(),
+            outer_dot_count: outer_count,
+            anomaly_counts,
+            sharpest_transition: sharpest_transition(&inner),
+            inversion_slice_min_width_m: widths.map(|value| value.0),
+            inversion_slice_max_width_m: widths.map(|value| value.1),
+            worst_dot: worst.map(|dot| corner_dot_report(*corner, dot)),
+        });
+    }
+    hotspot_candidates.sort_by(|left, right| {
+        severity(right.1.cell)
+            .total_cmp(&severity(left.1.cell))
+            .then_with(|| left.0.rank.cmp(&right.0.rank))
+    });
+    let top_hotspots = hotspot_candidates
+        .into_iter()
+        .take(10)
+        .map(|(corner, dot)| corner_dot_report(corner, dot))
+        .collect();
+    let known_spot = known_spot_report(&scans, &summaries)?;
+    write_bytes_atomic(&directory.temp_path().join("samples.jsonl"), &jsonl)?;
+    let computation_anomaly_count = scans
+        .iter()
+        .flat_map(|(_, dots)| dots)
+        .filter(|dot| has_computation_anomaly(dot.cell))
+        .count();
+    let mut manifest = CornerScanManifest {
+        schema_version: "fightbox.anomaly-corner-scan.v1",
+        package: args.package.display().to_string(),
+        baked: args.baked.display().to_string(),
+        fixture: args.fixture.display().to_string(),
+        source_id: args.source_id,
+        source_position_enu: [
+            fixture.source_position.east_m,
+            fixture.source_position.north_m,
+            fixture.source_position.up_m,
+        ],
+        listener_height_m: args.listener_height_m,
+        ranking_rule: "clear source-aligned adjacent street segment first, then planar distance from intersection to source, then stable ENU tie-break",
+        enumeration_rule: "6x6 fixture city: 80m blocks + 15m streets; four street-edge corners at each of 13 intersections on the source-aligned east-west/north-south thoroughfares",
+        scan_pattern: "boustrophedon squares: inner +/-4m; outer +/-10m",
+        inner_square_policy: "all 81x81 or 33x33 inner-square dots retained, including dots outside the nominal 4m circle",
+        outer_overlap_policy: "1m outer-square dots inside the +/-4m inner square queried for neighbour classification but omitted from JSONL as duplicates",
+        fine_corner_count,
+        fine_corner_policy: "top-ranked requested count plus the known-spot [110,300] corner are scanned at 0.1m",
+        corner_count: corners.len(),
+        dot_count: total_dots,
+        timings: TimingReport {
+            load_and_session_seconds,
+            query_seconds,
+            write_seconds: 0.0,
+            total_seconds: 0.0,
+        },
+        anomaly_counts: total_counts,
+        computation_anomaly_count,
+        corners: summaries,
+        top_hotspots,
+        known_spot,
+        samples_jsonl: "samples.jsonl",
+        thresholds: AnomalyClass::ALL
+            .into_iter()
+            .map(|class| ThresholdReport {
+                id: class.id(),
+                threshold: class.threshold(),
+                rationale: class.rationale(),
+            })
+            .collect(),
+    };
+    manifest.timings.write_seconds = write_started.elapsed().as_secs_f64();
+    manifest.timings.total_seconds = total_started.elapsed().as_secs_f64();
+    write_json_atomic(&directory.temp_path().join("manifest.json"), &manifest)?;
+    directory.commit()?;
+    println!(
+        "{}",
+        serde_json::to_string(&manifest)
+            .map_err(|error| CliError::new(format!("cannot serialize corner summary: {error}")))?
+    );
+    Ok(())
+}
+
+fn empty_class_counts() -> BTreeMap<&'static str, usize> {
+    AnomalyClass::ALL
+        .into_iter()
+        .map(|class| (class.id(), 0))
+        .collect()
+}
+
+fn is_known_spot_corner(corner: CornerDefinition) -> bool {
+    (corner.corner_enu[0] - 110.0).abs() < 0.01 && (corner.corner_enu[1] - 300.0).abs() < 0.01
+}
+
+fn json_float(value: f32) -> Value {
+    if value.is_finite() {
+        Value::from(value)
+    } else {
+        Value::String(if value.is_nan() {
+            "NaN".to_owned()
+        } else if value.is_sign_positive() {
+            "+inf".to_owned()
+        } else {
+            "-inf".to_owned()
+        })
+    }
+}
+
+fn corner_dot_report(corner: CornerDefinition, dot: ScannedDot) -> CornerDotReport {
+    CornerDotReport {
+        corner_id: corner.id,
+        corner_rank: corner.rank,
+        tier: dot.tier,
+        row: dot.row,
+        column: dot.column,
+        scan_index: dot.scan_index,
+        spacing_m: dot.spacing_m,
+        position_enu: [
+            dot.cell.position_enu.x,
+            dot.cell.position_enu.y,
+            dot.cell.position_enu.z,
+        ],
+        direct_audibility: json_float(dot.cell.direct_audibility),
+        direct_loss_db: json_float(dot.cell.direct_loss_db),
+        path_sh_energy: json_float(dot.cell.path_sh_energy),
+        path_strength_db: json_float(dot.cell.path_strength_db),
+        free_field_db: json_float(dot.cell.free_field_db),
+        score: json_float(dot.cell.score),
+        source_probe_covered: dot.cell.source_probe_covered,
+        listener_probe_covered: dot.cell.listener_probe_covered,
+        classes: AnomalyClass::ALL
+            .into_iter()
+            .filter(|class| dot.cell.flags.contains(*class))
+            .map(AnomalyClass::id)
+            .collect(),
+    }
+}
+
+fn sharpest_transition(inner: &[ScannedDot]) -> Option<GradientReport> {
+    let side = (inner.len() as f64).sqrt() as usize;
+    let by_cell = inner
+        .iter()
+        .map(|dot| ((dot.row, dot.column), *dot))
+        .collect::<BTreeMap<_, _>>();
+    let mut best: Option<GradientReport> = None;
+    for row in 0..side {
+        for column in 0..side {
+            let from = by_cell.get(&(row, column))?;
+            for neighbour in [(row, column + 1), (row + 1, column)] {
+                let Some(to) = by_cell.get(&neighbour) else {
+                    continue;
+                };
+                if !from.cell.direct_audibility.is_finite()
+                    || !to.cell.direct_audibility.is_finite()
+                {
+                    continue;
+                }
+                let delta = (from.cell.direct_audibility - to.cell.direct_audibility).abs();
+                if best
+                    .as_ref()
+                    .is_none_or(|current| delta > current.delta_direct_audibility)
+                {
+                    let delta_db = (from.cell.direct_loss_db - to.cell.direct_loss_db).abs();
+                    best = Some(GradientReport {
+                        delta_direct_audibility: delta,
+                        delta_direct_loss_db: delta_db.is_finite().then_some(delta_db),
+                        distance_m: from.spacing_m,
+                        from_enu: [
+                            from.cell.position_enu.x,
+                            from.cell.position_enu.y,
+                            from.cell.position_enu.z,
+                        ],
+                        to_enu: [
+                            to.cell.position_enu.x,
+                            to.cell.position_enu.y,
+                            to.cell.position_enu.z,
+                        ],
+                    });
+                }
+            }
+        }
+    }
+    best
+}
+
+fn inversion_slice_widths(inner: &[ScannedDot], spacing_m: f32) -> Option<(f32, f32)> {
+    let side = (inner.len() as f64).sqrt() as usize;
+    let flagged = inner
+        .iter()
+        .map(|dot| {
+            (
+                (dot.row, dot.column),
+                dot.cell.flags.contains(AnomalyClass::InversionSignature),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut widths = Vec::new();
+    for fixed in 0..side {
+        for transpose in [false, true] {
+            let mut run = 0;
+            for moving in 0..side {
+                let key = if transpose {
+                    (moving, fixed)
+                } else {
+                    (fixed, moving)
+                };
+                if flagged.get(&key).copied().unwrap_or(false) {
+                    run += 1;
+                } else if run > 0 {
+                    widths.push(run as f32 * spacing_m);
+                    run = 0;
+                }
+            }
+            if run > 0 {
+                widths.push(run as f32 * spacing_m);
+            }
+        }
+    }
+    widths.into_iter().fold(None, |range, width| {
+        Some(match range {
+            None => (width, width),
+            Some((minimum, maximum)) => (minimum.min(width), maximum.max(width)),
+        })
+    })
+}
+
+fn has_computation_anomaly(cell: ProxyCell) -> bool {
+    AnomalyClass::ALL
+        .into_iter()
+        .filter(|class| *class != AnomalyClass::InversionSignature)
+        .any(|class| cell.flags.contains(class))
+}
+
+fn known_spot_report(
+    scans: &[(CornerDefinition, Vec<ScannedDot>)],
+    summaries: &[CornerSummary],
+) -> Result<KnownSpotReport> {
+    let (corner, dots) = scans
+        .iter()
+        .min_by(|(left, _), (right, _)| {
+            let left_distance = (left.corner_enu[0] - KNOWN_SPOT_ENU[0]).powi(2)
+                + (left.corner_enu[1] - KNOWN_SPOT_ENU[1]).powi(2);
+            let right_distance = (right.corner_enu[0] - KNOWN_SPOT_ENU[0]).powi(2)
+                + (right.corner_enu[1] - KNOWN_SPOT_ENU[1]).powi(2);
+            left_distance.total_cmp(&right_distance)
+        })
+        .ok_or_else(|| CliError::new("corner scan enumerated no corners"))?;
+    let dot = dots
+        .iter()
+        .copied()
+        .filter(|dot| dot.tier == CornerTier::Inner)
+        .min_by(|left, right| {
+            let distance = |dot: &ScannedDot| {
+                (dot.cell.position_enu.x - KNOWN_SPOT_ENU[0]).powi(2)
+                    + (dot.cell.position_enu.y - KNOWN_SPOT_ENU[1]).powi(2)
+            };
+            distance(left).total_cmp(&distance(right))
+        })
+        .ok_or_else(|| CliError::new("known-spot corner has no inner dots"))?;
+    let summary = summaries
+        .iter()
+        .find(|summary| summary.corner.id == corner.id)
+        .expect("every scan has a summary");
+    let dx = dot.cell.position_enu.x - KNOWN_SPOT_ENU[0];
+    let dy = dot.cell.position_enu.y - KNOWN_SPOT_ENU[1];
+    Ok(KnownSpotReport {
+        requested_enu: KNOWN_SPOT_ENU,
+        nearest_corner_id: corner.id,
+        nearest_corner_enu: corner.corner_enu,
+        nearest_dot: corner_dot_report(*corner, dot),
+        nearest_dot_distance_m: (dx * dx + dy * dy).sqrt(),
+        reproduces_any_flag: !dot.cell.flags.is_empty(),
+        reproduces_inversion_signature: dot.cell.flags.contains(AnomalyClass::InversionSignature),
+        inversion_slice_min_width_m: summary.inversion_slice_min_width_m,
+        inversion_slice_max_width_m: summary.inversion_slice_max_width_m,
+    })
+}
+
 fn sweep(args: Args) -> Result<()> {
     let total_started = Instant::now();
     let output = validate_output_path(&args.output)?;
@@ -628,6 +1348,21 @@ fn encode_raster(grid: GridSpec, cells: &[ProxyCell]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn clean_raw(position: fightbox_steam_audio::EnuVector3) -> AnomalyRawSample {
+        AnomalyRawSample {
+            position_enu: position,
+            direct_audibility: 1.0,
+            path_eq: [0.1; 3],
+            path_sh_energy: 0.1,
+            path_coefficient_min: 0.1,
+            path_coefficient_max: 0.1,
+            source_probe_covered: true,
+            listener_probe_covered: true,
+            direct_path_energy: None,
+            reflection_energy: None,
+        }
+    }
+
     #[test]
     fn parses_configurable_grid_and_inspection_position() {
         let args = parse_args(&[
@@ -681,5 +1416,50 @@ mod tests {
             u32::from_le_bytes(bytes[60..64].try_into().unwrap()),
             SOURCE_COVERED_BIT | LISTENER_COVERED_BIT
         );
+    }
+
+    #[test]
+    fn megablock_main_thoroughfare_corner_enumeration_is_stable() {
+        let corners = enumerate_main_thoroughfare_corners([292.5, 292.5]);
+        assert_eq!(corners.len(), 52);
+        assert!(corners.iter().any(|corner| {
+            corner.intersection_enu == [102.5, 292.5] && corner.corner_enu == [110.0, 300.0]
+        }));
+        assert!(corners.iter().any(|corner| {
+            corner.intersection_enu == [292.5, 482.5] && corner.corner_enu == [285.0, 475.0]
+        }));
+        assert_eq!(corners[0].corridor_relation, "source_cross");
+    }
+
+    #[test]
+    fn boustrophedon_order_reverses_every_other_row() {
+        assert_eq!(boustrophedon_indices(3), vec![0, 1, 2, 5, 4, 3, 6, 7, 8]);
+    }
+
+    #[test]
+    fn exact_sample_path_passes_all_local_classifier_classes_through() {
+        let position = fightbox_steam_audio::EnuVector3::new(10.0, 10.0, 1.5);
+        let source = fightbox_api::EnuVector3::new(0.0, 0.0, 1.5);
+        let mut raw = clean_raw(position);
+        raw.direct_audibility = 0.01;
+        raw.path_eq = [0.01; 3];
+        raw.path_sh_energy = 0.01;
+        let cell = classify_exact_sample(raw, 105.0, source);
+        assert!(cell.flags.contains(AnomalyClass::InversionSignature));
+
+        let mut raw = clean_raw(position);
+        raw.path_sh_energy = f32::NAN;
+        let cell = classify_exact_sample(raw, 105.0, source);
+        assert!(cell.flags.contains(AnomalyClass::InvalidEnergy));
+
+        let mut raw = clean_raw(position);
+        raw.direct_audibility = f32::NAN;
+        let cell = classify_exact_sample(raw, 105.0, source);
+        assert!(cell.flags.contains(AnomalyClass::InvalidCoefficient));
+
+        let mut raw = clean_raw(position);
+        raw.path_sh_energy = 0.0;
+        let cell = classify_exact_sample(raw, 105.0, source);
+        assert!(cell.flags.contains(AnomalyClass::ZeroPathWithCoverage));
     }
 }
