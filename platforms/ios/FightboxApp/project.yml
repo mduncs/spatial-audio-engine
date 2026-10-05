@@ -1,0 +1,79 @@
+name: FightboxApp
+
+options:
+  minimumXcodeGenVersion: 2.44.1
+  deploymentTarget:
+    iOS: "15.0"
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    SDKROOT: iphoneos
+    SUPPORTED_PLATFORMS: iphoneos
+    TARGETED_DEVICE_FAMILY: "1"
+    SUPPORTS_MACCATALYST: NO
+    SWIFT_VERSION: "5.0"
+    FIGHTBOX_ARTIFACT_ROOT: "$(SRCROOT)/../../.."
+
+targets:
+  FightboxApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: ../FightboxKit/Sources/FightboxKit/CoreMotionHeadTracker.swift
+      - path: ../FightboxKit/Sources/FightboxKit/GpsLocalEnuProvider.swift
+      - path: ../FightboxKit/Sources/FightboxKit/AbxSession.swift
+      - path: ../FightboxKit/Sources/FightboxKit/FightboxNeutralSpatialSession.swift
+      - path: ../FightboxKit/Sources/FightboxKit/AppleSpatialMixerAdapter.swift
+      - path: ../FightboxKit/Sources/FightboxKit/SpatialProgramProvider.swift
+      - path: ../FightboxKit/Sources/FightboxKit/AppleBodyMotionTracker.swift
+      - path: ../FightboxKit/Sources/FightboxKit/CellStreamingCoordinator.swift
+      - path: ../FightboxKit/Sources/FightboxKit/FightboxCityRoute.swift
+      - path: ../FightboxKit/Sources/FightboxKit/FightboxRouteArtifactResolver.swift
+      - path: ../FightboxKit/Sources/FightboxKit/FightboxMacroLifecycleCoordinator.swift
+      - path: ../FightboxKit/Sources/FightboxKit/CanonicalAssetStreaming.swift
+      - path: ../FightboxKit/Sources/FightboxC/fightbox_shim.c
+      - path: Resources/chicago-block-a.fightbox
+        type: folder
+        buildPhase: resources
+      - path: Resources/chicago-block-baked
+        type: folder
+        buildPhase: resources
+      - path: Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.fightbox.spatial-audio
+        PRODUCT_NAME: Fightbox
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: FightboxApp.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/FightboxApp-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../../../crates/fightbox-ffi/include"
+          - "$(SRCROOT)/../FightboxKit/Sources/FightboxC/include"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(FIGHTBOX_ARTIFACT_ROOT)/target/aarch64-apple-ios/release"
+          - "$(FIGHTBOX_ARTIFACT_ROOT)/.cache/steam-audio/steamaudio-4.8.1/steamaudio/lib/ios"
+          - "$(SRCROOT)/../third-party/lib/ios"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-lfightbox_ffi"
+          - "-lphonon"
+          - "-lpffft"
+          - "-lmysofa"
+          - "-lc++"
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: YES
+        CODE_SIGN_STYLE: Automatic
+      configs:
+        Debug:
+          TARGETED_DEVICE_FAMILY: "1"
+        Release:
+          TARGETED_DEVICE_FAMILY: "1"
+    dependencies:
+      - sdk: libz.tbd
+    scheme:
+      gatherCoverageData: false

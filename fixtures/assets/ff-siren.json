@@ -1,0 +1,23 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "ff-siren",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/music/ff-siren-48k-mono.wav",
+      "sha256": "4529199942d183dd0dfddb18069d0e5078705e3b3aee85b14ebf314d12caa548",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 12.375250,
+  "target_rms_dbfs": -18.0,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes."
+  ]
+}

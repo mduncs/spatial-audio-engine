@@ -1,0 +1,148 @@
+{
+  "features": [
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            [
+              -87.6295229,
+              41.8729321
+            ],
+            [
+              -87.6295175,
+              41.8726076
+            ],
+            [
+              -87.6292951,
+              41.8726082
+            ],
+            [
+              -87.6293,
+              41.8729344
+            ],
+            [
+              -87.6295229,
+              41.8729321
+            ]
+          ]
+        ],
+        "type": "Polygon"
+      },
+      "id": "way/148261311",
+      "properties": {
+        "building": "apartments",
+        "levels": 13,
+        "name": "New Franklin Building"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            [
+              -87.6295244,
+              41.8730905
+            ],
+            [
+              -87.6293064,
+              41.873094
+            ],
+            [
+              -87.6293,
+              41.8729344
+            ],
+            [
+              -87.6295229,
+              41.8729321
+            ],
+            [
+              -87.6295244,
+              41.8730905
+            ]
+          ]
+        ],
+        "type": "Polygon"
+      },
+      "id": "way/148261329",
+      "properties": {
+        "building": "apartments",
+        "levels": 9,
+        "name": "Rowe Building"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            [
+              -87.6295764,
+              41.8744487
+            ],
+            [
+              -87.6293542,
+              41.8744521
+            ],
+            [
+              -87.6293317,
+              41.873636
+            ],
+            [
+              -87.6295541,
+              41.8736327
+            ],
+            [
+              -87.6295764,
+              41.8744487
+            ]
+          ]
+        ],
+        "type": "Polygon"
+      },
+      "id": "way/148517232",
+      "properties": {
+        "building": "apartments",
+        "levels": 22,
+        "name": "Transportation Building"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          [
+            [
+              -87.6295175,
+              41.8726076
+            ],
+            [
+              -87.6295164,
+              41.8724043
+            ],
+            [
+              -87.6292941,
+              41.8724049
+            ],
+            [
+              -87.6292951,
+              41.8726082
+            ],
+            [
+              -87.6295175,
+              41.8726076
+            ]
+          ]
+        ],
+        "type": "Polygon"
+      },
+      "id": "way/843220032",
+      "properties": {
+        "building": "retail",
+        "name": "RESERV"
+      },
+      "type": "Feature"
+    }
+  ],
+  "type": "FeatureCollection"
+}

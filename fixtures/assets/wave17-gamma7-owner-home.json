@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma7-owner-home",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma7-owner-home.wav",
+      "sha256": "2c2d3e45c5b2d3bf258e0764b493fc8c898efa16bbc2d86097f29399b5bd7fdf",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 20.0,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -29.117631,
+  "calibration": {
+    "applied_gain_db": 5.117631
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma7 source SHA-256 b9e37ea371b10f1ff6c60ba943118b2d805501c7338ff53088c883028adf6ca0; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

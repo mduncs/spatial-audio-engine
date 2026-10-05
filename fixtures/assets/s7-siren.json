@@ -1,0 +1,19 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "s7-siren",
+  "kind": "multitone",
+  "generator": {
+    "module": "fightbox_evidence::signal",
+    "multitone": {"frequencies_hz": [700.0, 950.0]}
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 1.0,
+  "target_rms_dbfs": -20,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The available multitone generator renders 700 Hz and 950 Hz concurrently; it cannot encode the requested 1 Hz alternation."
+  ]
+}

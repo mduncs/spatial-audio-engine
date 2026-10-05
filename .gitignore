@@ -1,0 +1,12 @@
+/target/
+/.cache/
+fixtures/assets/music
+fixtures/assets/squad
+fixtures/assets/wave17-audition
+__pycache__/
+*.py[cod]
+.DS_Store
+*.user.json
+/EXECUTION.md
+/runs/
+platforms/ios/FightboxKit/.build/

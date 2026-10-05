@@ -1,0 +1,20 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "s3-calibrated-pink",
+  "kind": "pink_like",
+  "generator": {
+    "module": "fightbox_evidence::signal",
+    "pink_like": {"seed": 2037767009}
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 0.1,
+  "target_rms_dbfs": -20,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The pink_like generator is a deterministic reference, not a measurement-grade pink source.",
+    "Identical seeds and parameters regenerate identical samples; the descriptor commits no binary media."
+  ]
+}

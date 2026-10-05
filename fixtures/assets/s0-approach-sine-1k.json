@@ -1,0 +1,19 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "s0-approach-sine-1k",
+  "kind": "sine",
+  "generator": {
+    "module": "fightbox_evidence::signal",
+    "sine": {"frequency_hz": 1000.0}
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 0.1,
+  "target_rms_dbfs": -20,
+  "expected_reference_rms_dbfs": -3.0102999566398125,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "A single sine is a calibration reference for distance-level ordering, not a perceptual stimulus."
+  ]
+}

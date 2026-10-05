@@ -1,0 +1,426 @@
+{
+  "schema_version": "fightbox.fixture.workbench.v1",
+  "fixture_id": "checkpoint-block",
+  "gate": "scenario-2",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {
+    "name": "Steam Audio",
+    "version": "4.8.1"
+  },
+  "sources": [
+    {
+      "id": "abrams-idle-checkpoint",
+      "asset_id": "squad-abrams-idle",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 90
+      },
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 8.0
+      },
+      "position_m": [
+        285.0,
+        305.0,
+        1.5
+      ]
+    },
+    {
+      "id": "mi8-orbit",
+      "asset_id": "squad-mi8-rotor-close",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 126
+      },
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 21.0
+      },
+      "trajectory": {
+        "waypoints_m": [
+          [482.500, 292.500, 55.0],
+          [480.875, 317.300, 55.0],
+          [476.026, 341.676, 55.0],
+          [468.037, 365.210, 55.0],
+          [457.045, 387.500, 55.0],
+          [443.237, 408.165, 55.0],
+          [426.850, 426.850, 55.0],
+          [408.165, 443.237, 55.0],
+          [387.500, 457.045, 55.0],
+          [365.210, 468.037, 55.0],
+          [341.676, 476.026, 55.0],
+          [317.300, 480.875, 55.0],
+          [292.500, 482.500, 55.0],
+          [267.700, 480.875, 55.0],
+          [243.324, 476.026, 55.0],
+          [219.790, 468.037, 55.0],
+          [197.500, 457.045, 55.0],
+          [176.835, 443.237, 55.0],
+          [158.150, 426.850, 55.0],
+          [141.763, 408.165, 55.0],
+          [127.955, 387.500, 55.0],
+          [116.963, 365.210, 55.0],
+          [108.974, 341.676, 55.0],
+          [104.125, 317.300, 55.0],
+          [102.500, 292.500, 55.0],
+          [104.125, 267.700, 55.0],
+          [108.974, 243.324, 55.0],
+          [116.963, 219.790, 55.0],
+          [127.955, 197.500, 55.0],
+          [141.763, 176.835, 55.0],
+          [158.150, 158.150, 55.0],
+          [176.835, 141.763, 55.0],
+          [197.500, 127.955, 55.0],
+          [219.790, 116.963, 55.0],
+          [243.324, 108.974, 55.0],
+          [267.700, 104.125, 55.0],
+          [292.500, 102.500, 55.0],
+          [317.300, 104.125, 55.0],
+          [341.676, 108.974, 55.0],
+          [365.210, 116.963, 55.0],
+          [387.500, 127.955, 55.0],
+          [408.165, 141.763, 55.0],
+          [426.850, 158.150, 55.0],
+          [443.237, 176.835, 55.0],
+          [457.045, 197.500, 55.0],
+          [468.037, 219.790, 55.0],
+          [476.026, 243.324, 55.0],
+          [480.875, 267.700, 55.0]
+        ],
+        "speed_mps": 30.0,
+        "max_speed_mps": 30.0
+      }
+    },
+    {
+      "id": "m2-checkpoint-gun",
+      "impulsive": true,
+      "asset_id": "squad-m2-burst-loop",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 153
+      },
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 2.0
+      },
+      "position_m": [
+        289.0,
+        102.5,
+        2.0
+      ]
+    },
+    {
+      "id": "dshk-return-fire",
+      "impulsive": true,
+      "asset_id": "squad-dshk-burst-loop",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 154
+      },
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 2.0
+      },
+      "position_m": [
+        292.5,
+        342.5,
+        2.0
+      ]
+    },
+    {
+      "id": "a10-gunrun-sky",
+      "asset_id": "squad-a10-pass",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 127
+      },
+      "default_enabled": false,
+      "extent": {
+        "kind": "point"
+      },
+      "trajectory": {
+        "waypoints_m": [
+          [197.500, 331.167, 127.0],
+          [197.500, 197.500, 127.0],
+          [198.413, 188.233, 127.0],
+          [201.116, 179.323, 127.0],
+          [205.505, 171.110, 127.0],
+          [211.412, 163.912, 127.0],
+          [218.610, 158.005, 127.0],
+          [226.823, 153.616, 127.0],
+          [235.733, 150.913, 127.0],
+          [245.000, 150.000, 127.0],
+          [254.267, 150.913, 127.0],
+          [263.177, 153.616, 127.0],
+          [271.390, 158.005, 127.0],
+          [278.588, 163.912, 127.0],
+          [284.495, 171.110, 127.0],
+          [288.884, 179.323, 127.0],
+          [291.587, 188.233, 127.0],
+          [292.500, 197.500, 127.0],
+          [292.500, 342.500, 127.0],
+          [292.500, 487.500, 127.0],
+          [291.587, 496.767, 127.0],
+          [288.884, 505.677, 127.0],
+          [284.495, 513.890, 127.0],
+          [278.588, 521.088, 127.0],
+          [271.390, 526.995, 127.0],
+          [263.177, 531.384, 127.0],
+          [254.267, 534.087, 127.0],
+          [245.000, 535.000, 127.0],
+          [235.733, 534.087, 127.0],
+          [226.823, 531.384, 127.0],
+          [218.610, 526.995, 127.0],
+          [211.412, 521.088, 127.0],
+          [205.505, 513.890, 127.0],
+          [201.116, 505.677, 127.0],
+          [198.413, 496.767, 127.0],
+          [197.500, 487.500, 127.0]
+        ],
+        "speed_mps": 10.452049,
+        "max_speed_mps": 10.452049
+      }
+    },
+    {
+      "id": "a10-strike-line",
+      "impulsive": true,
+      "asset_id": "squad-a10-impacts",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 163
+      },
+      "default_enabled": false,
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 35.0
+      },
+      "position_m": [
+        292.5,
+        342.5,
+        2.0
+      ]
+    },
+    {
+      "id": "a10-gunrun-sky-west",
+      "asset_id": "squad-a10-pass",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 127
+      },
+      "default_enabled": false,
+      "playback_start_offset_s": 42.0,
+      "extent": {
+        "kind": "point"
+      },
+      "trajectory": {
+        "waypoints_m": [
+          [197.500, 331.167, 127.0],
+          [197.500, 197.500, 127.0],
+          [198.413, 188.233, 127.0],
+          [201.116, 179.323, 127.0],
+          [205.505, 171.110, 127.0],
+          [211.412, 163.912, 127.0],
+          [218.610, 158.005, 127.0],
+          [226.823, 153.616, 127.0],
+          [235.733, 150.913, 127.0],
+          [245.000, 150.000, 127.0],
+          [254.267, 150.913, 127.0],
+          [263.177, 153.616, 127.0],
+          [271.390, 158.005, 127.0],
+          [278.588, 163.912, 127.0],
+          [284.495, 171.110, 127.0],
+          [288.884, 179.323, 127.0],
+          [291.587, 188.233, 127.0],
+          [292.500, 197.500, 127.0],
+          [292.500, 342.500, 127.0],
+          [292.500, 487.500, 127.0],
+          [291.587, 496.767, 127.0],
+          [288.884, 505.677, 127.0],
+          [284.495, 513.890, 127.0],
+          [278.588, 521.088, 127.0],
+          [271.390, 526.995, 127.0],
+          [263.177, 531.384, 127.0],
+          [254.267, 534.087, 127.0],
+          [245.000, 535.000, 127.0],
+          [235.733, 534.087, 127.0],
+          [226.823, 531.384, 127.0],
+          [218.610, 526.995, 127.0],
+          [211.412, 521.088, 127.0],
+          [205.505, 513.890, 127.0],
+          [201.116, 505.677, 127.0],
+          [198.413, 496.767, 127.0],
+          [197.500, 487.500, 127.0]
+        ],
+        "speed_mps": 10.452049,
+        "max_speed_mps": 10.452049
+      }
+    },
+    {
+      "id": "a10-strike-line-west",
+      "impulsive": true,
+      "asset_id": "squad-a10-impacts",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 163
+      },
+      "default_enabled": false,
+      "playback_start_offset_s": 42.0,
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 35.0
+      },
+      "position_m": [
+        197.5,
+        342.5,
+        2.0
+      ]
+    }
+  ],
+  "listener": {
+    "trajectory": {
+      "waypoints_m": [
+        [197.5, 292.5, 1.5],
+        [292.5, 292.5, 1.5],
+        [292.5, 387.5, 1.5],
+        [197.5, 387.5, 1.5]
+      ],
+      "speed_mps": 1.5,
+      "max_speed_mps": 1.5
+    },
+    "forward_enu": [
+      1,
+      0,
+      0
+    ],
+    "up_enu": [
+      0,
+      0,
+      1
+    ]
+  },
+  "geometry": {
+    "vertices_m": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        585,
+        0,
+        0
+      ],
+      [
+        585,
+        585,
+        0
+      ],
+      [
+        0,
+        585,
+        0
+      ]
+    ],
+    "triangles": [
+      {
+        "indices": [
+          0,
+          1,
+          2
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          2,
+          3
+        ],
+        "material": "masonry"
+      }
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [
+          0.03,
+          0.05,
+          0.07
+        ],
+        "scattering": 0.1,
+        "transmission": [
+          0.0251,
+          0.00562,
+          0.00178
+        ]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {
+      "distance_attenuation": true,
+      "occlusion": true,
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "enabled": true,
+      "rays": 4096,
+      "bounces": 3,
+      "duration_s": 1.5
+    },
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": [
+        "direct",
+        "path",
+        "reflections"
+      ]
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [
+        0,
+        0,
+        0.5
+      ],
+      "max_m": [
+        585,
+        585,
+        63.0
+      ],
+      "spacing_m": 4.0
+    },
+    "probe_generation": {
+      "type": "uniform_floor",
+      "height_m": 1.5
+    },
+    "path_bake": {
+      "identifier": "megablock-city-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 2
+    }
+  },
+  "expected": {
+    "properties": [
+      "The listener follows a four-leg closed loop through the megablock streets at 1.5 m/s, returning from the final waypoint to the first.",
+      "Four ordinary sources start enabled and four A-10 sources start disabled at the eight-source workbench cap; the Mi-8 follows a 48-waypoint constant-radius circle at 30 m/s and 55 m elevation.",
+      "The M2 at [289.0, 102.5, 2.0] and opposing DShK at [292.5, 342.5, 2.0] use fixed offline-composed burst-loop WAV assets; there is no space-triggered ballistic event in this fixture.",
+      "Two sample-synchronized A-10 sky/impact pairs are separated by a 42 s playback phase so their clusters alternate between the east and west legs of one 84 s racetrack lap.",
+      "The geometry, materials, simulation settings, probe volume, and megablock-city-bake-v1 identity match the megablock-walk fixture."
+    ],
+    "non_claims": [
+      "The synthetic grid is an acoustic stress fixture, not surveyed geography.",
+      "The source assets are local prepared derivatives and are not redistributable fixture content.",
+      "This fixture makes no delivered-ear-SPL claim without output calibration."
+    ]
+  }
+}

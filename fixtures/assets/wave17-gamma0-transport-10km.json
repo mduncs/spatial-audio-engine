@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma0-transport-10km",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma0-transport-10km.wav",
+      "sha256": "1cbde73bad17f544abb442086d5ea892abc73c82ceb114e548f3cf04fd113ec7",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 30.654520833,
+  "target_rms_dbfs": -36.990511,
+  "expected_reference_rms_dbfs": -127.940085,
+  "calibration": {
+    "applied_gain_db": 90.949574
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma0 source SHA-256 1cbde73bad17f544abb442086d5ea892abc73c82ceb114e548f3cf04fd113ec7; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

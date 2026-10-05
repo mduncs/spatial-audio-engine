@@ -1,0 +1,331 @@
+{
+  "fixture_id": "wave17-private-squad-palette",
+  "audition": {
+    "mode": "squad_palette",
+    "title": "PRIVATE SQUAD v8.1 · SOURCE PALETTE",
+    "place_label": "15 local audition derivatives · one-at-a-time tasting",
+    "place_nonclaim": "Private local inputs; identity hashes are not redistribution rights",
+    "macro_ranges_m": [
+      100,
+      1000,
+      10000
+    ]
+  },
+  "sources": [
+    {
+      "id": "palette-a10-impacts",
+      "asset_id": "squad-a10-impacts",
+      "audition_label": "A-10 · impact sequence",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        332.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-a10-pass",
+      "asset_id": "squad-a10-pass",
+      "audition_label": "A-10 · authored pass",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        372.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-abrams-idle",
+      "asset_id": "squad-abrams-idle",
+      "audition_label": "Abrams · idle",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        412.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-camo-tent-flap",
+      "asset_id": "squad-camo-tent-flap",
+      "audition_label": "Camo tent · flap",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        452.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-dshk-burst-loop",
+      "asset_id": "squad-dshk-burst-loop",
+      "audition_label": "DShK · burst texture",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        252.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-fire-building-large",
+      "asset_id": "squad-fire-building-large",
+      "audition_label": "Fire · large building",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        212.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-fire-car",
+      "asset_id": "squad-fire-car",
+      "audition_label": "Fire · vehicle",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        172.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-fob-radio-static",
+      "asset_id": "squad-fob-radio-static",
+      "audition_label": "FOB radio · static",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        132.5,
+        292.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-generator-diesel",
+      "asset_id": "squad-generator-diesel",
+      "audition_label": "Generator · diesel",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        332.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-m2-blast",
+      "asset_id": "squad-m2-blast",
+      "audition_label": "M2 · single blast",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        372.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-m2-burst-loop",
+      "asset_id": "squad-m2-burst-loop",
+      "audition_label": "M2 · burst texture",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        412.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-mi8-rotor-close",
+      "asset_id": "squad-mi8-rotor-close",
+      "audition_label": "Mi-8 · close rotor",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        452.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-thunder-distant-03",
+      "asset_id": "squad-thunder-distant-03",
+      "audition_label": "Thunder · pressure edge 03",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        252.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-thunder-distant-15",
+      "asset_id": "squad-thunder-distant-15",
+      "audition_label": "Thunder · long tail 15",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        212.5,
+        1.5
+      ]
+    },
+    {
+      "id": "palette-ural-idle",
+      "asset_id": "squad-ural-idle",
+      "audition_label": "Ural · idle",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "extent": {
+        "kind": "point"
+      },
+      "position_m": [
+        292.5,
+        172.5,
+        1.5
+      ]
+    }
+  ],
+  "listener": {
+    "position_m": [
+      292.5,
+      292.5,
+      1.5
+    ],
+    "forward_enu": [
+      0,
+      1,
+      0
+    ]
+  },
+  "simulation": {
+    "direct": {
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "rays": 4096,
+      "bounces": 3,
+      "duration_s": 1.5
+    },
+    "pathing": {
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true
+    },
+    "probe_volume": {
+      "spacing_m": 4.0
+    }
+  }
+}

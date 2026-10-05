@@ -1,0 +1,112 @@
+{
+  "schema_version": "fightbox.fixture.v1",
+  "fixture_id": "toms-diner-coloration-walk",
+  "gate": "S3",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {"name": "Steam Audio", "version": "4.8.1"},
+  "source": {
+    "id": "toms-diner-point",
+    "position_m": [0, 0, 1.5],
+    "reference_level": {"mode": "SplAtOneMeter", "db_spl": 80},
+    "asset_id": "toms-diner",
+    "spatial_extent": "point"
+  },
+  "listener": {
+    "position_m": [40, 0, 1.5],
+    "forward_enu": [-1, 0, 0],
+    "up_enu": [0, 0, 1],
+    "orientation": "face_source",
+    "trajectory": {
+      "speed_mps": 1.5,
+      "segments": [
+        {"kind": "line", "name": "approach", "from_m": [40, 0, 1.5], "to_m": [2.5, 0, 1.5]},
+        {
+          "kind": "orbit",
+          "name": "orbit",
+          "center_m": [0, 0, 1.5],
+          "radius_m": 2.5,
+          "start_angle_degrees": 0,
+          "revolutions": 1,
+          "direction": "counterclockwise"
+        },
+        {"kind": "line", "name": "recede", "from_m": [2.5, 0, 1.5], "to_m": [40, 0, 1.5]}
+      ]
+    }
+  },
+  "geometry": {
+    "vertices_m": [
+      [-50, 45, 0],
+      [50, 45, 0],
+      [50, 45, 10],
+      [-50, 45, 10],
+      [-45, -5, 0],
+      [45, -5, 0],
+      [45, 5, 0],
+      [-45, 5, 0]
+    ],
+    "triangles": [
+      {"indices": [0, 1, 2], "material": "masonry"},
+      {"indices": [0, 2, 3], "material": "masonry"},
+      {"indices": [2, 1, 0], "material": "masonry"},
+      {"indices": [3, 2, 0], "material": "masonry"},
+      {"indices": [4, 5, 6], "material": "ground"},
+      {"indices": [4, 6, 7], "material": "ground"},
+      {"indices": [6, 5, 4], "material": "ground"},
+      {"indices": [7, 6, 4], "material": "ground"}
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [0.08, 0.12, 0.18],
+        "scattering": 0.1,
+        "transmission": [0, 0, 0]
+      },
+      "ground": {
+        "absorption": [0.99, 0.99, 0.99],
+        "scattering": 0,
+        "transmission": [0, 0, 0]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {"distance_attenuation": true, "occlusion": true, "occlusion_samples": 64},
+    "reflections": {"enabled": true, "rays": 1024, "bounces": 1, "duration_s": 0.35},
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": ["direct", "path", "reflections"]
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [-41, -4, 0.5],
+      "max_m": [41, 4, 2.5],
+      "spacing_m": 2
+    },
+    "probe_generation": {"type": "uniform_floor", "height_m": 1.5},
+    "path_bake": {
+      "identifier": "toms-diner-coloration-walk-path-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 2
+    }
+  },
+  "expected": {
+    "properties": [
+      "The listener approaches from 40 m to 2.5 m, completes exactly one 2.5 m-radius orbit, and recedes to 40 m at 1.5 m/s while facing the fixed point source.",
+      "Comb, pump, and zipper qualification is measured on the summed direct plus path plus reflections binaural output.",
+      "During approach, program-compensated summed level is monotonic within the stated tolerance until the safety ceiling."
+    ],
+    "non_claims": [
+      "The fixture's S3 schema tag is a compatibility encoding because the frozen shared fixture schema predates the Phase D coloration slice.",
+      "The point-source render makes no post-MVP stereo-extent claim.",
+      "Automated coloration metrics do not replace the later human listening record."
+    ]
+  }
+}

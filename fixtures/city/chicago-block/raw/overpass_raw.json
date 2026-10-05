@@ -1,0 +1,180 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API 0.7.62.11 87bfad18",
+  "osm3s": {
+    "timestamp_osm_base": "2026-07-29T20:58:36Z",
+    "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
+  },
+  "elements": [
+
+{
+  "type": "way",
+  "id": 148261311,
+  "nodes": [
+    1613640630,
+    1613640682,
+    1613640864,
+    1613640799,
+    1613640630
+  ],
+  "tags": {
+    "addr:city": "Chicago",
+    "addr:housenumber": "720-736",
+    "addr:postcode": "60605",
+    "addr:state": "IL",
+    "addr:street": "South Dearborn Street",
+    "addr:street:name": "Dearborn",
+    "addr:street:prefix": "South",
+    "addr:street:type": "Street",
+    "building": "apartments",
+    "building:levels": "13",
+    "chicago:building_id": "814942",
+    "name": "New Franklin Building"
+  }
+},
+{
+  "type": "way",
+  "id": 148261329,
+  "nodes": [
+    1613640916,
+    1613640878,
+    1613640799,
+    1613640630,
+    1613640916
+  ],
+  "tags": {
+    "addr:city": "Chicago",
+    "addr:housenumber": "714",
+    "addr:postcode": "60605",
+    "addr:state": "IL",
+    "addr:street": "South Dearborn Street",
+    "addr:street:name": "Dearborn",
+    "addr:street:prefix": "South",
+    "addr:street:type": "Street",
+    "building": "apartments",
+    "building:levels": "9",
+    "chicago:building_id": "365859",
+    "name": "Rowe Building"
+  }
+},
+{
+  "type": "way",
+  "id": 148517232,
+  "nodes": [
+    1616109494,
+    1616109488,
+    1616109474,
+    1616109476,
+    1616109494
+  ],
+  "tags": {
+    "addr:city": "Chicago",
+    "addr:housenumber": "600",
+    "addr:postcode": "60605",
+    "addr:state": "IL",
+    "addr:street": "South Dearborn Street",
+    "addr:street:name": "Dearborn",
+    "addr:street:prefix": "South",
+    "addr:street:type": "Street",
+    "building": "apartments",
+    "building:levels": "22",
+    "chicago:building_id": "364561",
+    "name": "Transportation Building"
+  }
+},
+{
+  "type": "way",
+  "id": 843220032,
+  "nodes": [
+    1613640682,
+    7865901102,
+    7865901103,
+    1613640864,
+    1613640682
+  ],
+  "tags": {
+    "addr:city": "Chicago",
+    "addr:housenumber": "744",
+    "addr:postcode": "60605",
+    "addr:state": "IL",
+    "addr:street": "South Dearborn Street",
+    "amenity": "events_venue",
+    "building": "retail",
+    "name": "RESERV"
+  }
+},
+{
+  "type": "node",
+  "id": 1613640630,
+  "lat": 41.8729321,
+  "lon": -87.6295229
+},
+{
+  "type": "node",
+  "id": 1613640682,
+  "lat": 41.8726076,
+  "lon": -87.6295175
+},
+{
+  "type": "node",
+  "id": 1613640799,
+  "lat": 41.8729344,
+  "lon": -87.6293000
+},
+{
+  "type": "node",
+  "id": 1613640864,
+  "lat": 41.8726082,
+  "lon": -87.6292951
+},
+{
+  "type": "node",
+  "id": 1613640878,
+  "lat": 41.8730940,
+  "lon": -87.6293064
+},
+{
+  "type": "node",
+  "id": 1613640916,
+  "lat": 41.8730905,
+  "lon": -87.6295244
+},
+{
+  "type": "node",
+  "id": 1616109474,
+  "lat": 41.8736360,
+  "lon": -87.6293317
+},
+{
+  "type": "node",
+  "id": 1616109476,
+  "lat": 41.8736327,
+  "lon": -87.6295541
+},
+{
+  "type": "node",
+  "id": 7865901102,
+  "lat": 41.8724043,
+  "lon": -87.6295164
+},
+{
+  "type": "node",
+  "id": 7865901103,
+  "lat": 41.8724049,
+  "lon": -87.6292941
+},
+{
+  "type": "node",
+  "id": 1616109488,
+  "lat": 41.8744521,
+  "lon": -87.6293542
+},
+{
+  "type": "node",
+  "id": 1616109494,
+  "lat": 41.8744487,
+  "lon": -87.6295764
+}
+
+  ]
+}

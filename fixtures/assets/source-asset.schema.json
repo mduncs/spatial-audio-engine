@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fightbox.dev/schema/source-asset-1.json",
+  "title": "Fightbox canonical source asset",
+  "description": "Strict source truth normalized from legacy mono descriptors or authored directly for Mono/StereoLR assets. This contract does not claim stereo runtime support.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "asset_id",
+    "layout",
+    "presentation_provenance",
+    "compatible_geometries",
+    "original",
+    "canonical",
+    "canonicalization",
+    "measurements",
+    "motion",
+    "rights",
+    "seekability"
+  ],
+  "properties": {
+    "schema_version": {"const": "fightbox.source-asset.v1"},
+    "asset_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "layout": {"enum": ["mono", "stereo_lr"]},
+    "presentation_provenance": {
+      "enum": ["native_mono", "authored_stereo", "mono_expanded"]
+    },
+    "compatible_geometries": {
+      "type": "array",
+      "items": {"enum": ["point", "multi_point", "line_segment", "stereo_image"]},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "original": {"$ref": "#/$defs/original"},
+    "canonical": {"$ref": "#/$defs/canonical"},
+    "canonicalization": {"$ref": "#/$defs/toolchain"},
+    "measurements": {"$ref": "#/$defs/measurements"},
+    "motion": {"$ref": "#/$defs/motion"},
+    "rights": {"$ref": "#/$defs/rights"},
+    "seekability": {"enum": ["sample_accurate", "deterministic_generator"]},
+    "derivation": {"$ref": "#/$defs/derivation"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"layout": {"const": "stereo_lr"}}, "required": ["layout"]},
+      "then": {
+        "properties": {
+          "presentation_provenance": {"const": "authored_stereo"},
+          "compatible_geometries": {"const": ["stereo_image"]},
+          "measurements": {"required": ["stereo"]}
+        },
+        "not": {"required": ["derivation"]}
+      }
+    },
+    {
+      "if": {
+        "properties": {"presentation_provenance": {"const": "native_mono"}},
+        "required": ["presentation_provenance"]
+      },
+      "then": {
+        "properties": {
+          "layout": {"const": "mono"},
+          "compatible_geometries": {"const": ["point", "multi_point", "line_segment"]},
+          "measurements": {"not": {"required": ["stereo"]}}
+        },
+        "not": {"required": ["derivation"]}
+      }
+    },
+    {
+      "if": {
+        "properties": {"presentation_provenance": {"const": "mono_expanded"}},
+        "required": ["presentation_provenance"]
+      },
+      "then": {
+        "properties": {
+          "layout": {"const": "mono"},
+          "compatible_geometries": {"const": ["stereo_image"]},
+          "measurements": {"not": {"required": ["stereo"]}}
+        },
+        "required": ["derivation"]
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "layout": {"enum": ["mono", "stereo_lr"]},
+    "format": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["container", "codec", "sample_rate_hz", "layout", "lossy"],
+      "properties": {
+        "container": {
+          "enum": ["deterministic_generator", "wav", "aiff", "caf", "flac", "m4a", "mp3", "fightbox_planar_chunks_v1"]
+        },
+        "codec": {
+          "enum": ["sine_generator", "multitone_generator", "pink_like_generator", "pcm_integer", "pcm_float", "flac", "aac", "mp3", "pcm_f32_planar_le"]
+        },
+        "sample_rate_hz": {"type": "integer", "minimum": 1},
+        "layout": {"$ref": "#/$defs/layout"},
+        "lossy": {"type": "boolean"}
+      }
+    },
+    "original": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_sha256", "format"],
+      "properties": {
+        "content_sha256": {"$ref": "#/$defs/sha256"},
+        "format": {"$ref": "#/$defs/format"}
+      }
+    },
+    "canonical": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "canonical_pcm_sha256", "format", "frame_count", "chunk_frames", "chunk_storage"],
+      "properties": {
+        "artifact_id": {"type": "string", "pattern": "^fightbox\\.canonical-audio\\.v1:sha256:[0-9a-f]{64}$"},
+        "canonical_pcm_sha256": {"$ref": "#/$defs/sha256"},
+        "format": {
+          "allOf": [
+            {"$ref": "#/$defs/format"},
+            {
+              "properties": {
+                "container": {"const": "fightbox_planar_chunks_v1"},
+                "codec": {"const": "pcm_f32_planar_le"},
+                "sample_rate_hz": {"const": 48000},
+                "lossy": {"const": false}
+              }
+            }
+          ]
+        },
+        "frame_count": {"type": "integer", "minimum": 1},
+        "chunk_frames": {"const": 48000},
+        "chunk_storage": {"const": "raw_or_zstd_if_smaller"}
+      }
+    },
+    "pinned_tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "revision", "settings_sha256"],
+      "properties": {
+        "implementation": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "minLength": 1},
+        "settings_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decoder", "resampler"],
+      "properties": {
+        "decoder": {"$ref": "#/$defs/pinned_tool"},
+        "resampler": {"$ref": "#/$defs/pinned_tool"}
+      }
+    },
+    "levels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rms_dbfs", "true_peak_dbtp"],
+      "properties": {
+        "rms_dbfs": {"type": "number"},
+        "true_peak_dbtp": {"type": "number"}
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "levels"],
+      "properties": {
+        "channel": {"enum": ["mono", "left", "right"]},
+        "levels": {"$ref": "#/$defs/levels"}
+      }
+    },
+    "pca": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["center_weights_lr", "width_weights_lr", "center_energy", "width_energy"],
+      "properties": {
+        "center_weights_lr": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+        "width_weights_lr": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+        "center_energy": {"type": "number", "minimum": 0},
+        "width_energy": {"type": "number", "minimum": 0}
+      }
+    },
+    "mono_compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "score", "short_lag_comb_correlation_delta", "regular_notch_depth_delta_db"],
+      "properties": {
+        "status": {"enum": ["compatible", "rejected"]},
+        "score": {"type": "number", "minimum": 0, "maximum": 1},
+        "short_lag_comb_correlation_delta": {"type": "number", "minimum": 0},
+        "regular_notch_depth_delta_db": {"type": "number", "minimum": 0}
+      }
+    },
+    "stereo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pca", "correlation", "mono_compatibility"],
+      "properties": {
+        "pca": {"$ref": "#/$defs/pca"},
+        "correlation": {"type": "number", "minimum": -1, "maximum": 1},
+        "mono_compatibility": {"$ref": "#/$defs/mono_compatibility"}
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["analysis_revision", "per_channel", "aggregate"],
+      "properties": {
+        "analysis_revision": {"type": "string", "minLength": 1},
+        "per_channel": {"type": "array", "items": {"$ref": "#/$defs/channel"}, "minItems": 1, "maxItems": 2},
+        "aggregate": {"$ref": "#/$defs/levels"},
+        "stereo": {"$ref": "#/$defs/stereo"}
+      }
+    },
+    "motion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recording_carries_motion", "evidence", "description"],
+      "properties": {
+        "recording_carries_motion": {"type": "boolean"},
+        "evidence": {"enum": ["authored_dry", "recorded_motion", "legacy_unspecified"]},
+        "description": {"type": "string", "minLength": 1}
+      }
+    },
+    "rights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "license", "evidence"],
+      "properties": {
+        "status": {"enum": ["generated", "public_domain", "licensed", "restricted", "legacy_unverified"]},
+        "license": {"type": "string", "minLength": 1},
+        "evidence": {"type": "string", "minLength": 1}
+      }
+    },
+    "derivation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_artifact_id", "recipe_sha256"],
+      "properties": {
+        "source_artifact_id": {"type": "string", "pattern": "^fightbox\\.canonical-audio\\.v1:sha256:[0-9a-f]{64}$"},
+        "recipe_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

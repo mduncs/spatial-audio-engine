@@ -1,0 +1,91 @@
+{
+  "assumptions": [
+    {
+      "assumed_height_m": 4.0,
+      "building_id": "way/843220032",
+      "reason": "missing height and building:levels/levels; city default-height policy"
+    }
+  ],
+  "building_count": 4,
+  "format_version": 1,
+  "inputs": [
+    {
+      "path": "fixtures/city/chicago-block/chicago-block.geojson",
+      "sha256": "363583a00d22307fe6146726ba57b324e2000c6ab07e508abb1744c8cfe29200"
+    }
+  ],
+  "materials": {
+    "asphalt": {
+      "absorption": [
+        0.019999999552965164,
+        0.029999999329447746,
+        0.03999999910593033
+      ],
+      "scattering": 0.07999999821186066,
+      "transmission": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "brick": {
+      "absorption": [
+        0.029999999329447746,
+        0.03999999910593033,
+        0.07000000029802322
+      ],
+      "scattering": 0.15000000596046448,
+      "transmission": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "concrete": {
+      "absorption": [
+        0.019999999552965164,
+        0.029999999329447746,
+        0.05000000074505806
+      ],
+      "scattering": 0.10000000149011612,
+      "transmission": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "glass": {
+      "absorption": [
+        0.07999999821186066,
+        0.05000000074505806,
+        0.029999999329447746
+      ],
+      "scattering": 0.05000000074505806,
+      "transmission": [
+        0.11999999731779099,
+        0.07999999821186066,
+        0.03999999910593033
+      ]
+    },
+    "grass": {
+      "absorption": [
+        0.10000000149011612,
+        0.3499999940395355,
+        0.6499999761581421
+      ],
+      "scattering": 0.4000000059604645,
+      "transmission": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "materials_content_sha256": "eb92a1e6b465963e2897b1f75a2bf3bd7f538c513881374bd4819a31be730204",
+  "mesh": {
+    "content_sha256": "0df4a274cc15129e9171a62de8d0ae14a345799243c7443e1edcc085c61d7310",
+    "triangle_count": 50,
+    "vertex_count": 36
+  },
+  "tool_version": "0.1.0"
+}

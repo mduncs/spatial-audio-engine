@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma10-cell-e1-n0",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma10-cell-e1-n0.wav",
+      "sha256": "179d8c4b2a4570abe6f241eb7ddf946dd3749133f9c0d567c7c57b399c2d6e20",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 53.333333333,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -50.33103,
+  "calibration": {
+    "applied_gain_db": 26.33103
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma10 source SHA-256 de38b1bd5100a0a31f9c17e4c3564b119c15d56772313ecb8faac58f6e77630c; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

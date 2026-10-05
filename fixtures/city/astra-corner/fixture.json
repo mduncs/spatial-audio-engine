@@ -1,0 +1,181 @@
+{
+  "schema_version": "fightbox.fixture.workbench.v1",
+  "fixture_id": "astra-corner-music-v1",
+  "gate": "S5",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {
+    "name": "Steam Audio",
+    "version": "4.8.1"
+  },
+  "sources": [
+    {
+      "id": "corner-music",
+      "asset_id": "toms-diner",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "position_m": [
+        102.5,
+        102.5,
+        1.5
+      ],
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "playback_start_offset_s": 45.0
+    }
+  ],
+  "listener": {
+    "trajectory": {
+      "waypoints_m": [
+        [
+          148.5,
+          106.0,
+          1.5
+        ],
+        [
+          148.5,
+          131.2,
+          1.5
+        ]
+      ],
+      "speed_mps": 1.4,
+      "max_speed_mps": 1.4
+    },
+    "forward_enu": [
+      0,
+      1,
+      0
+    ],
+    "up_enu": [
+      0,
+      0,
+      1
+    ]
+  },
+  "geometry": {
+    "vertices_m": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        585,
+        0,
+        0
+      ],
+      [
+        585,
+        585,
+        0
+      ],
+      [
+        0,
+        585,
+        0
+      ]
+    ],
+    "triangles": [
+      {
+        "indices": [
+          0,
+          1,
+          2
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          2,
+          3
+        ],
+        "material": "masonry"
+      }
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [
+          0.03,
+          0.05,
+          0.07
+        ],
+        "scattering": 0.1,
+        "transmission": [
+          0.0251,
+          0.00562,
+          0.00178
+        ]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {
+      "distance_attenuation": true,
+      "occlusion": true,
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "enabled": true,
+      "rays": 4096,
+      "bounces": 3,
+      "duration_s": 1.5
+    },
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": [
+        "direct",
+        "path",
+        "reflections"
+      ]
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [
+        0,
+        0,
+        0.5
+      ],
+      "max_m": [
+        585,
+        585,
+        63.0
+      ],
+      "spacing_m": 4.0
+    },
+    "probe_generation": {
+      "type": "uniform_floor",
+      "height_m": 1.5
+    },
+    "path_bake": {
+      "identifier": "megablock-city-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 2
+    }
+  },
+  "expected": {
+    "properties": [
+      "One stationary Tom\u2019s Diner source and one 25.2 m northbound route at 1.4 m/s, ending after 18 seconds without looping.",
+      "Uses the retained megablock-seed1 package and bake; no new geometry/bake.",
+      "Listener passes 1.5 m east of synth/1/1/0, whose footprint is [113,113.2] to [147,146.8].",
+      "Source is off for normal window startup. Explicit headless replay enables only this source."
+    ],
+    "non_claims": [
+      "Synthetic local ENU, not surveyed Chicago.",
+      "This is a repeatable control-route reproduction, not sample-identical stochastic reflection output or a human realism pass.",
+      "Fixed north-facing listener; no head rotation in this case.",
+      "Monitor source calibration does not establish delivered-ear SPL."
+    ]
+  }
+}

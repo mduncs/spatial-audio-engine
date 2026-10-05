@@ -1,0 +1,32 @@
+[package]
+name = "fightbox-cli"
+version = "0.1.0"
+description = "Fightbox diagnostics CLI"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/mduncs/spatial-audio-engine"
+build = "build.rs"
+
+[features]
+default = []
+live-output = ["fightbox-runtime/live-output"]
+linked-sdk = [
+    "fightbox-steam-audio/linked-sdk",
+]
+
+[dependencies]
+fightbox-api = { path = "../../crates/fightbox-api" }
+fightbox-evidence = { path = "../../crates/fightbox-evidence" }
+fightbox-runtime = { path = "../../crates/fightbox-runtime" }
+fightbox-steam-audio = { path = "../../crates/fightbox-steam-audio" }
+fightbox-world = { path = "../../crates/fightbox-world" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+libc = "0.2"
+tiff = "0.11"
+zstd = "=0.13.3"
+
+[[bin]]
+name = "fightbox"
+path = "src/main.rs"

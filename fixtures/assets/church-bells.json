@@ -1,0 +1,23 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "church-bells",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/music/church-bells-48k-mono.wav",
+      "sha256": "cfb8f2c7948c13bb4ba59271ea0a118bc591a9bd9e690ec44bd33389ea04bb0a",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 59.443104,
+  "target_rms_dbfs": -16.0,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes."
+  ]
+}

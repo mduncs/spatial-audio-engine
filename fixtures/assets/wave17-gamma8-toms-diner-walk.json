@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma8-toms-diner-walk",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma8-toms-diner-walk.wav",
+      "sha256": "4902682cffb5951d51e0d0c0b2ffb826006d7a9cb899f02f1679c2339464b727",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 60.544,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -23.348434,
+  "calibration": {
+    "applied_gain_db": -0.651566
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma8 source SHA-256 bb2d21935e2d0d6a7d101ec05e5d2a68549c010b61591879d4e93a68f9524ed8; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": "fightbox.fixture.v1",
+  "fixture_id": "s4-masonry-room-doorway",
+  "gate": "S3",
+  "coordinate_frame": {"name": "local_enu", "units": "meters_seconds", "axes": "x_east_y_north_z_up", "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"},
+  "kernel": {"name": "Steam Audio", "version": "4.8.1"},
+  "source": {"id": "room-source", "position_m": [0.0, -1.0, 1.4], "reference_level": {"mode": "SplAtOneMeter", "db_spl": 85}, "asset_id": "s3-calibrated-pink"},
+  "listener": {"position_m": [0.8, 0.8, 1.5], "forward_enu": [0, 1, 0], "up_enu": [0, 0, 1]},
+  "geometry": {
+    "vertices_m": [[-2,-2.5,0],[2,-2.5,0],[2,2.5,0],[-2,2.5,0],[-2,-2.5,3],[2,-2.5,3],[2,2.5,3],[-2,2.5,3],[-0.5,2.5,0],[-0.5,2.5,3],[0.5,2.5,0],[0.5,2.5,3],[-0.5,2.5,2.1],[0.5,2.5,2.1],[2,6,0],[-2,6,0]],
+    "triangles": [
+      {"indices":[0,1,5],"material":"masonry"},{"indices":[0,5,4],"material":"masonry"},{"indices":[5,1,0],"material":"masonry"},{"indices":[4,5,0],"material":"masonry"},
+      {"indices":[0,3,7],"material":"masonry"},{"indices":[0,7,4],"material":"masonry"},{"indices":[7,3,0],"material":"masonry"},{"indices":[4,7,0],"material":"masonry"},
+      {"indices":[1,2,6],"material":"masonry"},{"indices":[1,6,5],"material":"masonry"},{"indices":[6,2,1],"material":"masonry"},{"indices":[5,6,1],"material":"masonry"},
+      {"indices":[3,8,9],"material":"masonry"},{"indices":[3,9,7],"material":"masonry"},{"indices":[9,8,3],"material":"masonry"},{"indices":[7,9,3],"material":"masonry"},
+      {"indices":[10,2,6],"material":"masonry"},{"indices":[10,6,11],"material":"masonry"},{"indices":[6,2,10],"material":"masonry"},{"indices":[11,6,10],"material":"masonry"},
+      {"indices":[12,13,11],"material":"masonry"},{"indices":[12,11,9],"material":"masonry"},{"indices":[11,13,12],"material":"masonry"},{"indices":[9,11,12],"material":"masonry"},
+      {"indices":[0,1,2],"material":"masonry"},{"indices":[0,2,3],"material":"masonry"},{"indices":[2,1,0],"material":"masonry"},{"indices":[3,2,0],"material":"masonry"},
+      {"indices":[4,7,6],"material":"masonry"},{"indices":[4,6,5],"material":"masonry"},{"indices":[6,7,4],"material":"masonry"},{"indices":[5,6,4],"material":"masonry"},
+      {"indices":[3,2,14],"material":"ground"},{"indices":[3,14,15],"material":"ground"},{"indices":[14,2,3],"material":"ground"},{"indices":[15,14,3],"material":"ground"}
+    ],
+    "materials": {
+      "masonry": {"absorption": [0.03,0.05,0.07], "scattering": 0.1, "transmission": [0,0,0]},
+      "high_absorption": {"absorption": [0.72,0.78,0.84], "scattering": 0.35, "transmission": [0,0,0]},
+      "ground": {"absorption": [0.05,0.07,0.08], "scattering": 0.05, "transmission": [0,0,0]}
+    }
+  },
+  "simulation": {
+    "direct": {"distance_attenuation": true, "occlusion": true, "occlusion_samples": 64},
+    "reflections": {"enabled": true, "rays": 4096, "bounces": 4, "duration_s": 0.5},
+    "pathing": {"enabled": true, "order": 2, "validation": true, "alternate_paths": true, "runtime_order": ["direct","path","reflections"]},
+    "probe_volume": {"type": "box", "min_m": [-1.5,-2.0,0.25], "max_m": [1.5,5.5,2.75], "spacing_m": 1.0},
+    "probe_generation": {"type": "uniform_floor", "height_m": 1.5},
+    "path_bake": {"identifier": "s4-room-path-bake-v1", "required_call": "iplPathBakerBake", "probe_batch_serialization": "required", "fresh_process_reload": true, "bake_order": 2}
+  },
+  "expected": {
+    "properties": [
+      "The 4 m by 5 m by 3 m masonry room is closed except for a 1 m wide by 2.1 m high aperture centered in its north wall.",
+      "A generated unit impulse produces a nonzero convolution response whose irSize exactly equals configured duration times sample rate.",
+      "Replacing masonry with the declared high-absorption variant shortens and weakens the indirect decay."
+    ],
+    "non_claims": [
+      "The fixture's S3 schema tag is a compatibility encoding because the frozen shared fixture schema predates S4; fixture_id and expected properties carry the S4 authority.",
+      "Automated decay ordering does not replace the later human listening record."
+    ]
+  }
+}

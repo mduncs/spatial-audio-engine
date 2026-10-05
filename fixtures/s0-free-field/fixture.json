@@ -1,0 +1,20 @@
+{
+  "schema_version": "fightbox.fixture.v1",
+  "fixture_id": "s0-free-field-100m-approach",
+  "gate": "S0",
+  "coordinate_frame": {"name": "local_enu", "units": "meters_seconds", "axes": "x_east_y_north_z_up", "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"},
+  "kernel": {"name": "Steam Audio", "version": "4.8.1"},
+  "source": {"id": "calibrated-point", "position_m": [0, 0, 1.5], "reference_level": {"mode": "SplAtOneMeter", "db_spl": 85}, "asset_id": "s0-calibrated-pink"},
+  "listener": {"position_m": [100, 0, 1.5], "forward_enu": [0, 1, 0], "up_enu": [0, 0, 1], "trajectory_m": [[100, 0, 1.5], [75, 0, 1.5], [50, 0, 1.5], [25, 0, 1.5], [10, 0, 1.5], [1, 0, 1.5]]},
+  "geometry": {"vertices_m": [], "triangles": [], "materials": {}},
+  "simulation": {
+    "direct": {"distance_attenuation": true, "occlusion": false},
+    "reflections": {"enabled": false},
+    "pathing": {"enabled": false},
+    "air_absorption": {"enabled": true, "comparison": "same 100 m geometry and source gain; vary only air_absorption.enabled"}
+  },
+  "expected": {
+    "properties": ["Approach samples are finite and their calibrated direct PCM level is monotonic nondecreasing until the safety ceiling.", "The 100 m to 1 m direct-level change is spreading-dominated and approximately 40 dB before any safety stage.", "Brightness changes continuously across adjacent approach samples.", "At the same 100 m distance, enabled air absorption has no greater high-band energy than disabled air absorption; this comparison is independent of level ordering."],
+    "non_claims": ["This fixture does not establish headphone-ear SPL without output calibration.", "This fixture does not establish audible quality or pathing."]
+  }
+}

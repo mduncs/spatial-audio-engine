@@ -1,0 +1,83 @@
+{
+  "schema_version": "fightbox.source-asset.v1",
+  "asset_id": "source-contract-authored-stereo",
+  "layout": "stereo_lr",
+  "presentation_provenance": "authored_stereo",
+  "compatible_geometries": ["stereo_image"],
+  "original": {
+    "content_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "format": {
+      "container": "m4a",
+      "codec": "aac",
+      "sample_rate_hz": 44100,
+      "layout": "stereo_lr",
+      "lossy": true
+    }
+  },
+  "canonical": {
+    "artifact_id": "fightbox.canonical-audio.v1:sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "canonical_pcm_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "format": {
+      "container": "fightbox_planar_chunks_v1",
+      "codec": "pcm_f32_planar_le",
+      "sample_rate_hz": 48000,
+      "layout": "stereo_lr",
+      "lossy": false
+    },
+    "frame_count": 480000,
+    "chunk_frames": 48000,
+    "chunk_storage": "raw_or_zstd_if_smaller"
+  },
+  "canonicalization": {
+    "decoder": {
+      "implementation": "fightbox-pinned-aac-decoder",
+      "revision": "1.0.0",
+      "settings_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "resampler": {
+      "implementation": "fightbox-pinned-resampler",
+      "revision": "1.0.0",
+      "settings_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+    }
+  },
+  "measurements": {
+    "analysis_revision": "fightbox.source-analysis.v1",
+    "per_channel": [
+      {
+        "channel": "left",
+        "levels": {"rms_dbfs": -20.0, "true_peak_dbtp": -2.0}
+      },
+      {
+        "channel": "right",
+        "levels": {"rms_dbfs": -20.0, "true_peak_dbtp": -3.0}
+      }
+    ],
+    "aggregate": {"rms_dbfs": -20.0, "true_peak_dbtp": -2.0},
+    "stereo": {
+      "pca": {
+        "center_weights_lr": [0.7071067811865476, 0.7071067811865476],
+        "width_weights_lr": [-0.7071067811865476, 0.7071067811865476],
+        "center_energy": 0.018,
+        "width_energy": 0.002
+      },
+      "correlation": 0.8,
+      "mono_compatibility": {
+        "status": "compatible",
+        "score": 0.95,
+        "short_lag_comb_correlation_delta": 0.02,
+        "regular_notch_depth_delta_db": 1.5
+      }
+    }
+  },
+  "motion": {
+    "recording_carries_motion": true,
+    "evidence": "recorded_motion",
+    "description": "The pinned recording contains source motion and therefore requires a static proxy."
+  },
+  "rights": {
+    "status": "licensed",
+    "license": "fixture-only-example",
+    "evidence": "This metadata-only fixture contains no media bytes."
+  },
+  "seekability": "sample_accurate"
+}

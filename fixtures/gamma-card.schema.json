@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fightbox.dev/schema/gamma-card-1.json",
+  "title": "Fightbox canonical gamma evidence card",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "card_id",
+    "status",
+    "engine_revision",
+    "artifacts",
+    "atmosphere",
+    "quality_states",
+    "voice_assignments",
+    "isolated_stems",
+    "resources",
+    "listening",
+    "failure_reason"
+  ],
+  "properties": {
+    "schema_version": {"const": "fightbox.gamma-card.v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "card_id": {
+      "enum": [
+        "gamma0_transport_pulse",
+        "gamma1_explosion_artillery",
+        "gamma2_firework",
+        "gamma3_supersonic_shot",
+        "gamma4_thunder",
+        "gamma5_fast_mover",
+        "gamma6_contention",
+        "gamma7_owner_home_aperture",
+        "gamma8_toms_diner",
+        "gamma9_spectral_composition",
+        "gamma10_cell_boundary"
+      ]
+    },
+    "status": {"enum": ["planned", "captured", "passed", "failed"]},
+    "engine_revision": {"type": "string", "minLength": 1},
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "world_package", "bake", "table"],
+      "properties": {
+        "source": {"$ref": "#/$defs/artifact_binding"},
+        "world_package": {"$ref": "#/$defs/artifact_binding"},
+        "bake": {"$ref": "#/$defs/artifact_binding"},
+        "table": {"$ref": "#/$defs/artifact_binding"}
+      }
+    },
+    "atmosphere": {"$ref": "#/$defs/atmosphere"},
+    "quality_states": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "voice_assignments": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/voice_assignment"}
+    },
+    "isolated_stems": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/stem"}
+    },
+    "resources": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/resources"}
+      ]
+    },
+    "listening": {"$ref": "#/$defs/listening"},
+    "failure_reason": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"enum": ["captured", "passed"]}}},
+      "then": {
+        "properties": {
+          "quality_states": {"minItems": 1},
+          "voice_assignments": {"minItems": 1},
+          "isolated_stems": {"minItems": 1},
+          "resources": {"$ref": "#/$defs/resources"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact_binding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "sha256"],
+          "properties": {
+            "status": {"const": "bound"},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"const": "not_applicable"},
+            "reason": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    },
+    "atmosphere": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "observation_id",
+            "temperature_c",
+            "relative_humidity_percent",
+            "pressure_pa",
+            "coefficient_sha256"
+          ],
+          "properties": {
+            "status": {"const": "frozen"},
+            "observation_id": {"type": "string", "minLength": 1},
+            "temperature_c": {"type": "number"},
+            "relative_humidity_percent": {"type": "number", "minimum": 0, "maximum": 100},
+            "pressure_pa": {"type": "number", "exclusiveMinimum": 0},
+            "coefficient_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"const": "not_applicable"},
+            "reason": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    },
+    "voice_assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "logical_voice", "detail_state", "event_role"],
+      "properties": {
+        "source_id": {"type": "string", "minLength": 1},
+        "logical_voice": {"type": "integer", "minimum": 0, "maximum": 255},
+        "detail_state": {"type": "string", "minLength": 1},
+        "event_role": {"type": "string", "minLength": 1}
+      }
+    },
+    "stem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "content_sha256", "channels", "frame_count"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1},
+        "content_sha256": {"$ref": "#/$defs/sha256"},
+        "channels": {"type": "integer", "minimum": 1, "maximum": 16},
+        "frame_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "callback_p99_ms", "callback_p999_ms", "peak_rss_mib"],
+      "properties": {
+        "platform": {"type": "string", "minLength": 1},
+        "callback_p99_ms": {"type": "number", "minimum": 0},
+        "callback_p999_ms": {"type": "number", "minimum": 0},
+        "peak_rss_mib": {"type": "number", "minimum": 0}
+      }
+    },
+    "listening": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt", "listener_id", "outcome", "notes"],
+      "properties": {
+        "prompt": {"type": "string", "minLength": 1},
+        "listener_id": {"type": "string"},
+        "outcome": {"enum": ["pending", "pass", "fail", "not_required"]},
+        "notes": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

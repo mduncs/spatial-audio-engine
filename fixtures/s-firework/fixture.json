@@ -1,0 +1,86 @@
+{
+  "schema_version": "fightbox.fixture.v1",
+  "fixture_id": "s-firework-elevated-megablock",
+  "gate": "S3",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {"name": "Steam Audio", "version": "4.8.1"},
+  "source": {
+    "id": "elevated-firework",
+    "position_m": [0, 0, 50],
+    "reference_level": {"mode": "SplAtOneMeter", "db_spl": 120},
+    "generator": {"kind": "firework_burst", "fixed_seed": "0xf1ae202607290048"}
+  },
+  "listener": {
+    "position_m": [220, 0, 1.5],
+    "forward_enu": [-1, 0, 0],
+    "up_enu": [0, 0, 1]
+  },
+  "geometry": {
+    "vertices_m": [
+      [15,15,0],[190,15,0],[190,190,0],[15,190,0],
+      [15,15,35],[190,15,35],[190,190,35],[15,190,35],
+      [15,-190,0],[190,-190,0],[190,-15,0],[15,-15,0],
+      [15,-190,35],[190,-190,35],[190,-15,35],[15,-15,35],
+      [-190,15,0],[-15,15,0],[-15,190,0],[-190,190,0],
+      [-190,15,35],[-15,15,35],[-15,190,35],[-190,190,35],
+      [-190,-190,0],[-15,-190,0],[-15,-15,0],[-190,-15,0],
+      [-190,-190,35],[-15,-190,35],[-15,-15,35],[-190,-15,35],
+      [-250,-250,0],[250,-250,0],[250,250,0],[-250,250,0]
+    ],
+    "triangles": [
+      {"indices":[0,3,7],"material":"masonry"},{"indices":[0,7,4],"material":"masonry"},{"indices":[7,3,0],"material":"masonry"},{"indices":[4,7,0],"material":"masonry"},
+      {"indices":[0,4,5],"material":"masonry"},{"indices":[0,5,1],"material":"masonry"},{"indices":[5,4,0],"material":"masonry"},{"indices":[1,5,0],"material":"masonry"},
+      {"indices":[4,7,6],"material":"roof"},{"indices":[4,6,5],"material":"roof"},{"indices":[6,7,4],"material":"roof"},{"indices":[5,6,4],"material":"roof"},
+
+      {"indices":[8,11,15],"material":"masonry"},{"indices":[8,15,12],"material":"masonry"},{"indices":[15,11,8],"material":"masonry"},{"indices":[12,15,8],"material":"masonry"},
+      {"indices":[11,10,14],"material":"masonry"},{"indices":[11,14,15],"material":"masonry"},{"indices":[14,10,11],"material":"masonry"},{"indices":[15,14,11],"material":"masonry"},
+      {"indices":[12,15,14],"material":"roof"},{"indices":[12,14,13],"material":"roof"},{"indices":[14,15,12],"material":"roof"},{"indices":[13,14,12],"material":"roof"},
+
+      {"indices":[17,18,22],"material":"masonry"},{"indices":[17,22,21],"material":"masonry"},{"indices":[22,18,17],"material":"masonry"},{"indices":[21,22,17],"material":"masonry"},
+      {"indices":[16,20,21],"material":"masonry"},{"indices":[16,21,17],"material":"masonry"},{"indices":[21,20,16],"material":"masonry"},{"indices":[17,21,16],"material":"masonry"},
+      {"indices":[20,23,22],"material":"roof"},{"indices":[20,22,21],"material":"roof"},{"indices":[22,23,20],"material":"roof"},{"indices":[21,22,20],"material":"roof"},
+
+      {"indices":[25,26,30],"material":"masonry"},{"indices":[25,30,29],"material":"masonry"},{"indices":[30,26,25],"material":"masonry"},{"indices":[29,30,25],"material":"masonry"},
+      {"indices":[27,26,30],"material":"masonry"},{"indices":[27,30,31],"material":"masonry"},{"indices":[30,26,27],"material":"masonry"},{"indices":[31,30,27],"material":"masonry"},
+      {"indices":[28,31,30],"material":"roof"},{"indices":[28,30,29],"material":"roof"},{"indices":[30,31,28],"material":"roof"},{"indices":[29,30,28],"material":"roof"},
+
+      {"indices":[32,33,34],"material":"ground"},{"indices":[32,34,35],"material":"ground"},{"indices":[34,33,32],"material":"ground"},{"indices":[35,34,32],"material":"ground"}
+    ],
+    "materials": {
+      "masonry": {"absorption":[0.03,0.05,0.07],"scattering":0.15,"transmission":[0,0,0]},
+      "roof": {"absorption":[0.08,0.12,0.18],"scattering":0.2,"transmission":[0,0,0]},
+      "ground": {"absorption":[0.05,0.07,0.09],"scattering":0.1,"transmission":[0,0,0]}
+    }
+  },
+  "simulation": {
+    "direct": {"distance_attenuation":true,"occlusion":true,"occlusion_samples":64},
+    "reflections": {"enabled":true,"rays":4096,"bounces":4,"duration_s":1.5},
+    "pathing": {"enabled":true,"order":2,"validation":true,"alternate_paths":true,"runtime_order":["direct","path","reflections"]},
+    "probe_volume": {"type":"box","min_m":[-240,-240,0.5],"max_m":[240,240,2.5],"spacing_m":20},
+    "probe_generation": {"type":"uniform_floor","height_m":1.5},
+    "path_bake": {
+      "identifier":"s-firework-megablock-path-bake-v1",
+      "required_call":"iplPathBakerBake",
+      "probe_batch_serialization":"required",
+      "fresh_process_reload":true,
+      "bake_order":2
+    }
+  },
+  "expected": {
+    "properties": [
+      "The deterministic source is elevated 50 m above the center street intersection of four 175 m city blocks.",
+      "The stationary ground listener is 220 m horizontally from the source and faces the intersection.",
+      "The full direct, validated path, and convolution-reflection pipeline preserves a sharp onset and audible indirect city energy after the direct arrival."
+    ],
+    "non_claims": [
+      "The synthetic megablock grid is an acoustic stress fixture, not surveyed geography.",
+      "The render makes no delivered-ear-SPL claim without output-device calibration.",
+      "Automated onset and energy checks do not replace the signed human listening record."
+    ]
+  }
+}

@@ -1,0 +1,428 @@
+{
+  "schema_version": "fightbox.fixture.workbench.v1",
+  "fixture_id": "astra-mi8-clearance70-v1",
+  "gate": "S5",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {
+    "name": "Steam Audio",
+    "version": "4.8.1"
+  },
+  "sources": [
+    {
+      "id": "mi8-orbit",
+      "asset_id": "squad-mi8-rotor-close",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 105
+      },
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 21.0
+      },
+      "trajectory": {
+        "waypoints_m": [
+          [
+            482.5,
+            292.5,
+            70
+          ],
+          [
+            480.875,
+            317.3,
+            70
+          ],
+          [
+            476.026,
+            341.676,
+            70
+          ],
+          [
+            468.037,
+            365.21,
+            70
+          ],
+          [
+            457.045,
+            387.5,
+            70
+          ],
+          [
+            443.237,
+            408.165,
+            70
+          ],
+          [
+            426.85,
+            426.85,
+            70
+          ],
+          [
+            408.165,
+            443.237,
+            70
+          ],
+          [
+            387.5,
+            457.045,
+            70
+          ],
+          [
+            365.21,
+            468.037,
+            70
+          ],
+          [
+            341.676,
+            476.026,
+            70
+          ],
+          [
+            317.3,
+            480.875,
+            70
+          ],
+          [
+            292.5,
+            482.5,
+            70
+          ],
+          [
+            267.7,
+            480.875,
+            70
+          ],
+          [
+            243.324,
+            476.026,
+            70
+          ],
+          [
+            219.79,
+            468.037,
+            70
+          ],
+          [
+            197.5,
+            457.045,
+            70
+          ],
+          [
+            176.835,
+            443.237,
+            70
+          ],
+          [
+            158.15,
+            426.85,
+            70
+          ],
+          [
+            141.763,
+            408.165,
+            70
+          ],
+          [
+            127.955,
+            387.5,
+            70
+          ],
+          [
+            116.963,
+            365.21,
+            70
+          ],
+          [
+            108.974,
+            341.676,
+            70
+          ],
+          [
+            104.125,
+            317.3,
+            70
+          ],
+          [
+            102.5,
+            292.5,
+            70
+          ],
+          [
+            104.125,
+            267.7,
+            70
+          ],
+          [
+            108.974,
+            243.324,
+            70
+          ],
+          [
+            116.963,
+            219.79,
+            70
+          ],
+          [
+            127.955,
+            197.5,
+            70
+          ],
+          [
+            141.763,
+            176.835,
+            70
+          ],
+          [
+            158.15,
+            158.15,
+            70
+          ],
+          [
+            176.835,
+            141.763,
+            70
+          ],
+          [
+            197.5,
+            127.955,
+            70
+          ],
+          [
+            219.79,
+            116.963,
+            70
+          ],
+          [
+            243.324,
+            108.974,
+            70
+          ],
+          [
+            267.7,
+            104.125,
+            70
+          ],
+          [
+            292.5,
+            102.5,
+            70
+          ],
+          [
+            317.3,
+            104.125,
+            70
+          ],
+          [
+            341.676,
+            108.974,
+            70
+          ],
+          [
+            365.21,
+            116.963,
+            70
+          ],
+          [
+            387.5,
+            127.955,
+            70
+          ],
+          [
+            408.165,
+            141.763,
+            70
+          ],
+          [
+            426.85,
+            158.15,
+            70
+          ],
+          [
+            443.237,
+            176.835,
+            70
+          ],
+          [
+            457.045,
+            197.5,
+            70
+          ],
+          [
+            468.037,
+            219.79,
+            70
+          ],
+          [
+            476.026,
+            243.324,
+            70
+          ],
+          [
+            480.875,
+            267.7,
+            70
+          ]
+        ],
+        "speed_mps": 30.0,
+        "max_speed_mps": 30.0
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "playback_start_offset_s": 0,
+      "audition_label": "MI-8 \u00b7 rooftop-clear orbit"
+    }
+  ],
+  "listener": {
+    "trajectory": {
+      "waypoints_m": [
+        [
+          292.5,
+          292.5,
+          1.5
+        ],
+        [
+          292.5,
+          292.501,
+          1.5
+        ]
+      ],
+      "speed_mps": 1.4,
+      "max_speed_mps": 1.4
+    },
+    "forward_enu": [
+      0,
+      1,
+      0
+    ],
+    "up_enu": [
+      0,
+      0,
+      1
+    ]
+  },
+  "geometry": {
+    "vertices_m": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        585,
+        0,
+        0
+      ],
+      [
+        585,
+        585,
+        0
+      ],
+      [
+        0,
+        585,
+        0
+      ]
+    ],
+    "triangles": [
+      {
+        "indices": [
+          0,
+          1,
+          2
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          2,
+          3
+        ],
+        "material": "masonry"
+      }
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [
+          0.03,
+          0.05,
+          0.07
+        ],
+        "scattering": 0.1,
+        "transmission": [
+          0.0251,
+          0.00562,
+          0.00178
+        ]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {
+      "distance_attenuation": true,
+      "occlusion": true,
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "enabled": true,
+      "rays": 4096,
+      "bounces": 3,
+      "duration_s": 1.5
+    },
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": [
+        "direct",
+        "path",
+        "reflections"
+      ]
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [
+        0,
+        0,
+        0.5
+      ],
+      "max_m": [
+        585,
+        585,
+        63.0
+      ],
+      "spacing_m": 4.0
+    },
+    "probe_generation": {
+      "type": "uniform_floor",
+      "height_m": 1.5
+    },
+    "path_bake": {
+      "identifier": "megablock-city-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 2
+    }
+  },
+  "expected": {
+    "properties": [
+      "Corrected candidate: same48-waypoint190m-radius30m/s orbit and rotor media/phase, altitude70m gives10m clearance above actual60m maximum roof.",
+      "Original55m fixture and checkpoint retained unchanged for regression.",
+      "Default-off/restartable105dB diagnostic source; listener fixed at center after1mm startup."
+    ],
+    "non_claims": [
+      "Not a prerecorded A-10 pass presented as live motion.",
+      "No human motion-quality verdict or delivered-ear SPL claim.",
+      "Short route capture does not qualify a full orbit, multi-source performance or mobile hardware.",
+      "Source samples contain rotor texture; this is not a synthetic constant-tone Doppler oracle.",
+      "70m is above63m baked probe-volume ceiling: elevated baked-path coverage is not established; this does not claim all shadow dropouts fixed.",
+      "Clearance checks concern point source geometry, not physical rotor radius or flight certification."
+    ]
+  }
+}
