@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma6-contention-mix",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma6-contention-mix.wav",
+      "sha256": "88941e18f624d8c1a40489dfa42f9c61e44b42e50a843c1232dbc00057faa0e3",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 4.0,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -26.776382,
+  "calibration": {
+    "applied_gain_db": 2.776382
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma6 source SHA-256 30ee615b1515006e466bf54185036f5967516da56d12a715f41f869a52ad4950; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

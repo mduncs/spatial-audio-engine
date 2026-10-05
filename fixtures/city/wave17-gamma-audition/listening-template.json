@@ -1,0 +1,293 @@
+{
+  "schema_version": "fightbox.wave17-gamma-audition-listening.v1",
+  "record_id": "wave17-gamma-audition-squad-forward-20260812T034556Z-pending",
+  "status": "awaiting_named_listener_judgments",
+  "prepared": {
+    "fixture": "/path/to/spatial-audio/engine/fixtures/city/wave17-gamma-audition/fixture.json",
+    "fixture_sha256": "168dcf84e1bb2ecd57e3523027cd6a4b803bb2fa535471d3646b47a39e3bb72f",
+    "workbench_binary": "/path/to/spatial-audio/engine/target/release/fightbox-workbench",
+    "workbench_sha256": "f5db461902502bff72f17bb3c1c142c01217b39f340971326c909f3fc6ad81df",
+    "audition_report": "/path/to/spatial-audio/evidence/wave17-audition-preparation-20260812T003140Z/audition-assets.json",
+    "audition_report_sha256": "d3c4f6b28fe49a1bb02f3d914584900fe2445be2b35c6153e10cfe6aee9482bc",
+    "gamma_card_root_sha256": "198511265423c3032964207c04912ef9633bc324e4911ded5cc5518822bfb261"
+  },
+  "authorization": {
+    "audio_authorized_by_user": true,
+    "authorization_timestamp_utc": "2026-08-12T03:45:56Z",
+    "authorization_quote": "and I need AUDIO!!!"
+  },
+  "listener": {
+    "listener_id": "",
+    "notes": ""
+  },
+  "route": {
+    "device_name": "External Headphones",
+    "output_path": "",
+    "headphones": "",
+    "spatial_processing_mode": "",
+    "hrtf_set": "steam-audio-default",
+    "hrtf_pretest_result": "not_run",
+    "monitor_gain_db": 0.0
+  },
+  "launch": {
+    "device_free_command": "./run-workbench-wave17-audition.command",
+    "authorized_audio_flag": "--start-audio",
+    "device_flag_optional": "--device <exact name>",
+    "binary_was_not_executed_during_preparation": true
+  },
+  "safety": {
+    "all_fixture_sources_default_off": true,
+    "all_fixture_sources_restart_on_enable": true,
+    "enable_only_one_source_unless_prompt_explicitly_requires_otherwise": true,
+    "ab_pairs_one_at_a_time": [
+      [
+        "gamma4-thunder-pressure-edge",
+        "gamma4-thunder-long-tail"
+      ],
+      [
+        "gamma9-neutral-ab",
+        "gamma9-combined-once-ab"
+      ],
+      [
+        "gamma10-monolithic-oracle-ab",
+        "gamma10-production-cell-e1-n0-ab"
+      ]
+    ]
+  },
+  "source_order": [
+    {
+      "source_id": "gamma0-100m-macro-ingress",
+      "asset_id": "wave17-gamma0-transport-100m",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ0 · transport · 100 m"
+    },
+    {
+      "source_id": "gamma0-1km-macro-ingress",
+      "asset_id": "wave17-gamma0-transport-1km",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ0 · transport · 1 km"
+    },
+    {
+      "source_id": "gamma0-10km-macro-ingress",
+      "asset_id": "wave17-gamma0-transport-10km",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ0 · transport · 10 km"
+    },
+    {
+      "source_id": "gamma1-artillery-200m",
+      "asset_id": "wave17-gamma1-artillery-200m",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ1 · artillery evidence stem"
+    },
+    {
+      "source_id": "gamma2-elevated-firework",
+      "asset_id": "wave17-gamma2-firework",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ2 · elevated-firework evidence stem"
+    },
+    {
+      "source_id": "gamma3-snap-then-boom",
+      "asset_id": "wave17-gamma3-snap-boom",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ3 · snap → boom evidence stem"
+    },
+    {
+      "source_id": "gamma4-thunder-pressure-edge",
+      "asset_id": "squad-thunder-distant-03",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ4 · thunder 03 · pressure edge"
+    },
+    {
+      "source_id": "gamma4-thunder-long-tail",
+      "asset_id": "squad-thunder-distant-15",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ4 · thunder 15 · long tail"
+    },
+    {
+      "source_id": "gamma5-a10-fast-mover",
+      "asset_id": "squad-a10-pass",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ5 · A-10 authored fast pass"
+    },
+    {
+      "source_id": "gamma6-m2-contention",
+      "asset_id": "squad-m2-burst-loop",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ6 · M2 contention texture"
+    },
+    {
+      "source_id": "gamma7-owner-home-aperture",
+      "asset_id": "wave17-gamma7-owner-home",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ7 · owner-home aperture evidence stem"
+    },
+    {
+      "source_id": "gamma8-toms-diner-walk",
+      "asset_id": "wave17-gamma8-toms-diner-walk",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ8 · Tom’s Diner walk evidence stem"
+    },
+    {
+      "source_id": "gamma9-neutral-ab",
+      "asset_id": "wave17-gamma9-neutral",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ9 · neutral evidence stem"
+    },
+    {
+      "source_id": "gamma9-combined-once-ab",
+      "asset_id": "wave17-gamma9-combined-once",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ9 · spectral composed-once evidence stem"
+    },
+    {
+      "source_id": "gamma10-monolithic-oracle-ab",
+      "asset_id": "wave17-gamma10-oracle",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ10 · monolithic oracle"
+    },
+    {
+      "source_id": "gamma10-production-cell-e1-n0-ab",
+      "asset_id": "wave17-gamma10-cell-e1-n0",
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "audition_label": "γ10 · retained production cell"
+    }
+  ],
+  "card_judgments": [
+    {
+      "card_id": "gamma0_transport_pulse",
+      "source_ids": [
+        "gamma0-100m-macro-ingress",
+        "gamma0-1km-macro-ingress",
+        "gamma0-10km-macro-ingress"
+      ],
+      "prompt": "Does each pulse arrive once at its authored delay, with increasing scale/range impression and no duplicate handoff? Wait through the 10 km program’s approximately 30.15-second arrival.",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma1_explosion_artillery",
+      "source_ids": [
+        "gamma1-artillery-200m"
+      ],
+      "prompt": "Does the artillery event retain a pressure edge, low body, and distance-morph character without click, generic bang, or broken tail?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma2_firework",
+      "source_ids": [
+        "gamma2-elevated-firework"
+      ],
+      "prompt": "Does the elevated firework read above the listener with a coherent launch/burst/tail rather than a ground-level click?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma3_supersonic_shot",
+      "source_ids": [
+        "gamma3-snap-then-boom"
+      ],
+      "prompt": "Is the supersonic snap followed once by a distinct boom, with coherent ordering and no reset or duplicate onset?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma4_thunder",
+      "source_ids": [
+        "gamma4-thunder-pressure-edge",
+        "gamma4-thunder-long-tail"
+      ],
+      "prompt": "Compare one at a time: does candidate 03 offer a useful pressure edge, and does preferred candidate 15 retain a more convincing long weather tail without reading as a generic bang?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma5_fast_mover",
+      "source_ids": [
+        "gamma5-a10-fast-mover"
+      ],
+      "prompt": "Does the 110 m/s program remain continuous through approach, closest pass, and recession without click, zipper, doubled motion, or pitch reset?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma6_contention",
+      "source_ids": [
+        "gamma6-m2-contention"
+      ],
+      "prompt": "Do the four-source contention cues remain separable and stable without source theft, pumping, dropout, or image collapse?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma7_owner_home_aperture",
+      "source_ids": [
+        "gamma7-owner-home-aperture"
+      ],
+      "prompt": "Across exterior, closed façade, open window, doorway crossing, and tail, does enclosure identity change naturally without abrupt coloration or discontinuity?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma8_toms_diner",
+      "source_ids": [
+        "gamma8-toms-diner-walk"
+      ],
+      "prompt": "Does the city-walk program remain spatially coherent and free of objectionable coloration, discontinuity, or source-image collapse?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma9_spectral_composition",
+      "source_ids": [
+        "gamma9-neutral-ab",
+        "gamma9-combined-once-ab"
+      ],
+      "prompt": "Compare one at a time: does the composed-once version remain coherent relative to neutral without double application, tonal combing, or unstable coloration?",
+      "outcome": "pending",
+      "observation": ""
+    },
+    {
+      "card_id": "gamma10_cell_boundary",
+      "source_ids": [
+        "gamma10-monolithic-oracle-ab",
+        "gamma10-production-cell-e1-n0-ab"
+      ],
+      "prompt": "Compare one at a time: is the production cell perceptually consistent with the monolithic oracle without objectionable seam coloration or discontinuity? This A/B does not itself exercise live four-world swapping.",
+      "outcome": "pending",
+      "observation": ""
+    }
+  ],
+  "overall_result": "undecided",
+  "date_iso": "",
+  "sign_off": {
+    "listener_signed": "",
+    "date_iso": ""
+  },
+  "requires_human_completion": true,
+  "claims": [],
+  "non_claims": [
+    "This blank template and scene preparation are not a listening pass.",
+    "No delivered-ear-SPL claim exists without output-device/headphone calibration.",
+    "The gamma0 10 km source is an offline macro-ingress program through a local proxy, not a live dense 10 km bake.",
+    "The gamma10 A/B pair does not replace the existing four-world callback evidence.",
+    "Private Squad-derived thunder bytes carry no redistribution grant.",
+    "Output authorization and an open default device are not themselves a listening judgment; all card outcomes remain pending."
+  ]
+}

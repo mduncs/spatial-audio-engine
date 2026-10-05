@@ -1,0 +1,5 @@
+FightboxApp.xcodeproj/
+.build/
+DerivedData/
+
+build/

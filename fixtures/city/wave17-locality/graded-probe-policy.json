@@ -1,0 +1,130 @@
+{
+  "lattice_origin_city_enu_mm": [
+    7500,
+    7500
+  ],
+  "tiers": [
+    {
+      "id": "residual",
+      "ground_up_mm": 1500,
+      "ground_spacing_m": 32,
+      "analysis_spacing_m": 32,
+      "regions_city_enu_mm": [
+        {
+          "min": [
+            -1000000,
+            -1000000
+          ],
+          "max": [
+            11000000,
+            1000000
+          ]
+        }
+      ],
+      "elevated_layers": []
+    },
+    {
+      "id": "route-core",
+      "ground_up_mm": 1500,
+      "ground_spacing_m": 8,
+      "analysis_spacing_m": 8,
+      "regions_city_enu_mm": [
+        {
+          "min": [
+            -400000,
+            -24000
+          ],
+          "max": [
+            10100000,
+            24000
+          ]
+        },
+        {
+          "min": [
+            -58000,
+            -58000
+          ],
+          "max": [
+            58000,
+            58000
+          ]
+        }
+      ],
+      "elevated_layers": [
+        {
+          "id": "route-63m",
+          "up_mm": 63000,
+          "spacing_m": 16
+        },
+        {
+          "id": "route-30m",
+          "up_mm": 30000,
+          "spacing_m": 16
+        }
+      ]
+    },
+    {
+      "id": "owner-home",
+      "ground_up_mm": 1500,
+      "ground_spacing_m": 4,
+      "analysis_spacing_m": 4,
+      "regions_city_enu_mm": [
+        {
+          "min": [
+            -50000,
+            -50000
+          ],
+          "max": [
+            50000,
+            50000
+          ]
+        }
+      ],
+      "elevated_layers": []
+    },
+    {
+      "id": "transition",
+      "ground_up_mm": 1500,
+      "ground_spacing_m": 16,
+      "analysis_spacing_m": 16,
+      "regions_city_enu_mm": [
+        {
+          "min": [
+            -400000,
+            -64000
+          ],
+          "max": [
+            10100000,
+            64000
+          ]
+        },
+        {
+          "min": [
+            -74000,
+            -74000
+          ],
+          "max": [
+            74000,
+            74000
+          ]
+        }
+      ],
+      "elevated_layers": [
+        {
+          "id": "transition-30m",
+          "up_mm": 30000,
+          "spacing_m": 32
+        },
+        {
+          "id": "transition-63m",
+          "up_mm": 63000,
+          "spacing_m": 32
+        }
+      ]
+    }
+  ],
+  "sky_pathing_policy": {
+    "maximum_layer_m": 63,
+    "above": "direct_reflections_only"
+  }
+}

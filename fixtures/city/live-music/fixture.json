@@ -1,0 +1,52 @@
+{
+  "fixture_id": "live-music-street-v1",
+  "sources": [
+    {
+      "id": "live-corner-speaker",
+      "live_input": {
+        "device": "All system audio",
+        "channels": "stereo"
+      },
+      "extent": {"kind": "stereo_image", "width_m": 4.0},
+      "audition_label": "Live music · corner speaker",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 125
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "forward_enu": [0.987496, -0.157637, 0.0],
+      "position_m": [493.8, 473.0, 8.0]
+    }
+  ],
+  "listener": {
+    "trajectory": {
+      "waypoints_m": [
+        [426.02, 483.82, 1.5],
+        [474.02, 483.82, 1.5]
+      ],
+      "speed_mps": 6.0,
+      "max_speed_mps": 6.0
+    },
+    "forward_enu": [0.987496, -0.157637, 0.0]
+  },
+  "simulation": {
+    "direct": {
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "rays": 4096,
+      "bounces": 8,
+      "duration_s": 1.5
+    },
+    "pathing": {
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "visibility_range_m": 20.0
+    },
+    "probe_volume": {
+      "spacing_m": 8.0
+    }
+  }
+}

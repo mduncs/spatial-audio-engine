@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma3-snap-boom",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma3-snap-boom.wav",
+      "sha256": "2f58dc1fe683f128e47b35129a3465d2718b01adce8e63f0f37086fb18c0e48c",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 8.0,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -29.381795,
+  "calibration": {
+    "applied_gain_db": 5.381795
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma3 source SHA-256 b5963dd4455c3ad45e6450162fc00e7d5afdffe5db9f4d7704d84a81ec7721eb; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

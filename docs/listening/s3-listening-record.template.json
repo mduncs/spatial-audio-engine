@@ -1,0 +1,41 @@
+{
+  "schema_version": "fightbox.listening.v1",
+  "record_id": "s3-provisional-TEMPLATE",
+  "fixture_id": "s3-masonry-building-corner",
+  "gate": "S3",
+  "fixture_sha256": null,
+  "bundle_manifest_sha256": null,
+  "listener": {
+    "listener_id": "REPLACE_WITH_LISTENER_ID",
+    "notes": "Provisional Phase A listening: human ears only (Gate 0 has not passed)."
+  },
+  "hrtf": {
+    "hrtf_set": "steam-audio-default",
+    "pretest_result": "not_run"
+  },
+  "equipment": {
+    "headphones": "REPLACE_WITH_MAKE_AND_MODEL",
+    "output_path": "REPLACE_WITH_INTERFACE_AND_PATH",
+    "monitor_gain_db": 0.0
+  },
+  "comparison_order": ["pathing_on", "pathing_off"],
+  "observations": [
+    {
+      "stimulus": "s3 pathing_on vs pathing_off sum at the initial occluded position",
+      "observation": "REPLACE: describe whether the pathing-on capture is audibly distinct from pathing-off (around-corner arrival vs direct-only)."
+    }
+  ],
+  "result": "undecided",
+  "date_iso": "2026-07-29",
+  "sign_off": {
+    "listener_signed": "",
+    "date_iso": ""
+  },
+  "requires_human_completion": true,
+  "claims": [],
+  "non_claims": [
+    "Human completion is required; this template alone is not a pass.",
+    "No delivered-ear-SPL claim without output-device/headphone calibration.",
+    "An extractor-based perceptual claim does not count as evidence before Gate 0 passes."
+  ]
+}

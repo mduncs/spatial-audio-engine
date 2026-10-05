@@ -1,0 +1,49 @@
+{
+  "version": 0.6,
+  "osm3s": {
+    "timestamp_osm_base": "2026-10-02T03:06:32Z",
+    "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
+  },
+  "elements": [
+    {
+      "type": "way",
+      "id": 209926304,
+      "nodes": [
+        2200830386,
+        2200831181,
+        2200831188,
+        2200830394,
+        2200830386
+      ],
+      "tags": {
+        "building": "house",
+        "building:levels": "2",
+        "chicago:building_id": "119509"
+      }
+    },
+    {
+      "type": "node",
+      "id": 2200830386,
+      "lat": 41.9635426,
+      "lon": -87.6702615
+    },
+    {
+      "type": "node",
+      "id": 2200830394,
+      "lat": 41.9635447,
+      "lon": -87.6701567
+    },
+    {
+      "type": "node",
+      "id": 2200831181,
+      "lat": 41.9637004,
+      "lon": -87.6702654
+    },
+    {
+      "type": "node",
+      "id": 2200831188,
+      "lat": 41.9637011,
+      "lon": -87.6701606
+    }
+  ]
+}

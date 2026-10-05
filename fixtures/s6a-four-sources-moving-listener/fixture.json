@@ -1,0 +1,342 @@
+{
+  "schema_version": "fightbox.fixture.s6a.v1",
+  "fixture_id": "s6a-four-sources-moving-listener",
+  "gate": "S6A",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {
+    "name": "Steam Audio",
+    "version": "4.8.1"
+  },
+  "sources": [
+    {
+      "id": "source-occluded-northwest",
+      "asset_id": "s3-calibrated-pink",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 85
+      },
+      "position_m": [
+        -4,
+        6,
+        1.5
+      ]
+    },
+    {
+      "id": "source-los-north",
+      "asset_id": "s3-multitone-spectral",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 78
+      },
+      "position_m": [
+        14,
+        2,
+        1.5
+      ]
+    },
+    {
+      "id": "source-los-southeast",
+      "asset_id": "s0-calibrated-pink",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 75
+      },
+      "position_m": [
+        8,
+        -6,
+        1.5
+      ]
+    },
+    {
+      "id": "source-moving-east-west",
+      "asset_id": "s0-approach-sine-1k",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 80
+      },
+      "trajectory": {
+        "waypoints_m": [
+          [
+            -8.0,
+            -1.0,
+            1.5
+          ],
+          [
+            0.0,
+            -1.0,
+            1.5
+          ],
+          [
+            8.0,
+            -1.0,
+            1.5
+          ]
+        ],
+        "speed_mps": 15,
+        "max_speed_mps": 20
+      }
+    }
+  ],
+  "listener": {
+    "trajectory": {
+      "waypoints_m": [
+        [
+          -8,
+          -4,
+          1.5
+        ],
+        [
+          8,
+          -4,
+          1.5
+        ],
+        [
+          8,
+          4,
+          1.5
+        ],
+        [
+          -8,
+          4,
+          1.5
+        ],
+        [
+          -8,
+          -4,
+          1.5
+        ]
+      ],
+      "speed_mps": 2,
+      "max_speed_mps": 3
+    },
+    "forward_enu": [
+      0,
+      1,
+      0
+    ],
+    "up_enu": [
+      0,
+      0,
+      1
+    ]
+  },
+  "geometry": {
+    "vertices_m": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        10,
+        0,
+        0
+      ],
+      [
+        10,
+        0,
+        6
+      ],
+      [
+        0,
+        0,
+        6
+      ],
+      [
+        0,
+        10,
+        0
+      ],
+      [
+        0,
+        10,
+        6
+      ],
+      [
+        -9,
+        -9,
+        0
+      ],
+      [
+        9,
+        -9,
+        0
+      ],
+      [
+        9,
+        9,
+        0
+      ],
+      [
+        -9,
+        9,
+        0
+      ]
+    ],
+    "triangles": [
+      {
+        "indices": [
+          0,
+          1,
+          2
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          2,
+          3
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          2,
+          1,
+          0
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          3,
+          2,
+          0
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          4,
+          5
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          5,
+          3
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          5,
+          4,
+          0
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          3,
+          5,
+          0
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          6,
+          7,
+          8
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          6,
+          8,
+          9
+        ],
+        "material": "masonry"
+      }
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [
+          0.03,
+          0.05,
+          0.07
+        ],
+        "scattering": 0.1,
+        "transmission": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {
+      "distance_attenuation": true,
+      "occlusion": true,
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "enabled": true,
+      "rays": 4096,
+      "bounces": 2,
+      "duration_s": 1.0
+    },
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": [
+        "direct",
+        "path",
+        "reflections"
+      ]
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [
+        -8.75,
+        -8.75,
+        0.5
+      ],
+      "max_m": [
+        14.25,
+        8.25,
+        2.5
+      ],
+      "spacing_m": 1.0
+    },
+    "probe_generation": {
+      "type": "uniform_floor",
+      "height_m": 1.5
+    },
+    "path_bake": {
+      "identifier": "s6a-four-sources-path-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 3
+    }
+  },
+  "expected": {
+    "properties": [
+      "per_source_isolation",
+      "continuous_doppler_pitch_track_no_steps",
+      "callback_budget_within_gate",
+      "summed_output_smoothness"
+    ],
+    "non_claims": [
+      "This fixture makes no eight-source governance claim; four-source operation is within initial scope.",
+      "This fixture makes no governor-assisted mixing claim; output summation operates on four independent contributions.",
+      "This fixture makes no human-listening claim; automated metric validation is required.",
+      "The moving source renders as a geometric point; LineSegment spatial extent is post-MVP."
+    ]
+  }
+}

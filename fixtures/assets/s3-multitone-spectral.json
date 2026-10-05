@@ -1,0 +1,19 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "s3-multitone-spectral",
+  "kind": "multitone",
+  "generator": {
+    "module": "fightbox_evidence::signal",
+    "multitone": {"frequencies_hz": [440.0, 880.0, 1760.0, 3520.0]}
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 0.1,
+  "target_rms_dbfs": -20,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The multitone spreads energy across bins to exercise the spectral comparison; it is not a perceptual stimulus."
+  ]
+}

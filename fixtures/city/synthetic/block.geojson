@@ -1,0 +1,48 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "height": 12.0, "material": "brick" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[0, 0], [12, 0], [12, 8], [0, 8], [0, 0]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "levels": 5, "material": "concrete" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[18, 0], [28, 0], [28, 7], [18, 7], [18, 0]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "height": 7.5, "material": "glass" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[0, 14], [7, 14], [7, 18], [11, 18], [11, 25], [0, 25], [0, 14]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "height": 22.0 },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[17, 14], [30, 14], [30, 25], [17, 25], [17, 14]],
+          [[21, 17], [26, 17], [26, 22], [21, 22], [21, 17]]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "levels": 2, "material": "brick" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[35, 5], [42, 2], [47, 8], [43, 14], [36, 12], [35, 5]]]
+      }
+    }
+  ]
+}

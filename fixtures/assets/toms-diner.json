@@ -1,0 +1,23 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "toms-diner",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/music/toms-diner-48k-mono.wav",
+      "sha256": "4a614d600d4ef66a98923598a790e9b7054e4b8722af79f84fa82a0c6a0ee843",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 228.37,
+  "target_rms_dbfs": -20,
+  "expected_reference_rms_dbfs": null,
+  "calibration": {"applied_gain_db": null},
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes."
+  ]
+}

@@ -1,0 +1,330 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fightbox.dev/schema/world-manifest-2.json",
+  "title": "Fightbox world package manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "assumptions",
+    "building_count",
+    "extensions",
+    "format_version",
+    "inputs",
+    "materials",
+    "materials_content_sha256",
+    "mesh",
+    "schema_version",
+    "tool_version",
+    "world"
+  ],
+  "properties": {
+    "format_version": { "const": 2 },
+    "schema_version": { "const": "fightbox.world-manifest.v2" },
+    "tool_version": { "type": "string", "minLength": 1 },
+    "inputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/provenance" }
+    },
+    "building_count": { "type": "integer", "minimum": 0 },
+    "assumptions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/assumption" }
+    },
+    "materials": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "type": "string", "minLength": 1 },
+      "additionalProperties": { "$ref": "#/$defs/material" }
+    },
+    "materials_content_sha256": { "$ref": "#/$defs/sha256" },
+    "mesh": { "$ref": "#/$defs/meshMetadata" },
+    "world": { "$ref": "#/$defs/world" },
+    "extensions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/extension" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nonNegativeSize": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "positiveSize": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "enuVector": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "coefficientTriplet": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number", "minimum": 0, "maximum": 1 }
+    },
+    "cityId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}[a-z0-9]$|^[a-z]$"
+    },
+    "cellId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,63}:e(?:0|-?[1-9][0-9]*):n(?:0|-?[1-9][0-9]*)$"
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "assumption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assumed_height_m", "building_id", "reason"],
+      "properties": {
+        "assumed_height_m": { "type": "number", "exclusiveMinimum": 0 },
+        "building_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["absorption", "scattering", "transmission"],
+      "properties": {
+        "absorption": { "$ref": "#/$defs/coefficientTriplet" },
+        "scattering": { "type": "number", "minimum": 0, "maximum": 1 },
+        "transmission": { "$ref": "#/$defs/coefficientTriplet" }
+      }
+    },
+    "meshMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_sha256", "triangle_count", "vertex_count"],
+      "properties": {
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "triangle_count": { "type": "integer", "minimum": 0 },
+        "vertex_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "geodeticOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["altitude_m", "datum", "latitude_degrees", "local_frame", "longitude_degrees"],
+      "properties": {
+        "datum": { "const": "WGS84" },
+        "local_frame": { "const": "wgs84_ecef_enu" },
+        "latitude_degrees": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude_degrees": { "type": "number", "minimum": -180, "exclusiveMaximum": 180 },
+        "altitude_m": { "type": "number" }
+      }
+    },
+    "gridIndex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["east", "north"],
+      "properties": {
+        "east": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "north": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 }
+      }
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_enu_m", "min_enu_m"],
+      "properties": {
+        "min_enu_m": { "$ref": "#/$defs/enuVector" },
+        "max_enu_m": { "$ref": "#/$defs/enuVector" }
+      }
+    },
+    "switchPlane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["neighbor_cell_id", "normal_enu", "offset_m"],
+      "properties": {
+        "neighbor_cell_id": { "$ref": "#/$defs/cellId" },
+        "normal_enu": { "$ref": "#/$defs/enuVector" },
+        "offset_m": { "type": "number" }
+      }
+    },
+    "supportedRanges": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baked_path_horizon_m", "geometry_halo_m", "probe_footprint_m"],
+      "properties": {
+        "probe_footprint_m": { "const": 585.0 },
+        "geometry_halo_m": { "const": 600.0 },
+        "baked_path_horizon_m": { "const": 600.0 }
+      }
+    },
+    "corePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "compression",
+        "content_sha256",
+        "path",
+        "raw_size_bytes",
+        "schema",
+        "stored_content_sha256",
+        "stored_size_bytes"
+      ],
+      "properties": {
+        "schema": { "enum": ["fightbox.mesh.v1", "fightbox.material-table.v1"] },
+        "path": { "enum": ["mesh.bin", "materials.json"] },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "stored_content_sha256": { "$ref": "#/$defs/sha256" },
+        "raw_size_bytes": { "$ref": "#/$defs/nonNegativeSize" },
+        "stored_size_bytes": { "$ref": "#/$defs/nonNegativeSize" },
+        "compression": { "const": "none" }
+      }
+    },
+    "payloads": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["materials", "mesh"],
+      "properties": {
+        "mesh": { "$ref": "#/$defs/corePayload" },
+        "materials": { "$ref": "#/$defs/corePayload" }
+      }
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bounds_local_enu_m",
+        "grid_index",
+        "id",
+        "local_to_city_enu_m",
+        "neighbors",
+        "payloads",
+        "routes",
+        "supported_ranges",
+        "switch_planes"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/cellId" },
+        "grid_index": { "$ref": "#/$defs/gridIndex" },
+        "local_to_city_enu_m": { "$ref": "#/$defs/enuVector" },
+        "bounds_local_enu_m": { "$ref": "#/$defs/bounds" },
+        "neighbors": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/cellId" }
+        },
+        "switch_planes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/switchPlane" }
+        },
+        "routes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+          }
+        },
+        "supported_ranges": { "$ref": "#/$defs/supportedRanges" },
+        "payloads": { "$ref": "#/$defs/payloads" }
+      }
+    },
+    "mobileCellPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hard_raw_probe_payload_bytes",
+        "maximum_prepared_neighbors",
+        "maximum_resident_worlds",
+        "ownership_guard_m",
+        "pairwise_overlap_m",
+        "stride_m",
+        "target_raw_probe_payload_bytes"
+      ],
+      "properties": {
+        "stride_m": { "const": 485.0 },
+        "pairwise_overlap_m": { "const": 100.0 },
+        "ownership_guard_m": { "const": 50.0 },
+        "maximum_prepared_neighbors": { "const": 1 },
+        "maximum_resident_worlds": { "const": 2 },
+        "target_raw_probe_payload_bytes": { "const": 50331648 },
+        "hard_raw_probe_payload_bytes": { "const": 67108864 }
+      }
+    },
+    "extensionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "unknown_core_fields",
+        "unknown_optional_capabilities",
+        "unknown_required_capabilities"
+      ],
+      "properties": {
+        "mode": { "const": "typed_hash_indexed_sidecars" },
+        "unknown_core_fields": { "const": "reject" },
+        "unknown_optional_capabilities": { "const": "retain_and_report" },
+        "unknown_required_capabilities": { "const": "reject" }
+      }
+    },
+    "world": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cell", "city", "extension_policy", "mobile_cell_policy"],
+      "properties": {
+        "city": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["geodetic_origin", "id"],
+          "properties": {
+            "id": { "$ref": "#/$defs/cityId" },
+            "geodetic_origin": { "$ref": "#/$defs/geodeticOrigin" }
+          }
+        },
+        "cell": { "$ref": "#/$defs/cell" },
+        "mobile_cell_policy": { "$ref": "#/$defs/mobileCellPolicy" },
+        "extension_policy": { "$ref": "#/$defs/extensionPolicy" }
+      }
+    },
+    "extension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "compression",
+        "content_sha256",
+        "path",
+        "raw_size_bytes",
+        "requirement",
+        "stored_content_sha256",
+        "stored_size_bytes"
+      ],
+      "properties": {
+        "capability": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*\\.v[1-9][0-9]*$"
+        },
+        "requirement": { "enum": ["optional", "required"] },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240,
+          "pattern": "^(?!manifest\\.json$|mesh\\.bin$|materials\\.json$)[a-z0-9_-](?:[a-z0-9._-]{0,62}[a-z0-9_-])?(?:/[a-z0-9_-](?:[a-z0-9._-]{0,62}[a-z0-9_-])?)*$"
+        },
+        "content_sha256": { "$ref": "#/$defs/sha256" },
+        "stored_content_sha256": { "$ref": "#/$defs/sha256" },
+        "raw_size_bytes": { "$ref": "#/$defs/positiveSize" },
+        "stored_size_bytes": { "$ref": "#/$defs/positiveSize" },
+        "compression": { "enum": ["none", "zstd"] }
+      }
+    }
+  }
+}

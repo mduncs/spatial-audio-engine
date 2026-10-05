@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma2-firework",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma2-firework.wav",
+      "sha256": "dbef86c597ebb2fcf32767ad83a8cef3c030ddfb2ed8235525fcdbeb6048e2c5",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 8.0,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -22.825533,
+  "calibration": {
+    "applied_gain_db": -1.174467
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma2 source SHA-256 1112394906b309b6587db60dbbe7aaed911d4a6ed6d402659b4d981614a84b40; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

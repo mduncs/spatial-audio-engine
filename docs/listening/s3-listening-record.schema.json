@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fightbox.dev/schema/s3-listening-record-1.json",
+  "title": "Fightbox provisional S3 listening record",
+  "description": "Provisional Phase A listening record. Human ears only (Gate 0 does not exist yet). The template alone is never a pass. The record has two honest states: 'undecided' templates may carry null hashes and an empty sign-off; 'pass'/'fail' records must be fully populated. Cross-field state rules are enforced by docs/listening/validate.py because JSON Schema cannot express them.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_id",
+    "fixture_id",
+    "gate",
+    "fixture_sha256",
+    "bundle_manifest_sha256",
+    "listener",
+    "hrtf",
+    "equipment",
+    "comparison_order",
+    "observations",
+    "result",
+    "date_iso",
+    "sign_off",
+    "requires_human_completion",
+    "claims",
+    "non_claims"
+  ],
+  "properties": {
+    "schema_version": {"const": "fightbox.listening.v1"},
+    "record_id": {"type": "string"},
+    "fixture_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+    "gate": {"const": "S3"},
+    "fixture_sha256": {
+      "description": "SHA-256 (lowercase 64-hex) over the fixture descriptor. Null only for an undecided template.",
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "bundle_manifest_sha256": {
+      "description": "SHA-256 (lowercase 64-hex) over the capture manifest. Null only for an undecided template.",
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "listener": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["listener_id", "notes"],
+      "properties": {
+        "listener_id": {"type": "string"},
+        "notes": {"type": "string"}
+      }
+    },
+    "hrtf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hrtf_set", "pretest_result"],
+      "properties": {
+        "hrtf_set": {"type": "string"},
+        "pretest_result": {"type": "string"}
+      }
+    },
+    "equipment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["headphones", "output_path"],
+      "properties": {
+        "headphones": {"type": "string"},
+        "output_path": {"type": "string"},
+        "monitor_gain_db": {"type": ["number", "null"]}
+      }
+    },
+    "comparison_order": {
+      "description": "Exactly the two unique pathing stimuli, in this order.",
+      "type": "array",
+      "const": ["pathing_on", "pathing_off"]
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stimulus", "observation"],
+        "properties": {
+          "stimulus": {"type": "string"},
+          "observation": {"type": "string"}
+        }
+      }
+    },
+    "result": {"enum": ["undecided", "pass", "fail"]},
+    "date_iso": {
+      "description": "ISO-8601 date the record was authored. May be empty for an undecided template.",
+      "type": "string",
+      "pattern": "^([0-9]{4}-[0-9]{2}-[0-9]{2})?$"
+    },
+    "sign_off": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["listener_signed", "date_iso"],
+      "properties": {
+        "listener_signed": {"type": "string"},
+        "date_iso": {
+          "description": "ISO-8601 date of human sign-off. May be empty for an undecided template.",
+          "type": "string",
+          "pattern": "^([0-9]{4}-[0-9]{2}-[0-9]{2})?$"
+        }
+      }
+    },
+    "requires_human_completion": {"const": true},
+    "claims": {"type": "array", "items": {"type": "string"}},
+    "non_claims": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "contains": {"const": "Human completion is required; this template alone is not a pass."}
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma1-artillery-200m",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma1-artillery-200m.wav",
+      "sha256": "f7ac7db465fd6dada925e696a17d3964fb63b0906a31ed7c6977dd2b23627748",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 8.0,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -52.584039,
+  "calibration": {
+    "applied_gain_db": 28.584039
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma1 source SHA-256 a6c12d07b398d300b1121d18d9d33025c5ece28af7dd562d89a097749022cd64; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

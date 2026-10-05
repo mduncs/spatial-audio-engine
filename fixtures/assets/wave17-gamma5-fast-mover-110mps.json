@@ -1,0 +1,27 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "wave17-gamma5-fast-mover-110mps",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/wave17-audition/wave17-gamma5-fast-mover-110mps.wav",
+      "sha256": "a6c3dbac340383443a8bc535e6555dd29eeaf23e05836398ab003def405f58ef",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 6.0,
+  "target_rms_dbfs": -24.0,
+  "expected_reference_rms_dbfs": -35.2988,
+  "calibration": {
+    "applied_gain_db": 11.2988
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "Audition adaptation of exact gamma5 source SHA-256 51f1ff458e5c8c9dfda52fd1d06bc8befafebf943758ab72749b0c9fb49d1795; the original retained artifact remains evidence authority.",
+    "Stereo inputs are equal-power folded to mono and may be peak-safety attenuated/padded; this derivative is not a replacement canonical gamma stem.",
+    "The looping Workbench copy is private preparation for explicit human listening and is not itself a listening judgment."
+  ]
+}

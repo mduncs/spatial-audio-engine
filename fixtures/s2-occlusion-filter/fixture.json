@@ -1,0 +1,106 @@
+{
+  "schema_version": "fightbox.fixture.v1",
+  "fixture_id": "s2-direct-occlusion",
+  "gate": "S2",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {"name": "Steam Audio", "version": "4.8.1"},
+  "source": {
+    "id": "wall-edge-firefighter-siren",
+    "asset_id": "ff-siren",
+    "reference_level": {"mode": "SplAtOneMeter", "db_spl": 105},
+    "trajectory": {
+      "waypoints_m": [
+        [10, -6, 1.5],
+        [10, 4, 1.5],
+        [10, -6, 1.5],
+        [10, 4, 1.5]
+      ],
+      "speed_mps": 1.6,
+      "max_speed_mps": 1.6,
+      "closed_cycle": true
+    }
+  },
+  "listener": {
+    "position_m": [0, 0, 1.5],
+    "forward_enu": [1, 0, 0],
+    "up_enu": [0, 0, 1]
+  },
+  "geometry": {
+    "vertices_m": [
+      [-8, -12, 0],
+      [16, -12, 0],
+      [16, 12, 0],
+      [-8, 12, 0],
+      [4, -1, 0],
+      [4, 10, 0],
+      [4, 10, 7],
+      [4, -1, 7]
+    ],
+    "triangles": [
+      {"indices": [0, 1, 2], "material": "ground"},
+      {"indices": [0, 2, 3], "material": "ground"},
+      {"indices": [2, 1, 0], "material": "ground"},
+      {"indices": [3, 2, 0], "material": "ground"},
+      {"indices": [4, 5, 6], "material": "masonry"},
+      {"indices": [4, 6, 7], "material": "masonry"},
+      {"indices": [6, 5, 4], "material": "masonry"},
+      {"indices": [7, 6, 4], "material": "masonry"}
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [0.08, 0.5, 0.95],
+        "scattering": 0.15,
+        "transmission": [0.65, 0.02, 0.0005]
+      },
+      "ground": {
+        "absorption": [0.08, 0.1, 0.12],
+        "scattering": 0.08,
+        "transmission": [0, 0, 0]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {"distance_attenuation": true, "occlusion": true, "occlusion_samples": 64},
+    "reflections": {"enabled": true, "rays": 2048, "bounces": 2, "duration_s": 0.6},
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": ["direct", "path", "reflections"]
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [-2, -9, 0.5],
+      "max_m": [13, 7, 2.5],
+      "spacing_m": 2
+    },
+    "probe_generation": {"type": "uniform_floor", "height_m": 1.5},
+    "path_bake": {
+      "identifier": "s2-direct-occlusion-path-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 2,
+      "visibility_range_m": 30,
+      "path_range_m": 35
+    }
+  },
+  "expected": {
+    "properties": [
+      "The pinned firefighter siren crosses the south edge of a solid masonry wall four times over two slow LOS-to-occluded-to-LOS cycles.",
+      "At the north endpoint the wall fully blocks the direct segment; at the south endpoint the direct segment clears the wall edge.",
+      "Frequency-dependent masonry transmission and retained path/reflection stages keep the occluded source audible while exposing geometry-tracked muffling."
+    ],
+    "non_claims": [
+      "The compact wall fixture is synthetic and is not surveyed architecture.",
+      "The fixture makes no delivered-ear-SPL claim without output-device calibration.",
+      "Machine sanity checks do not replace the listening record."
+    ]
+  }
+}

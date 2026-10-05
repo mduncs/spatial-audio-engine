@@ -1,0 +1,12 @@
+# Verified by the AirPods probe 2026-10-01: active head attitude (+x right, +y forward, +z up) in a gravity-vertical frame.
+# ENU quaternion = H * (current * inverse(reference)) * inverse(H); H is the yaw turning the reference nose heading to north. North forward = q * [0,0,1,0] * inverse(q).
+# name	reference.w/x/y/z	current.w/x/y/z	forward.east/north/up (normalize raw quaternions in f64, then cast to f32).
+yaw-left	1	0	0	0	0.7071067812	0	0	0.7071067812	-1	0	0
+yaw-mirrored	1	0	0	0	0.7071067812	0	0	-0.7071067812	1	0	0
+pitch-up	1	0	0	0	0.7071067812	0.7071067812	0	0	0	0	1
+pitch-mirrored	1	0	0	0	0.7071067812	-0.7071067812	0	0	0	0	-1
+pitch-as-roll	1	0	0	0	0.7071067812	0	-0.7071067812	0	0	1	0
+roll	1	0	0	0	0.7071067812	0	0.7071067812	0	0	1	0
+noncommuting-reference	0.8	0.2	-0.4	0.4	0.5	-0.5	0.5	0.5	-0.6	0.8	0
+airpods-left-20261001	0.974735	-0.145883	-0.077242	-0.150479	0.833905	0.010418	-0.155196	0.529536	-0.987587	0.106208	0.115727
+airpods-up-20261001	0.974735	-0.145883	-0.077242	-0.150479	0.950208	0.226845	-0.059036	-0.205329	0.111537	0.735548	0.668229

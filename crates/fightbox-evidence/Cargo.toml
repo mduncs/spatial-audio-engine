@@ -1,0 +1,15 @@
+[package]
+name = "fightbox-evidence"
+version = "0.1.0"
+description = "Deterministic Fightbox capture and run-manifest domain structures"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/mduncs/spatial-audio-engine"
+
+[dependencies]
+ebur128 = { version = "=0.1.10", default-features = false }
+fightbox-api = { path = "../fightbox-api" }
+
+[lib]
+path = "src/lib.rs"

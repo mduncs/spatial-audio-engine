@@ -1,0 +1,206 @@
+{
+  "schema_version": "fightbox.fixture.workbench.v1",
+  "fixture_id": "astra-artillery-street-path-candidate-v1",
+  "gate": "S5",
+  "coordinate_frame": {
+    "name": "local_enu",
+    "units": "meters_seconds",
+    "axes": "x_east_y_north_z_up",
+    "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"
+  },
+  "kernel": {
+    "name": "Steam Audio",
+    "version": "4.8.1"
+  },
+  "sources": [
+    {
+      "id": "artillery-corner-shot",
+      "asset_id": "astra-artillery-single",
+      "reference_level": {
+        "mode": "SplAtOneMeter",
+        "db_spl": 155
+      },
+      "default_enabled": false,
+      "restart_on_enable": true,
+      "impulsive": true,
+      "extent": {
+        "kind": "line_segment",
+        "length_m": 6.0
+      },
+      "position_m": [
+        102.5,
+        102.5,
+        1.5
+      ],
+      "audition_label": "Artillery street · path candidate",
+      "ballistic": {
+        "muzzle_position_m": [
+          2223.82,
+          102.5,
+          2122.82
+        ],
+        "mach_segments": [
+          {
+            "length_m": 3000.0,
+            "mach": 1.5
+          }
+        ],
+        "n_wave_ms_at_30_m": 2.8,
+        "crack_peak_db_at_30_m": 150.8,
+        "notes": "Provisional physics-review values (2026-09-30), pure data. 155 mm shell, last 3 km of flight: 45-degree descent from due east (travel azimuth 270 degrees) at constant Mach 1.5 (514.5 m/s), mesh-checked clear of buildings for the flight and both Spot A/B crack rays. muzzle_position_m is the terminal-segment start, not a gun; no muzzle blast is rendered. N-wave 2.8 ms at 30 m perpendicular miss (Whitham, d=0.155 m, l=0.85 m; plausible 2-4 ms), scaled by miss^(1/4). Crack anchor 150.8 dB peak at 30 m miss, falling as miss^(-3/4); independent of the 155 dB impact anchor."
+      }
+    }
+  ],
+  "listener": {
+    "trajectory": {
+      "waypoints_m": [
+        [
+          426.02,
+          483.82,
+          1.5
+        ],
+        [
+          474.02,
+          483.82,
+          1.5
+        ]
+      ],
+      "speed_mps": 6.0,
+      "max_speed_mps": 6.0
+    },
+    "forward_enu": [
+      0.9945218953682733,
+      0.10452846326765346,
+      0.0
+    ],
+    "up_enu": [
+      0,
+      0,
+      1
+    ]
+  },
+  "geometry": {
+    "vertices_m": [
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        585,
+        0,
+        0
+      ],
+      [
+        585,
+        585,
+        0
+      ],
+      [
+        0,
+        585,
+        0
+      ]
+    ],
+    "triangles": [
+      {
+        "indices": [
+          0,
+          1,
+          2
+        ],
+        "material": "masonry"
+      },
+      {
+        "indices": [
+          0,
+          2,
+          3
+        ],
+        "material": "masonry"
+      }
+    ],
+    "materials": {
+      "masonry": {
+        "absorption": [
+          0.03,
+          0.05,
+          0.07
+        ],
+        "scattering": 0.1,
+        "transmission": [
+          0.0251,
+          0.00562,
+          0.00178
+        ]
+      }
+    }
+  },
+  "simulation": {
+    "direct": {
+      "distance_attenuation": true,
+      "occlusion": true,
+      "occlusion_samples": 64
+    },
+    "reflections": {
+      "enabled": true,
+      "rays": 4096,
+      "bounces": 8,
+      "duration_s": 1.5
+    },
+    "pathing": {
+      "enabled": true,
+      "order": 2,
+      "validation": true,
+      "alternate_paths": true,
+      "runtime_order": [
+        "direct",
+        "path",
+        "reflections"
+      ],
+      "visibility_range_m": 20.0
+    },
+    "probe_volume": {
+      "type": "box",
+      "min_m": [
+        0,
+        0,
+        0.5
+      ],
+      "max_m": [
+        585,
+        585,
+        63.0
+      ],
+      "spacing_m": 8.0
+    },
+    "probe_generation": {
+      "type": "uniform_floor",
+      "height_m": 1.5
+    },
+    "path_bake": {
+      "identifier": "megablock-city-bake-v1",
+      "required_call": "iplPathBakerBake",
+      "probe_batch_serialization": "required",
+      "fresh_process_reload": true,
+      "bake_order": 2
+    }
+  },
+  "expected": {
+    "properties": [
+      "Artillery street · path candidate: original 155 dB SPL at 1 m reference, full astra-artillery-single recording, six-metre extent and original source position preserved.",
+      "Listener starts at ENU [426.02,483.82,1.5], heading 84 degrees; optional eastward route ends at [474.02,483.82,1.5]. Autopilot remains off until explicitly enabled.",
+      "Use successor-path1500-vis40.baked: all 9723 retained probe spheres/order preserved, path bake range 1500 m and bake visibility 40 m; runtime visibility remains 20 m with validation enabled. Same retained mesh/material identities.",
+      "All sounds start disabled; Listen triggers the shot. Original runtime output protection remains unchanged; no extra quiet guard.",
+      "Listen also fires the shell's supersonic crack when the listener is inside its Mach cone: the crack is heard first, then the impact, from one press. Spot A: crack 0.956 s before the impact sound; Spot B: 0.966 s.",
+      "Impulsive: each Listen replans up to four discrete late echoes for the current spot and freezes them on the delayed impact's first sample. Echoes are routed returns only: the street route re-reflected off a finite, front-facing, visible facade patch, or a distinct longer street route, 50-1200 ms after the primary route arrival. Delay is referenced to the straight-line-timed pathing primary; gain inherits the rendered primary's baked-path transfer at the shot, times the extra spreading and air of the longer route (free-field level if no transfer)."
+    ],
+    "non_claims": [
+      "Crack timing uses straight-line acoustic delays; the rendered impact does not include street-route (path-length) delay.",
+      "No muzzle blast; constant-Mach terminal flight is a provisional approximation.",
+      "Candidate restores the tested street-path samples; no whole-city or perceptual approval claim.",
+      "Original source reference does not specify delivered headphone SPL. Baseline fixtures and running applications are unchanged.",
+      "Echo planning is first-order and geometric at ear height: no second-order canyon flutter, roof-edge routes, or measured corner loss; the corner voicing on non-shared route corners turning at least 30 degrees is provisional."
+    ]
+  }
+}

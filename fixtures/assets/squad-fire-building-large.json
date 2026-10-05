@@ -1,0 +1,26 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-fire-building-large",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-fire-building-large.wav",
+      "sha256": "c04345faafbd3f1d1537390c6390da48497f2d4f0750fbdf01a1cae3e80f048f",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 22.5395,
+  "target_rms_dbfs": -20.0,
+  "expected_reference_rms_dbfs": -21.011234,
+  "calibration": {
+    "applied_gain_db": 1.011234
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of a Squad v8.1 game asset; this descriptor grants no right to redistribute audio bytes."
+  ]
+}

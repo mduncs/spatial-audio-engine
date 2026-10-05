@@ -1,0 +1,28 @@
+{
+  "schema_version": "fightbox.fixture.v1",
+  "fixture_id": "s3-masonry-building-corner",
+  "gate": "S3",
+  "coordinate_frame": {"name": "local_enu", "units": "meters_seconds", "axes": "x_east_y_north_z_up", "steam_audio_mapping": "steam_x=enu_x;steam_y=enu_z;steam_z=-enu_y"},
+  "kernel": {"name": "Steam Audio", "version": "4.8.1"},
+  "source": {"id": "corner-source", "position_m": [-4, 6, 1.5], "reference_level": {"mode": "SplAtOneMeter", "db_spl": 85}, "asset_id": "s3-calibrated-pink"},
+  "listener": {"position_m": [6, -4, 1.5], "forward_enu": [0, 1, 0], "up_enu": [0, 0, 1], "trajectory_m": [[6, -4, 1.5], [3, -3, 1.5], [1, -2, 1.5], [-0.5, -1.5, 1.5], [-2, -1, 1.5]]},
+  "geometry": {
+    "vertices_m": [[0, 0, 0], [10, 0, 0], [10, 0, 6], [0, 0, 6], [0, 10, 0], [0, 10, 6], [-9, -9, 0], [9, -9, 0], [9, 9, 0], [-9, 9, 0]],
+    "triangles": [{"indices": [0, 1, 2], "material": "masonry"}, {"indices": [0, 2, 3], "material": "masonry"}, {"indices": [2, 1, 0], "material": "masonry"}, {"indices": [3, 2, 0], "material": "masonry"}, {"indices": [0, 4, 5], "material": "masonry"}, {"indices": [0, 5, 3], "material": "masonry"}, {"indices": [5, 4, 0], "material": "masonry"}, {"indices": [3, 5, 0], "material": "masonry"}, {"indices": [6, 7, 8], "material": "masonry"}, {"indices": [6, 8, 9], "material": "masonry"}],
+    "materials": {"masonry": {"absorption": [0.03, 0.05, 0.07], "scattering": 0.1, "transmission": [0.0, 0.0, 0.0]}}
+  },
+  "simulation": {
+    "direct": {"distance_attenuation": true, "occlusion": true, "occlusion_samples": 64},
+    "reflections": {"enabled": true, "rays": 4096, "bounces": 2, "duration_s": 1.0},
+    "pathing": {"enabled": true, "order": 2, "validation": true, "alternate_paths": true, "runtime_order": ["direct", "path", "reflections"]},
+    "probe_volume": {"type": "box", "min_m": [-8.75, -8.75, 0.5], "max_m": [8.25, 8.25, 2.5], "spacing_m": 1.0},
+    "probe_generation": {"type": "uniform_floor", "height_m": 1.5},
+    "path_bake": {"identifier": "s3-masonry-corner-path-bake-v1", "required_call": "iplPathBakerBake", "probe_batch_serialization": "required", "fresh_process_reload": true, "bake_order": 2}
+  },
+  "expected": {
+    "properties": ["Initial source and listener positions have no direct line of sight because their segment crosses both adjacent masonry façades.", "A successful result requires a nonempty serialized probe batch, a stable content hash, fresh-process reload, and a nontrivial finite validated path output. Probe count, non-null output, EQ, unvalidated output, or order alone is insufficient.", "Pathing-on and pathing-off captures differ by an automated spectral or level metric while direct, path, and reflection diagnostic stems are separately captured.", "As the trajectory moves around the convex exterior edge and returns to line of sight, the summed output hands off from path contribution to direct contribution without a discontinuity claim based on either stem alone."],
+    "analytic": {"edge_m": [0, 0, 1.5], "listener_to_edge_enu": [-6, 4, 0], "arrival_azimuth_degrees_clockwise_from_north": 303.690068, "tolerance_degrees": 15, "meaning": "Initial validated path-arrival direction at the listener points toward the convex exterior corner edge."},
+    "stems": {"required": ["direct", "path", "reflections"], "pathing_toggle_captures": ["on", "off"]},
+    "non_claims": ["Fixture validity is not proof that the result is audible; a headphone listening record is separately required by S3.", "This fixture does not license a pathing claim until the listed bake, serialization, reload, and output conditions are evidenced."]
+  }
+}

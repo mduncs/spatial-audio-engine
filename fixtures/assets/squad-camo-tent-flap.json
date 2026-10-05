@@ -1,0 +1,26 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-camo-tent-flap",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-camo-tent-flap.wav",
+      "sha256": "3fa60606af2c052b029fd291729013dea7c616046ba632155bc75f0fd6df69eb",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 32.550604167,
+  "target_rms_dbfs": -41.969045,
+  "expected_reference_rms_dbfs": -41.212958,
+  "calibration": {
+    "applied_gain_db": -0.756087
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of a Squad v8.1 game asset; this descriptor grants no right to redistribute audio bytes."
+  ]
+}

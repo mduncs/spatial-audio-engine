@@ -1,0 +1,26 @@
+{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "squad-generator-diesel",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/squad/squad-generator-diesel.wav",
+      "sha256": "7c09d9647fbe57e3559177799899fa55af0a174f80023cad0ff89b4d4ba82dd2",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 25.494729167,
+  "target_rms_dbfs": -20.0,
+  "expected_reference_rms_dbfs": -28.416885,
+  "calibration": {
+    "applied_gain_db": 8.416885
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration.",
+    "The recording hash establishes file identity, not authorship, licensing, or provenance beyond the pinned bytes.",
+    "The prepared WAV is a local derivative of a Squad v8.1 game asset; this descriptor grants no right to redistribute audio bytes."
+  ]
+}
