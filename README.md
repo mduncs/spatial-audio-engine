@@ -74,7 +74,6 @@ Only map-based `city build` goes online: Nominatim, the Overpass API, and, for C
 - Wind and weather refraction are not modelled, and corner diffraction uses Steam Audio's default model, which the project's notes call weaker than a real building edge.
 - Song input, app audio capture and head tracking are macOS only. On Linux the Workbench can only render headless.
 - The iPhone app builds but has never run on a phone.
-- `LICENSE` says MIT, while the Cargo manifests say Apache-2.0.
 
 ## Keywords
 
