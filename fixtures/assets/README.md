@@ -65,24 +65,6 @@ Drop a file onto a map source, otherwise the first live/music source (or first s
 
 AudioToolbox decodes MP3, M4A/AAC, ALAC, FLAC, AIFF, WAV and CAF off the UI/audio threads. Workbench measures and normalizes the program to nominal −14 dBFS before the existing calibrated source drive; songs loop, retain stereo with `stereo_image`, and otherwise fold to measured mono. Ogg/Vorbis and non-macOS song decoding return clear errors. Personal files stay external; the pinned WAV route is unchanged. Whole-file PCM is held in memory (about 33 MiB/minute for stereo plus temporary decode/cache copies).
 
-## Local Squad-derived audition assets
-
-`tools/prepare-squad-assets.py` reads the user-owned external Squad v8.1 source tree and writes
-48 kHz mono float WAVs only under the gitignored `fixtures/assets/squad/` directory. Tracked
-legacy descriptors pin those local bytes but do not grant redistribution rights. Prepare only the
-needed assets with repeatable selectors instead of rebuilding the full local library:
-
-```sh
-python3 tools/prepare-squad-assets.py \
-  --asset squad-thunder-distant-03 \
-  --asset squad-thunder-distant-15 \
-  --report /absolute/path/preparation-report.json
-```
-
-Omitting `--asset` preserves the legacy all-assets behavior. The two distant-thunder candidates
-are non-looping, equal-power mono folds of authored Squad weather recordings; they are private
-audition inputs, not rights-cleared distribution media or measured physical lightning channels.
-
 ## Level terminology (read carefully)
 
 Three distinct level concepts are in play. Confusing them is the classic evidence error, so the

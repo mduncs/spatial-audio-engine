@@ -1733,19 +1733,47 @@ fn asset_analysis_message(error: &fightbox_evidence::AssetAnalysisError) -> &'st
 mod tests {
     use super::*;
 
+    const ONSET_LOOP: &str = r#"{
+  "schema_version": "fightbox.asset-descriptor.v1",
+  "asset_id": "onset-loop-example",
+  "kind": "wav",
+  "generator": {
+    "wav": {
+      "path": "fixtures/assets/example/onset-loop.wav",
+      "sha256": "b284d05165a539f674f9c4d8358fc4bf9dc080b7b6a5510058ed59035a1e75b4",
+      "start_frame": 0,
+      "loop": true
+    }
+  },
+  "channels": 1,
+  "sample_rate_hz": 48000,
+  "duration_s": 26.400833333,
+  "target_rms_dbfs": -22.036692,
+  "expected_reference_rms_dbfs": -20.558544,
+  "calibration": {
+    "applied_gain_db": -1.478147
+  },
+  "non_claims": [
+    "This descriptor makes no delivered-ear-SPL claim without output calibration."
+  ],
+  "onsets_s": [
+    0.0,
+    6.546,
+    14.604145833,
+    20.115625
+  ]
+}"#;
+
     #[test]
     fn composed_loop_onset_tables_parse_to_exact_frames_and_validate_order() {
-        let descriptor = AssetDescriptor::parse(include_str!(
-            "../../../fixtures/assets/squad-m2-burst-loop.json"
-        ))
-        .unwrap();
+        let descriptor = AssetDescriptor::parse(ONSET_LOOP).unwrap();
         assert_eq!(descriptor.onsets_s, [0.0, 6.546, 14.604145833, 20.115625]);
         assert_eq!(
             descriptor.onset_frames().unwrap(),
             [0, 314_208, 700_999, 965_550]
         );
 
-        let original = include_str!("../../../fixtures/assets/squad-m2-burst-loop.json");
+        let original = ONSET_LOOP;
         let descending = original.replace("0.0,\n    6.546", "6.546,\n    0.0");
         assert!(
             AssetDescriptor::parse(&descending)
@@ -1759,9 +1787,7 @@ mod tests {
                 .contains("[0, duration_s)")
         );
 
-        let no_table =
-            AssetDescriptor::parse(include_str!("../../../fixtures/assets/squad-a10-pass.json"))
-                .unwrap();
+        let no_table = AssetDescriptor::parse(TOMS_DINER).unwrap();
         assert!(no_table.onsets_s.is_empty());
         assert!(no_table.onset_frames().unwrap().is_empty());
     }

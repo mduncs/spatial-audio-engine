@@ -885,9 +885,13 @@ mod tests {
     #[test]
     #[ignore = "requires the local Wave 17 audition preparation scripts"]
     fn prepared_wave17_audition_scene_assets_load_as_finite_mono() {
-        let fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
-            "../../../fixtures/city/wave17-gamma-audition/fixture.json"
-        ))
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/city/wave17-gamma-audition/fixture.json"),
+            )
+            .unwrap(),
+        )
         .unwrap();
         let asset_ids = fixture["sources"].as_array().unwrap().iter().map(|source| {
             source["asset_id"]
